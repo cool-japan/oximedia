@@ -32,4 +32,5 @@
 
 mod writer;
 
+pub use writer::WavFormatConfig;
 pub use writer::WavMuxer;
