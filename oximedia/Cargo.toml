@@ -616,3 +616,8 @@ required-features = ["quality", "metering", "transcode", "timecode", "workflow",
 name = "nmos_server_demo"
 path = "../examples/nmos_server_demo.rs"
 required-features = ["routing"]
+
+[[example]]
+name = "my_decoding_demo"
+path = "../examples/my-decoding-example.rs"
+required-features = ["video"]
