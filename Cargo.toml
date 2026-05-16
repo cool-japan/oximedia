@@ -116,6 +116,7 @@ members = [
     "crates/oximedia-vpl-sys",
     "crates/oximedia-vaapi-sys",
     "crates/oximedia-amf-sys",
+    "crates/oximedia-vtb",
     "oximedia-wasm",
     "benches",
 ]
