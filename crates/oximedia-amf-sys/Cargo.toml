@@ -1,0 +1,30 @@
+[package]
+name = "oximedia-amf-sys"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "FFI bindings to AMD AMF (Advanced Media Framework). Linux + Windows."
+keywords = ["amf", "ffi", "amd", "vce", "vcn"]
+categories = ["external-ffi-bindings", "multimedia"]
+links = "amf-amf-sys"
+
+[lib]
+name = "oximedia_amf_sys"
+
+[build-dependencies]
+bindgen = { workspace = true }
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+non_camel_case_types = "allow"
+non_snake_case = "allow"
+non_upper_case_globals = "allow"
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
