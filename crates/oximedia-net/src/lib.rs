@@ -100,6 +100,7 @@ pub mod retry_policy;
 pub mod rist;
 pub mod rtmp;
 pub mod rtp_session;
+pub mod rtsp;
 pub mod session_tracker;
 pub mod smpte2022_7;
 pub mod smpte2110;
