@@ -24,6 +24,7 @@
 pub mod avi;
 pub mod buffer;
 pub mod flac;
+pub mod flv;
 pub mod matroska;
 #[cfg(all(feature = "mmap", not(target_arch = "wasm32")))]
 pub mod mmap;
@@ -39,6 +40,7 @@ pub mod y4m;
 
 pub use avi::{AviDemuxError, AviMjpegReader};
 pub use flac::FlacDemuxer;
+pub use flv::{FlvDemuxer, FlvError, FlvHeader, FlvTag};
 pub use matroska::MatroskaDemuxer;
 pub use mp4::Mp4Demuxer;
 pub use mpegts::MpegTsDemuxer;
