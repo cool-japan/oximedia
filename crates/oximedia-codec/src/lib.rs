@@ -286,6 +286,7 @@ pub mod packet_queue;
 pub mod packet_splitter;
 pub mod picture_timing;
 pub mod profile_level;
+pub mod prores;
 pub mod psycho_visual;
 pub mod quality_metrics;
 pub mod rate_control;
