@@ -2,10 +2,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shmem;
-// Unix domain sockets are only available on Unix-like targets. Tokio gates
-// `UnixListener`/`UnixStream` behind `#[cfg(unix)]`, so the socket module must
-// be gated identically — see issue #13.
-#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg(unix)]
 pub mod socket;
 
 use serde::{Deserialize, Serialize};
