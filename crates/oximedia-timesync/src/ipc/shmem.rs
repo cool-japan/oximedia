@@ -138,6 +138,7 @@ pub struct TimeSnapshot {
 
 /// Minimum mapping size: one `SharedTimeData` worth of bytes, rounded up to
 /// a reasonable page-aligned boundary.
+#[cfg(unix)]
 const MIN_MAP_SIZE: u64 = 4096;
 
 /// Shared memory manager backed by a memory-mapped file.

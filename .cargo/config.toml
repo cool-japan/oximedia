@@ -1,1 +1,10 @@
 # Workspace-level Cargo configuration for OxiMedia.
+
+# On Windows, the PE-image default stack reserve is 1 MiB. The `oximedia` CLI
+# uses a derive-clap command tree with ~120 subcommand modules, which makes
+# `Cli::parse()` overflow that 1 MiB on the main thread before `--help` can
+# print (STATUS_STACK_OVERFLOW / 0xC00000FD). Raising the reserve to 8 MiB
+# matches the Linux default and is a link-time-only change, so it does not
+# invalidate dependency caches.
+[target.'cfg(windows)']
+rustflags = ["-C", "link-arg=/STACK:8388608"]
