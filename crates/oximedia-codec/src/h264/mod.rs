@@ -52,6 +52,7 @@ pub mod cavlc;
 pub mod cavlc_tables;
 pub mod deblock;
 pub mod deblock_frame;
+pub mod deblock_frame_chroma;
 pub mod decoder;
 pub mod dpb;
 pub mod frame;
@@ -78,6 +79,7 @@ pub use deblock::{
     should_filter_line, strong_filter_line, DeblockBlockInfo,
 };
 pub use deblock_frame::{deblock_frame_luma, DeblockMbState};
+pub use deblock_frame_chroma::{deblock_frame_chroma_420, DeblockChromaInfo};
 pub use cabac::{
     init_context_state, init_contexts, init_contexts_i_slice, init_contexts_pb_slice,
     CabacContext, CABAC_STATE_LEN,
