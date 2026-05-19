@@ -42,6 +42,7 @@
 pub mod bit_reader;
 pub mod cabac;
 pub mod cabac_init_tables;
+pub mod cabac_syntax;
 pub mod cabac_tables;
 pub mod cavlc;
 pub mod cavlc_tables;
@@ -70,6 +71,11 @@ pub use deblock::{
 pub use cabac::{
     init_context_state, init_contexts, init_contexts_i_slice, init_contexts_pb_slice,
     CabacContext,
+};
+pub use cabac_syntax::{
+    decode_b_sub_mb_type, decode_cbp_chroma, decode_cbp_luma, decode_intra4x4_pred_mode,
+    decode_intra_chroma_pred_mode, decode_intra_mb_type, decode_mb_skip, decode_mvd,
+    decode_p_sub_mb_type, decode_ref_idx, IntraMbType,
 };
 pub use cavlc::{
     decode_residual_block, read_coeff_token, read_level, read_residual_block, read_run_before,
