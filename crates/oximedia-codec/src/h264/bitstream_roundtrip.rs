@@ -15,6 +15,7 @@
 
 use crate::h264::frame::Frame;
 use crate::h264::pcm::{read_pcm_macroblock_420, write_pcm_macroblock_420};
+use crate::h264::pipeline::{DecodeStep, Decoder};
 use crate::h264::pps::parse_pps;
 use crate::h264::rbsp::strip_emulation_prevention;
 use crate::h264::slice_header::{parse_slice_header, NalContext, SliceType};
@@ -372,4 +373,88 @@ impl BitWriter {
         }
         out
     }
+}
+
+#[test]
+fn decoder_round_trips_minimal_baseline_i_pcm() {
+    // Same encoded bitstream as round_trip_minimal_baseline_i_pcm,
+    // but exercised through the top-level Decoder driver to prove
+    // the parameter-set store + NAL routing + slice dispatch +
+    // frame emission compose end-to-end.
+    let pattern = build_test_pattern();
+    let bitstream = encode_minimal_idr_i_pcm(&pattern);
+
+    let mut decoder = Decoder::new();
+    let frames = decoder.feed_annex_b(&bitstream).expect("feed");
+    assert_eq!(frames.len(), 1, "expected exactly one decoded frame");
+    let frame = &frames[0];
+
+    for j in 0..16 {
+        for i in 0..16 {
+            let expected = pattern.luma[j * 16 + i];
+            let actual = frame.get_luma(i, j).expect("luma sample");
+            assert_eq!(
+                actual, expected,
+                "decoder luma mismatch at ({i}, {j}): {actual} vs {expected}"
+            );
+        }
+    }
+    for j in 0..8 {
+        for i in 0..8 {
+            assert_eq!(
+                frame.get_cb(i, j),
+                Some(pattern.cb[j * 8 + i]),
+                "decoder Cb mismatch at ({i}, {j})"
+            );
+            assert_eq!(
+                frame.get_cr(i, j),
+                Some(pattern.cr[j * 8 + i]),
+                "decoder Cr mismatch at ({i}, {j})"
+            );
+        }
+    }
+
+    // DPB should now hold one short-term reference (IDR with
+    // nal_ref_idc = 3).
+    assert_eq!(decoder.dpb().entries.len(), 1);
+    assert!(decoder.dpb().entries[0].is_short_term_reference);
+}
+
+#[test]
+fn decoder_handles_sps_pps_only_without_frame_output() {
+    // SPS + PPS alone shouldn't emit a frame.
+    let pattern = build_test_pattern();
+    let bitstream = encode_minimal_idr_i_pcm(&pattern);
+    // Strip the slice NAL (everything after the second start code).
+    let mut trimmed = Vec::new();
+    let mut start_codes_seen = 0;
+    let mut i = 0;
+    while i + 3 < bitstream.len() {
+        let len = if bitstream[i..i + 4] == [0, 0, 0, 1] {
+            4
+        } else if bitstream[i..i + 3] == [0, 0, 1] {
+            3
+        } else {
+            trimmed.push(bitstream[i]);
+            i += 1;
+            continue;
+        };
+        if start_codes_seen >= 2 {
+            break;
+        }
+        trimmed.extend_from_slice(&bitstream[i..i + len]);
+        start_codes_seen += 1;
+        i += len;
+        while i + 3 < bitstream.len()
+            && !(bitstream[i..i + 3] == [0, 0, 1]
+                || bitstream[i..i + 4] == [0, 0, 0, 1])
+        {
+            trimmed.push(bitstream[i]);
+            i += 1;
+        }
+    }
+    let _ = DecodeStep::None;
+    let mut decoder = Decoder::new();
+    let frames = decoder.feed_annex_b(&trimmed).expect("feed");
+    assert!(frames.is_empty(), "SPS+PPS only must not emit a frame");
 }
