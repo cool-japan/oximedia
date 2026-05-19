@@ -421,7 +421,6 @@ uuid = { version = "1.23", features = ["v4", "serde", "js"] }
 prometheus = "0.14"
 cc = "1"
 bindgen = "0.72"
-pkg-config = "0.3"
 oxiarc-archive = "0.2.6"
 oxiarc-deflate = "0.2.6"
 oxiarc-lz4 = "0.2.6"

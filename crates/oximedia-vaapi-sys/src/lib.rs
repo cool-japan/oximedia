@@ -11,7 +11,7 @@
 #[cfg(target_os = "linux")]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-/// True when libva bindings were generated (i.e. Linux + pkg-config found `libva`).
+/// True when libva bindings were generated (i.e. Linux + `LIBVA_ROOT` set at build time).
 pub const HAS_BINDINGS: bool = cfg!(target_os = "linux");
 
 #[cfg(test)]

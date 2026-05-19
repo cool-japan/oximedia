@@ -1,44 +1,25 @@
 //! Build script for oximedia-vaapi-sys.
 //!
-//! libva is a Linux-only API discovered via pkg-config (`libva`,
-//! `libva-drm`, `libva-x11`).  Discovery is **opt-in only**: the
-//! workspace's root README promises "no `pkg-config`" out of the
-//! box, so without the `pkg-config` cargo feature the build script
-//! emits empty bindings and the workspace stays buildable on any
-//! host without system VAAPI headers.
+//! libva is a Linux-only API.  Discovery is intentionally env-var
+//! only — no `pkg-config`, no system probing — to honour the
+//! workspace README's "one cargo add, no system library
+//! installations" promise.
+//!
+//! If `LIBVA_ROOT` is set we generate real bindings against
+//! `${LIBVA_ROOT}/include/va/va.h` and link `-lva`.  Otherwise we
+//! emit an empty bindings file so the workspace stays buildable on
+//! every host.  Callers that want VAAPI acceleration install libva
+//! themselves and set `LIBVA_ROOT` (and optionally use DRM-only or
+//! X11 wrappers via `LIBVA_LINK_EXTRA`).
 
 use std::env;
 use std::path::PathBuf;
 
-#[cfg(feature = "pkg-config")]
-fn probe_libva() -> Vec<PathBuf> {
-    // Probe each library; we don't require X11 to be present
-    // (DRM-only headless builds are common in render farms).
-    let mut include_paths: Vec<PathBuf> = Vec::new();
-    let mut linked_any = false;
-
-    for pkg in ["libva", "libva-drm", "libva-x11"] {
-        if let Ok(l) = pkg_config::Config::new().probe(pkg) {
-            include_paths.extend(l.include_paths.iter().cloned());
-            linked_any = true;
-        }
-    }
-
-    if linked_any {
-        include_paths
-    } else {
-        Vec::new()
-    }
-}
-
-#[cfg(not(feature = "pkg-config"))]
-fn probe_libva() -> Vec<PathBuf> {
-    Vec::new()
-}
-
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=LIBVA_ROOT");
+    println!("cargo:rerun-if-env-changed=LIBVA_LINK_EXTRA");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
@@ -53,16 +34,15 @@ fn main() {
         return;
     }
 
-    let include_paths = probe_libva();
-
-    if include_paths.is_empty() {
+    let Ok(root) = env::var("LIBVA_ROOT") else {
         std::fs::write(
             &bindings_path,
-            "// oximedia-vaapi-sys: empty bindings (pkg-config feature off or libva not found)\n",
+            "// oximedia-vaapi-sys: empty bindings (LIBVA_ROOT not set)\n",
         )
         .expect("write empty bindings");
         return;
-    }
+    };
+    let include_paths = [PathBuf::from(&root).join("include")];
 
     let mut builder = bindgen::Builder::default().header("wrapper.h");
     for inc in &include_paths {
@@ -86,7 +66,14 @@ fn main() {
         .write_to_file(&bindings_path)
         .expect("write bindings.rs");
 
-    // pkg-config probes already emitted rustc-link-lib lines; nothing else
-    // to do here. We don't add X11 deliberately so the crate links cleanly
-    // in DRM-only environments.
+    println!("cargo:rustc-link-search=native={}/lib", root);
+    println!("cargo:rustc-link-lib=va");
+    // Optional extras: callers needing DRM-only or X11 entry points
+    // pass them via LIBVA_LINK_EXTRA (e.g. "va-drm va-x11").  Each
+    // whitespace-separated token becomes one `-l<lib>` directive.
+    if let Ok(extra) = env::var("LIBVA_LINK_EXTRA") {
+        for lib in extra.split_whitespace() {
+            println!("cargo:rustc-link-lib={lib}");
+        }
+    }
 }
