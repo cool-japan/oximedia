@@ -111,11 +111,84 @@ pub fn parse_slice_cavlc(
             "h264 slice_cavlc: PPS signals CABAC".into(),
         ));
     }
-    if !matches!(sh.slice_type, SliceType::I | SliceType::SI | SliceType::P) {
+    if !matches!(
+        sh.slice_type,
+        SliceType::I | SliceType::SI | SliceType::P | SliceType::B
+    ) {
         return Err(CodecError::InvalidData(format!(
             "h264 slice_cavlc: slice type {:?} not yet supported",
             sh.slice_type
         )));
+    }
+
+    // B-slice CAVLC walk: minimal version.  For each macroblock we
+    // peek `mb_skip_run` + `mb_type` exp-Golomb codes to advance
+    // the bitstream cursor and produce an `Unsupported` entry per
+    // macroblock — proper B-slice partition-shape and bi-pred MV
+    // decoding is the last remaining feature gap.  Reconstruction
+    // renders these as mid-grey via the existing Unsupported path.
+    if matches!(sh.slice_type, SliceType::B) {
+        let pic_width_mbs = sps.pic_width_in_mbs_minus1 as usize + 1;
+        let pic_height_mbs = sps.pic_height_in_map_units_minus1 as usize + 1;
+        let total = pic_width_mbs * pic_height_mbs;
+        let qp_y_initial =
+            (pps.pic_init_qp_minus26 + 26 + sh.slice_qp_delta).clamp(0, 51) as u8;
+        let mut out = Vec::with_capacity(total);
+        let mut mb_idx = sh.first_mb_in_slice as usize;
+        let mut mb_skip_run = reader.read_ue()? as usize;
+        while mb_idx < total {
+            let mb_x = mb_idx % pic_width_mbs;
+            let mb_y = mb_idx / pic_width_mbs;
+            if mb_skip_run > 0 {
+                out.push(MbCavlcDecoded {
+                    mb_x,
+                    mb_y,
+                    kind: MbCavlcKind::Skip,
+                    qp_y: qp_y_initial,
+                    qp_chroma: qp_y_initial,
+                });
+                mb_skip_run -= 1;
+                mb_idx += 1;
+                if mb_skip_run == 0 && mb_idx < total {
+                    mb_skip_run = reader.read_ue()? as usize;
+                }
+                continue;
+            }
+            // Best-effort: peek mb_type without consuming further
+            // syntax.  Subsequent macroblocks may desync — the
+            // walker stops emitting more entries once it can't
+            // safely advance.
+            let _mb_type = reader.read_ue().unwrap_or(0);
+            out.push(MbCavlcDecoded {
+                mb_x,
+                mb_y,
+                kind: MbCavlcKind::Unsupported,
+                qp_y: qp_y_initial,
+                qp_chroma: qp_y_initial,
+            });
+            // We can't reliably advance past the mb_type without
+            // knowing the partition layout — stop the walk here so
+            // we don't read garbage downstream.
+            break;
+        }
+        // Pad remaining macroblocks as unsupported placeholders so
+        // pipeline.rs still renders a complete picture.
+        while out.len() < total {
+            let mb_idx = out.len() + sh.first_mb_in_slice as usize;
+            if mb_idx >= total {
+                break;
+            }
+            let mb_x = mb_idx % pic_width_mbs;
+            let mb_y = mb_idx / pic_width_mbs;
+            out.push(MbCavlcDecoded {
+                mb_x,
+                mb_y,
+                kind: MbCavlcKind::Unsupported,
+                qp_y: qp_y_initial,
+                qp_chroma: qp_y_initial,
+            });
+        }
+        return Ok(out);
     }
 
     let pic_width_mbs = sps.pic_width_in_mbs_minus1 as usize + 1;
@@ -392,13 +465,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_b_slice() {
+    fn b_slice_walks_with_unsupported_entries() {
+        // B-slice CAVLC walks but emits Unsupported placeholders
+        // for every macroblock (full mb_type / bi-pred decoding is
+        // the remaining feature gap).
         let sps = dummy_sps();
         let pps = dummy_pps();
         let sh = dummy_sh(SliceType::B);
-        let bytes = [0u8; 4];
+        let bytes = [0x80u8; 4]; // valid first bit so read_ue returns 0
         let mut reader = BitReader::new(&bytes);
-        assert!(parse_slice_cavlc(&mut reader, &sps, &pps, &sh).is_err());
+        let mbs = parse_slice_cavlc(&mut reader, &sps, &pps, &sh).expect("walk");
+        // 1×1 macroblock picture → one entry.
+        assert_eq!(mbs.len(), 1);
+        match mbs[0].kind {
+            MbCavlcKind::Skip | MbCavlcKind::Unsupported => {}
+            _ => panic!("expected Skip or Unsupported, got {:?}", mbs[0].kind),
+        }
     }
 
     #[test]
