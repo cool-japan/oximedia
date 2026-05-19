@@ -61,6 +61,7 @@ pub mod intra_pred;
 pub mod macroblock;
 pub mod motion;
 pub mod mv_pred;
+pub mod pcm;
 pub mod pps;
 pub mod rbsp;
 pub mod reconstruct_inter;
@@ -117,6 +118,7 @@ pub use motion::{
     chroma_bilinear, fetch_chroma_4x4_subpel, fetch_luma_4x4_integer, fetch_luma_4x4_subpel,
     luma_6tap_unclipped, luma_half_pel, rounded_average,
 };
+pub use pcm::{read_pcm_macroblock_420, write_pcm_macroblock_420, PcmSamples420};
 pub use mv_pred::{
     apply_mv_delta, median3, predict_mv_16x8_bottom, predict_mv_16x8_top, predict_mv_8x16_left,
     predict_mv_8x16_right, predict_mv_median, MotionVector, MvPredictionContext,
