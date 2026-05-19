@@ -159,8 +159,13 @@ impl<'a> CabacContext<'a> {
         self.low -= (self.range << (CABAC_BITS + 1)) & lps_mask;
         self.range += (range_lps - self.range) & lps_mask;
 
+        // `s_xor` is `s` itself on the MPS branch (lps_mask=0) or
+        // `~s` on the LPS branch (lps_mask=-1).  In the latter case
+        // it is negative, so we compute the table index as `i32` and
+        // only cast to `usize` after adding 128 (which guarantees
+        // non-negative).
         let s_xor = s ^ lps_mask;
-        let mlps_idx = H264_MLPS_STATE_OFFSET + 128 + (s_xor as usize);
+        let mlps_idx = (H264_MLPS_STATE_OFFSET as i32 + 128 + s_xor) as usize;
         *state = H264_CABAC_TABLES[mlps_idx];
         let bit = s_xor & 1;
 
@@ -257,11 +262,22 @@ pub fn init_context_state(m: i8, n: i8, slice_qp: u8) -> u8 {
 /// Initialises every context in a 460-entry context table for an
 /// I-slice at the given slice QP.
 ///
-/// Returns a `[u8; 460]` of packed initial states ready for use by
+/// Width of the CABAC context-state array.
+///
+/// The 460 standard H.264 contexts cover slice / mb / mvd / cbp /
+/// residual decoding; the 460..1024 range holds the 8×8-transform
+/// CBF contexts (e.g. luma8x8 CBF at 1012..1016) and the
+/// 4:4:4-chroma residual contexts.  FFmpeg's `cabac_state` is sized
+/// 1024 for the same reason; the extra slots are initialised from
+/// the same `[m, n]` pair tables ([`CABAC_CONTEXT_INIT_I`] /
+/// [`CABAC_CONTEXT_INIT_PB`]) which carry 1024 entries each.
+pub const CABAC_STATE_LEN: usize = 1024;
+
+/// Returns a `[u8; 1024]` of packed initial states ready for use by
 /// [`CabacContext::get`].
 #[must_use]
-pub fn init_contexts_i_slice(slice_qp: u8) -> [u8; 460] {
-    let mut out = [0u8; 460];
+pub fn init_contexts_i_slice(slice_qp: u8) -> [u8; CABAC_STATE_LEN] {
+    let mut out = [0u8; CABAC_STATE_LEN];
     for (i, slot) in out.iter_mut().enumerate() {
         let pair = CABAC_CONTEXT_INIT_I[i];
         *slot = init_context_state(pair[0], pair[1], slice_qp);
@@ -272,10 +288,10 @@ pub fn init_contexts_i_slice(slice_qp: u8) -> [u8; 460] {
 /// Initialises every context for a P/B/SP/SI slice using
 /// `cabac_init_idc` ∈ {0, 1, 2} (signalled in the slice header).
 #[must_use]
-pub fn init_contexts_pb_slice(slice_qp: u8, cabac_init_idc: u8) -> [u8; 460] {
+pub fn init_contexts_pb_slice(slice_qp: u8, cabac_init_idc: u8) -> [u8; CABAC_STATE_LEN] {
     let idc = (cabac_init_idc as usize).min(2);
     let table = &CABAC_CONTEXT_INIT_PB[idc];
-    let mut out = [0u8; 460];
+    let mut out = [0u8; CABAC_STATE_LEN];
     for (i, slot) in out.iter_mut().enumerate() {
         let pair = table[i];
         *slot = init_context_state(pair[0], pair[1], slice_qp);
@@ -291,7 +307,7 @@ pub fn init_contexts(
     slice_type: SliceType,
     slice_qp: u8,
     cabac_init_idc: u8,
-) -> [u8; 460] {
+) -> [u8; CABAC_STATE_LEN] {
     match slice_type {
         SliceType::I | SliceType::SI => init_contexts_i_slice(slice_qp),
         _ => init_contexts_pb_slice(slice_qp, cabac_init_idc),
@@ -372,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn init_contexts_i_slice_populates_460() {
+    fn init_contexts_i_slice_populates_full_state_array() {
         let states = init_contexts_i_slice(26);
         // All entries should be valid u8 states (0..=126 effectively).
         for s in &states {
