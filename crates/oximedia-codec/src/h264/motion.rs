@@ -60,6 +60,86 @@ pub fn rounded_average(a: u8, b: u8) -> u8 {
     ((u32::from(a) + u32::from(b) + 1) >> 1) as u8
 }
 
+/// Fetches an integer-position 4×4 luma block from the reference
+/// frame.  `ref_x` / `ref_y` are luma-sample coordinates of the
+/// block's top-left.  Out-of-range positions are clamped to the
+/// nearest frame edge per H.264's reference picture extension rule.
+#[must_use]
+pub fn fetch_luma_4x4_integer(
+    ref_frame: &crate::h264::frame::Frame,
+    ref_x: i32,
+    ref_y: i32,
+) -> [[u8; 4]; 4] {
+    let mut out = [[0u8; 4]; 4];
+    for j in 0..4 {
+        for i in 0..4 {
+            let sx = clamp_to_frame(ref_x + i as i32, ref_frame.width);
+            let sy = clamp_to_frame(ref_y + j as i32, ref_frame.height);
+            out[j][i] = ref_frame.get_luma(sx, sy).unwrap_or(0);
+        }
+    }
+    out
+}
+
+/// Fetches a 4×4 chroma block at sub-pel position from the reference
+/// frame.  `mv_x` / `mv_y` are eighth-pel motion vector components
+/// referencing the chroma plane.  The integer position is implicit
+/// in `block_cx` / `block_cy` (chroma-plane coordinates).
+///
+/// Uses the chroma bilinear filter at every sample.
+#[must_use]
+pub fn fetch_chroma_4x4_subpel(
+    ref_frame: &crate::h264::frame::Frame,
+    block_cx: i32,
+    block_cy: i32,
+    mv_x: i32,
+    mv_y: i32,
+    is_cb: bool,
+) -> [[u8; 4]; 4] {
+    let int_x = block_cx + (mv_x >> 3);
+    let int_y = block_cy + (mv_y >> 3);
+    let dx = (mv_x & 7) as u8;
+    let dy = (mv_y & 7) as u8;
+    let cw = ref_frame.chroma_width() as i32;
+    let ch = ref_frame.chroma_height() as i32;
+    let read = |x: i32, y: i32| -> u8 {
+        let sx = clamp_to_dim(x, cw);
+        let sy = clamp_to_dim(y, ch);
+        let v = if is_cb {
+            ref_frame.get_cb(sx as usize, sy as usize)
+        } else {
+            ref_frame.get_cr(sx as usize, sy as usize)
+        };
+        v.unwrap_or(0)
+    };
+
+    let mut out = [[0u8; 4]; 4];
+    for j in 0..4 {
+        for i in 0..4 {
+            let tl = read(int_x + i as i32, int_y + j as i32);
+            let tr = read(int_x + i as i32 + 1, int_y + j as i32);
+            let bl = read(int_x + i as i32, int_y + j as i32 + 1);
+            let br = read(int_x + i as i32 + 1, int_y + j as i32 + 1);
+            out[j][i] = chroma_bilinear([tl, tr, bl, br], dx, dy);
+        }
+    }
+    out
+}
+
+fn clamp_to_frame(p: i32, max: usize) -> usize {
+    clamp_to_dim(p, max as i32) as usize
+}
+
+fn clamp_to_dim(p: i32, max: i32) -> i32 {
+    if p < 0 {
+        0
+    } else if p >= max {
+        max - 1
+    } else {
+        p
+    }
+}
+
 /// Chroma bilinear interpolator at ⅛-pel granularity.
 ///
 /// `four_neighbours` holds the four integer-grid chroma samples
@@ -171,6 +251,66 @@ mod tests {
         for dx in 0..8 {
             for dy in 0..8 {
                 assert_eq!(chroma_bilinear([42, 42, 42, 42], dx, dy), 42);
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_luma_4x4_integer_returns_block_from_frame() {
+        let mut frame = crate::h264::frame::Frame::new(16, 16);
+        // Fill with a recognisable pattern.
+        for y in 0..16 {
+            for x in 0..16 {
+                frame.set_luma(x, y, (x * 16 + y) as u8);
+            }
+        }
+        let block = fetch_luma_4x4_integer(&frame, 4, 8);
+        for j in 0..4 {
+            for i in 0..4 {
+                let expected = ((4 + i) * 16 + (8 + j)) as u8;
+                assert_eq!(block[j][i], expected, "({i}, {j})");
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_luma_4x4_integer_clamps_at_frame_edge() {
+        let mut frame = crate::h264::frame::Frame::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                frame.set_luma(x, y, 7);
+            }
+        }
+        // Request past the bottom-right corner: every sample should
+        // come from the corner pixel.
+        let block = fetch_luma_4x4_integer(&frame, 14, 14);
+        for row in &block {
+            for &v in row {
+                assert_eq!(v, 7);
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_chroma_4x4_subpel_at_integer_position_returns_top_left() {
+        let mut frame = crate::h264::frame::Frame::new(16, 16);
+        frame.set_cb(2, 3, 100);
+        let block = fetch_chroma_4x4_subpel(&frame, 2, 3, 0, 0, true);
+        assert_eq!(block[0][0], 100);
+    }
+
+    #[test]
+    fn fetch_chroma_4x4_subpel_constant_frame_returns_constant_block() {
+        let mut frame = crate::h264::frame::Frame::new(16, 16);
+        for cy in 0..8 {
+            for cx in 0..8 {
+                frame.set_cb(cx, cy, 42);
+            }
+        }
+        let block = fetch_chroma_4x4_subpel(&frame, 2, 2, 3, 5, true);
+        for row in &block {
+            for &v in row {
+                assert_eq!(v, 42);
             }
         }
     }
