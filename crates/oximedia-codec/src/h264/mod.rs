@@ -42,6 +42,7 @@
 pub mod bit_reader;
 pub mod cabac;
 pub mod cabac_init_tables;
+pub mod cabac_mb;
 pub mod cabac_residual;
 pub mod cabac_syntax;
 pub mod cabac_tables;
@@ -72,6 +73,10 @@ pub use deblock::{
 pub use cabac::{
     init_context_state, init_contexts, init_contexts_i_slice, init_contexts_pb_slice,
     CabacContext, CABAC_STATE_LEN,
+};
+pub use cabac_mb::{
+    decode_chroma_residual, decode_intra_mb, decode_luma_residual, decode_mb_qp_delta,
+    ChromaCbfCtxs, Intra4x4Mpms, IntraMbCabac, LumaCbfCtxs, MbLumaResidualInputs, MbResidualState,
 };
 pub use cabac_residual::{
     coded_block_flag_ctx, decode_residual_dc, decode_residual_nondc, ResidualParams,

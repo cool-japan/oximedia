@@ -47,12 +47,13 @@ pub enum IntraMbType {
     /// I_PCM — raw uncoded samples follow.
     IPCM,
     /// I_16x16 — single prediction mode for the entire 16×16 luma
-    /// block.  Carries the encoded `intra_16x16_pred_mode`, a flag
-    /// for nonzero AC coefficients, and the 0..=2 chroma CBP code.
+    /// block.  Carries the intra_16x16 prediction mode plus a packed
+    /// CBP byte (bits 0..=3 = luma AC CBP, bits 4..=5 = chroma CBP).
     I16x16 {
         /// 0..=3, the intra_16x16 prediction mode.
         pred_mode: u8,
-        /// 0..=15 — encodes luma_ac (0 / 15) and chroma_cbp (0..=2).
+        /// Packed CBP: bits 0..=3 are luma (0x0 or 0xF) and bits
+        /// 4..=5 carry chroma (0 = none, 1 = DC only, 2 = DC + AC).
         cbp: u8,
     },
 }
@@ -145,7 +146,7 @@ pub fn decode_intra_mb_type(
 
     IntraMbType::I16x16 {
         pred_mode,
-        cbp: (chroma_cbp << 2) | (luma_ac as u8 * 15),
+        cbp: (chroma_cbp << 4) | (luma_ac as u8 * 15),
     }
 }
 
@@ -458,7 +459,8 @@ mod tests {
             IntraMbType::I4x4 | IntraMbType::IPCM => {}
             IntraMbType::I16x16 { pred_mode, cbp } => {
                 assert!(pred_mode <= 3);
-                assert!(cbp <= 0xF);
+                // Max packed value: (chroma=2 << 4) | (luma=15) = 0x2F.
+                assert!(cbp <= 0x2F);
             }
         }
     }
