@@ -41,6 +41,10 @@ use crate::h264::reconstruct_inter::{
     reconstruct_inter_p_mb, reconstruct_inter_p_mb_multiref, InterPMbInputs,
 };
 use crate::h264::slice_cabac::{parse_slice_cabac, MbKind, SliceCabacContext};
+use crate::h264::slice_cavlc::{
+    cavlc_block_to_position_4x4, cavlc_chroma_ac_to_position, cavlc_chroma_dc_to_position,
+    parse_slice_cavlc, MbCavlcKind,
+};
 use crate::h264::slice_header::{parse_slice_header, NalContext, SliceType};
 use crate::h264::sps::{parse_sps, SpsRbsp};
 use crate::CodecError;
@@ -542,11 +546,89 @@ impl Decoder {
             return Ok(frame);
         }
 
-        // P / B CAVLC slice loop is not yet wired through
-        // pipeline.rs (the inter-CAVLC walker is the last piece on
-        // the roadmap).  Fall back to a mid-grey frame so callers
-        // still see a well-formed picture and the slice counts
-        // toward the DPB.
+        // P slice: walk via parse_slice_cavlc and reconstruct each
+        // recognised macroblock kind.  Unsupported entries
+        // (P_8x8 / P_8x8ref0) get a mid-grey placeholder so the
+        // frame stays well-formed.
+        if sh.slice_type == SliceType::P {
+            let mut reader = BitReader::new(rbsp);
+            reader.skip_bits(slice_header_bits as u32)?;
+            let mbs = parse_slice_cavlc(&mut reader, sps, pps, sh)?;
+
+            let placeholder = Frame::new(pic_width, pic_height);
+            let ref_pic_list_l0 = self.build_ref_pic_list_l0();
+            let primary_ref = ref_pic_list_l0
+                .first()
+                .map(|f| &**f)
+                .unwrap_or(&placeholder);
+
+            for mb in &mbs {
+                match &mb.kind {
+                    MbCavlcKind::Skip => {
+                        let mvs = [(0i32, 0i32); 16];
+                        let luma_4x4 = [[0i32; 16]; 16];
+                        let chroma_dc = [[0i32; 8]; 2];
+                        let chroma_ac = [[0i32; 16]; 8];
+                        let inputs = InterPMbInputs {
+                            mb_x: mb.mb_x,
+                            mb_y: mb.mb_y,
+                            mvs_l0: &mvs,
+                            luma_4x4: &luma_4x4,
+                            chroma_dc: &chroma_dc,
+                            chroma_ac: &chroma_ac,
+                            qp_y: mb.qp_y,
+                            qp_chroma: mb.qp_chroma,
+                        };
+                        reconstruct_inter_p_mb(&mut frame, primary_ref, &inputs)?;
+                    }
+                    MbCavlcKind::InterP {
+                        motion,
+                        luma_blocks,
+                        chroma_dc,
+                        chroma_ac,
+                        is_16x16,
+                        ..
+                    } => {
+                        if !is_16x16 {
+                            fill_mid_grey(&mut frame, mb.mb_x, mb.mb_y);
+                            continue;
+                        }
+                        // Single-partition 16×16: one MV delta from
+                        // the bitstream.  Without an MV neighbour
+                        // cache plumbed through pipeline.rs the
+                        // delta is applied to a zero predictor —
+                        // bit-exact MV reconstruction needs the
+                        // median predictor wired in here.  Real
+                        // motion is still represented because the
+                        // MVD itself is non-zero on coded MBs.
+                        let mv = motion.mvd_l0.first().copied().unwrap_or((0, 0));
+                        let mvs = [mv; 16];
+
+                        let luma_4x4 = build_luma_4x4(luma_blocks);
+                        let chroma_dc_pos = build_chroma_dc(chroma_dc);
+                        let chroma_ac_pos = build_chroma_ac(chroma_ac);
+                        let inputs = InterPMbInputs {
+                            mb_x: mb.mb_x,
+                            mb_y: mb.mb_y,
+                            mvs_l0: &mvs,
+                            luma_4x4: &luma_4x4,
+                            chroma_dc: &chroma_dc_pos,
+                            chroma_ac: &chroma_ac_pos,
+                            qp_y: mb.qp_y,
+                            qp_chroma: mb.qp_chroma,
+                        };
+                        reconstruct_inter_p_mb(&mut frame, primary_ref, &inputs)?;
+                    }
+                    MbCavlcKind::Intra { .. } | MbCavlcKind::Unsupported => {
+                        fill_mid_grey(&mut frame, mb.mb_x, mb.mb_y);
+                    }
+                }
+            }
+            return Ok(frame);
+        }
+
+        // B and the remaining CAVLC paths still emit a mid-grey
+        // frame so the slice counts toward the DPB.
         for y in 0..pic_height {
             for x in 0..pic_width {
                 frame.set_luma(x, y, 128);
@@ -561,6 +643,43 @@ impl Decoder {
         let _ = sps.chroma_format_idc;
         Ok(frame)
     }
+}
+
+fn build_luma_4x4(
+    blocks: &[Option<crate::h264::cavlc::ResidualBlock>; 16],
+) -> [[i32; 16]; 16] {
+    let mut out = [[0i32; 16]; 16];
+    for (i, blk) in blocks.iter().enumerate() {
+        if let Some(b) = blk {
+            out[i] = cavlc_block_to_position_4x4(b);
+        }
+    }
+    out
+}
+
+fn build_chroma_dc(
+    blocks: &[Option<crate::h264::cavlc::ResidualBlock>; 2],
+) -> [[i32; 8]; 2] {
+    let mut out = [[0i32; 8]; 2];
+    for plane in 0..2 {
+        if let Some(b) = &blocks[plane] {
+            let dc = cavlc_chroma_dc_to_position(b);
+            out[plane][..4].copy_from_slice(&dc);
+        }
+    }
+    out
+}
+
+fn build_chroma_ac(
+    blocks: &[Option<crate::h264::cavlc::ResidualBlock>; 8],
+) -> [[i32; 16]; 8] {
+    let mut out = [[0i32; 16]; 8];
+    for (i, blk) in blocks.iter().enumerate() {
+        if let Some(b) = blk {
+            out[i] = cavlc_chroma_ac_to_position(b);
+        }
+    }
+    out
 }
 
 /// Free-function POC type 2 formula (spec § 8.2.1.3).  Exposed
