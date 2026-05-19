@@ -40,6 +40,7 @@
 //! management) extends the workspace; this module stays parsing-only.
 
 pub mod bit_reader;
+pub mod cavlc;
 pub mod macroblock;
 pub mod pps;
 pub mod rbsp;
@@ -49,6 +50,10 @@ pub mod sps;
 pub mod vui;
 
 pub use bit_reader::BitReader;
+pub use cavlc::{
+    decode_residual_block, read_level, read_run_before, read_total_zeros_chroma_dc,
+    read_total_zeros_luma, update_suffix_length, BlockKind, ResidualBlock,
+};
 pub use macroblock::{
     parse_macroblock_layer, InterMotionInfo, Intra16x16PredMode, IntraChromaPredMode,
     IntraNxNPredInfo, MacroblockLayer, MbType, MotionVectorDelta, SubMbType,
