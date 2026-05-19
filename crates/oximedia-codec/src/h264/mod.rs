@@ -51,8 +51,9 @@ pub mod vui;
 
 pub use bit_reader::BitReader;
 pub use cavlc::{
-    decode_residual_block, read_level, read_run_before, read_total_zeros_chroma_dc,
-    read_total_zeros_luma, update_suffix_length, BlockKind, ResidualBlock,
+    decode_residual_block, read_coeff_token, read_level, read_residual_block, read_run_before,
+    read_total_zeros_chroma_dc, read_total_zeros_luma, update_suffix_length, BlockKind,
+    ResidualBlock, COEFF_TOKEN_TABLES_PENDING,
 };
 pub use macroblock::{
     parse_macroblock_layer, InterMotionInfo, Intra16x16PredMode, IntraChromaPredMode,
