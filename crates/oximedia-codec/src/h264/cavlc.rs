@@ -300,14 +300,73 @@ pub fn read_run_before(
     }
 }
 
-/// Decode a residual block given an already-decoded `coeff_token`
-/// (i.e. caller-supplied `total_coeff` / `trailing_ones`).
+/// Reads the `coeff_token` syntax element from the bitstream.
 ///
-/// This signature exists so the level / total_zeros / run_before
-/// machinery is testable independently of the four neighbour-context
-/// `coeff_token` VLC tables that phase 4b-ii introduces.  Once
-/// phase 4b-ii lands, a thin wrapper will read `coeff_token` from the
-/// bitstream and forward to this function.
+/// Selects one of the variable-length code tables based on the
+/// neighbour-context `nc` value (the per-axis average of non-zero
+/// coefficient counts in the top and left neighbours, or -1 for chroma
+/// DC) and scans the table bit-by-bit to recover
+/// `(TotalCoeff, TrailingOnes)`.
+///
+/// # Errors
+///
+/// Returns [`CodecError::InvalidData`] when the bitstream is malformed
+/// or when the selected lookup table is not yet populated.  See
+/// [`COEFF_TOKEN_TABLES_PENDING`] for the list of unpopulated tables.
+pub fn read_coeff_token(
+    r: &mut BitReader<'_>,
+    kind: BlockKind,
+    nc: i32,
+) -> Result<(u8, u8), CodecError> {
+    let _ = (r, kind, nc);
+    // TODO(h264-cavlc): populate the four context-dependent luma
+    // coeff_token tables and the chroma DC table.  Until then this
+    // returns an explicit error so callers cannot silently produce
+    // non-conformant residuals.
+    Err(CodecError::InvalidData(
+        "h264 cavlc: coeff_token lookup tables not yet populated".into(),
+    ))
+}
+
+/// Documentation marker listing CAVLC pieces still pending.
+///
+/// Pending lookup tables:
+///
+/// - Luma `coeff_token` for `nc < 2`.
+/// - Luma `coeff_token` for `nc` in `[2, 4)`.
+/// - Luma `coeff_token` for `nc` in `[4, 8)`.
+/// - Luma `coeff_token` for `nc >= 8` (6-bit fixed-length).
+/// - Chroma DC `coeff_token` for 4:2:0.
+/// - The 14 remaining `total_zeros` columns (`TotalCoeff` 2..=15).
+pub const COEFF_TOKEN_TABLES_PENDING: &str =
+    "luma nc<2, luma nc[2..4), luma nc[4..8), luma nc>=8, chroma DC; \
+     plus total_zeros TC=2..15";
+
+/// Reads and decodes one complete residual block from the bitstream.
+///
+/// Composition: reads `coeff_token` via [`read_coeff_token`] then
+/// forwards to [`decode_residual_block`] with the decoded
+/// `(TotalCoeff, TrailingOnes)` pair.
+///
+/// # Errors
+///
+/// Propagates errors from [`read_coeff_token`] and
+/// [`decode_residual_block`].
+pub fn read_residual_block(
+    r: &mut BitReader<'_>,
+    kind: BlockKind,
+    nc: i32,
+) -> Result<ResidualBlock, CodecError> {
+    let (total_coeff, trailing_ones) = read_coeff_token(r, kind, nc)?;
+    decode_residual_block(r, kind, total_coeff, trailing_ones)
+}
+
+/// Decodes one residual block given an already-decoded `coeff_token`.
+///
+/// Exposed as a separate entry point so the level / total_zeros /
+/// run_before machinery is testable independently of the
+/// context-dependent `coeff_token` lookup tables (see
+/// [`COEFF_TOKEN_TABLES_PENDING`]).
 ///
 /// # Errors
 ///
@@ -812,6 +871,27 @@ mod tests {
             decode_residual_block(&mut r, BlockKind::ChromaDc, 5, 0).is_err(),
             "total_coeff > block max must error"
         );
+    }
+
+    #[test]
+    fn read_coeff_token_errors_until_tables_populated() {
+        let buf = [0xFFu8; 4];
+        let mut r = BitReader::new(&buf);
+        let err = read_coeff_token(&mut r, BlockKind::Luma4x4, 0)
+            .expect_err("must error until tables are populated");
+        match err {
+            CodecError::InvalidData(msg) => {
+                assert!(msg.contains("coeff_token"));
+            }
+            _ => panic!("expected InvalidData"),
+        }
+    }
+
+    #[test]
+    fn read_residual_block_propagates_pending_table_error() {
+        let buf = [0xFFu8; 4];
+        let mut r = BitReader::new(&buf);
+        assert!(read_residual_block(&mut r, BlockKind::ChromaDc, -1).is_err());
     }
 
     #[test]
