@@ -439,6 +439,147 @@ fn bipred_average_4x4(a: &[[u8; 4]; 4], b: &[[u8; 4]; 4]) -> [[u8; 4]; 4] {
     out
 }
 
+/// Reconstructs one inter P macroblock with a multi-reference
+/// frame list.
+///
+/// Behaves identically to [`reconstruct_inter_p_mb`] when
+/// `ref_list_l0` has length 1.  Per 4×4 sub-block, picks the
+/// reference frame at `decoded.ref_l0[sub]` from `ref_list_l0`;
+/// negative or out-of-range indices fall back to zero prediction.
+///
+/// `decoded.ref_l0` is a `&[i8; 16]` — one entry per 4×4
+/// sub-block, mirroring [`crate::h264::inter_cache::InterMbDecoded::ref_l0`].
+///
+/// # Errors
+///
+/// Returns [`CodecError::InvalidData`] when the macroblock extends
+/// past the frame.
+pub fn reconstruct_inter_p_mb_multiref(
+    frame: &mut Frame,
+    ref_list_l0: &[&Frame],
+    inputs: &InterPMbInputs<'_>,
+    ref_idx_per_block: &[i8; 16],
+) -> Result<(), CodecError> {
+    let px = inputs.mb_x.checked_mul(16).ok_or_else(|| {
+        CodecError::InvalidData("h264 reconstruct_inter_p_multiref: mb_x overflow".into())
+    })?;
+    let py = inputs.mb_y.checked_mul(16).ok_or_else(|| {
+        CodecError::InvalidData("h264 reconstruct_inter_p_multiref: mb_y overflow".into())
+    })?;
+    if px + 16 > frame.width || py + 16 > frame.height {
+        return Err(CodecError::InvalidData(format!(
+            "h264 reconstruct_inter_p_multiref: mb ({}, {}) extends past frame {}x{}",
+            inputs.mb_x, inputs.mb_y, frame.width, frame.height
+        )));
+    }
+
+    for sub in 0..16 {
+        let sub_x = (sub % 4) * 4;
+        let sub_y = (sub / 4) * 4;
+        let (mv_x, mv_y) = inputs.mvs_l0[sub];
+        let ref_idx = ref_idx_per_block[sub];
+        let ref_frame = pick_ref_frame(ref_list_l0, ref_idx);
+        let prediction = if let Some(rf) = ref_frame {
+            fetch_luma_4x4_subpel(rf, (px + sub_x) as i32, (py + sub_y) as i32, mv_x, mv_y)
+        } else {
+            [[0u8; 4]; 4]
+        };
+        let residual = if is_all_zero(&inputs.luma_4x4[sub]) {
+            [[0i32; 4]; 4]
+        } else {
+            dequant_and_inverse_transform_4x4_pos(&inputs.luma_4x4[sub], inputs.qp_y)
+        };
+        for j in 0..4 {
+            for i in 0..4 {
+                let pred = i32::from(prediction[j][i]);
+                let v = (pred + residual[j][i]).clamp(0, 255) as u8;
+                frame.set_luma(px + sub_x + i, py + sub_y + j, v);
+            }
+        }
+    }
+
+    let chroma_dc_2x2: [[[i32; 2]; 2]; 2] = [
+        [
+            [inputs.chroma_dc[0][0], inputs.chroma_dc[0][1]],
+            [inputs.chroma_dc[0][2], inputs.chroma_dc[0][3]],
+        ],
+        [
+            [inputs.chroma_dc[1][0], inputs.chroma_dc[1][1]],
+            [inputs.chroma_dc[1][2], inputs.chroma_dc[1][3]],
+        ],
+    ];
+    let chroma_dc_dequant: [[[i32; 2]; 2]; 2] = [
+        inverse_hadamard_2x2_chroma_dc(chroma_dc_2x2[0], inputs.qp_chroma),
+        inverse_hadamard_2x2_chroma_dc(chroma_dc_2x2[1], inputs.qp_chroma),
+    ];
+
+    let cx = inputs.mb_x * 8;
+    let cy = inputs.mb_y * 8;
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+    if cx + 8 > cw || cy + 8 > ch {
+        return Err(CodecError::InvalidData(format!(
+            "h264 reconstruct_inter_p_multiref: chroma at ({}, {}) extends past {}x{}",
+            inputs.mb_x, inputs.mb_y, cw, ch
+        )));
+    }
+
+    for plane in 0..2 {
+        let is_cb = plane == 0;
+        for sub in 0..4 {
+            let sub_x = (sub % 2) * 4;
+            let sub_y = (sub / 2) * 4;
+            let luma_sub = (sub_y / 2) * 4 + (sub_x / 2);
+            let (mv_x, mv_y) = inputs.mvs_l0[luma_sub];
+            let ref_idx = ref_idx_per_block[luma_sub];
+            let ref_frame = pick_ref_frame(ref_list_l0, ref_idx);
+            let prediction = if let Some(rf) = ref_frame {
+                fetch_chroma_4x4_subpel(
+                    rf,
+                    (cx + sub_x) as i32,
+                    (cy + sub_y) as i32,
+                    mv_x,
+                    mv_y,
+                    is_cb,
+                )
+            } else {
+                [[0u8; 4]; 4]
+            };
+            let chroma_idx = 4 * plane + sub;
+            let dc_row = sub / 2;
+            let dc_col = sub % 2;
+            let dc = chroma_dc_dequant[plane][dc_row][dc_col];
+            let mut ac_with_dc = inputs.chroma_ac[chroma_idx];
+            ac_with_dc[0] = dc;
+            let residual = if is_all_zero(&ac_with_dc) {
+                [[0i32; 4]; 4]
+            } else {
+                dequant_and_inverse_transform_4x4_pos(&ac_with_dc, inputs.qp_chroma)
+            };
+            for j in 0..4 {
+                for i in 0..4 {
+                    let pred = i32::from(prediction[j][i]);
+                    let v = (pred + residual[j][i]).clamp(0, 255) as u8;
+                    if is_cb {
+                        frame.set_cb(cx + sub_x + i, cy + sub_y + j, v);
+                    } else {
+                        frame.set_cr(cx + sub_x + i, cy + sub_y + j, v);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn pick_ref_frame<'a>(list: &'a [&'a Frame], idx: i8) -> Option<&'a Frame> {
+    if idx < 0 {
+        return None;
+    }
+    list.get(idx as usize).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
