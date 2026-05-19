@@ -72,6 +72,26 @@ pub fn inverse_scan_4x4(coeffs_scan: &[i32; 16]) -> [[i32; 4]; 4] {
     block
 }
 
+/// Dequantizes + inverse-transforms a 4×4 block whose coefficients
+/// are stored flat in row-major position order (not zig-zag scan).
+///
+/// CABAC residual decoders write `block[scantable[idx]] = coeff`,
+/// producing position-order flat output.  Use this helper instead
+/// of [`dequant_and_inverse_transform_4x4`] when feeding CABAC
+/// output into reconstruction.
+#[must_use]
+pub fn dequant_and_inverse_transform_4x4_pos(
+    block_flat: &[i32; 16],
+    qp: u8,
+) -> [[i32; 4]; 4] {
+    let mut block_2d = [[0i32; 4]; 4];
+    for k in 0..16 {
+        block_2d[k / 4][k % 4] = block_flat[k];
+    }
+    dequantize_4x4(&mut block_2d, qp);
+    inverse_transform_4x4(&block_2d)
+}
+
 /// Dequantizes a 4×4 coefficient block in place.
 ///
 /// Applies the standard H.264 path: multiply each coefficient by the

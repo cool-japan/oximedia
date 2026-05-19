@@ -29,7 +29,9 @@
 
 use crate::h264::frame::Frame;
 use crate::h264::motion::{fetch_chroma_4x4_subpel, fetch_luma_4x4_subpel};
-use crate::h264::transform::dequant_and_inverse_transform_4x4;
+use crate::h264::transform::{
+    dequant_and_inverse_transform_4x4_pos, inverse_hadamard_2x2_chroma_dc,
+};
 use crate::CodecError;
 
 /// Per-macroblock inputs the reconstruction needs.  Fields here are
@@ -44,11 +46,21 @@ pub struct InterPMbInputs<'a> {
     pub mb_y: usize,
     /// Per-4×4 motion vectors in luma quarter-pel units.
     pub mvs_l0: &'a [(i32, i32); 16],
-    /// Per-4×4 luma residual coefficients in scan order.  An entry
-    /// of all zeros is treated as "no residual" and skips IDCT.
+    /// Per-4×4 luma residual coefficients in row-major position
+    /// order (matching CABAC's `decode_residual_nondc` output via
+    /// `block[scantable[idx]] = coeff`).  An entry of all zeros
+    /// is treated as "no residual" and skips IDCT.
     pub luma_4x4: &'a [[i32; 16]; 16],
-    /// Per-chroma-4×4 residual coefficients in scan order: indices
-    /// 0..=3 = Cb, 4..=7 = Cr.
+    /// Chroma DC blocks for the macroblock — `[0]` = Cb 2×2 DC,
+    /// `[1]` = Cr 2×2 DC.  Only the first 4 entries of each
+    /// sub-array are meaningful for 4:2:0; they store the 2×2 DC
+    /// block in row-major (`[0]` = (0, 0), `[1]` = (0, 1),
+    /// `[2]` = (1, 0), `[3]` = (1, 1)).
+    pub chroma_dc: &'a [[i32; 8]; 2],
+    /// Per-chroma-4×4 residual coefficients in row-major position
+    /// order (15 AC slots; DC slot at index 0 is overwritten by
+    /// the inverse-Hadamard chroma DC values inside this
+    /// reconstruction function).  Indices: 0..=3 = Cb, 4..=7 = Cr.
     pub chroma_ac: &'a [[i32; 16]; 8],
     /// Effective luma QP for this macroblock.
     pub qp_y: u8,
@@ -95,7 +107,7 @@ pub fn reconstruct_inter_p_mb(
         let residual = if is_all_zero(&inputs.luma_4x4[sub]) {
             [[0i32; 4]; 4]
         } else {
-            dequant_and_inverse_transform_4x4(&inputs.luma_4x4[sub], inputs.qp_y)
+            dequant_and_inverse_transform_4x4_pos(&inputs.luma_4x4[sub], inputs.qp_y)
         };
         for j in 0..4 {
             for i in 0..4 {
@@ -105,6 +117,24 @@ pub fn reconstruct_inter_p_mb(
             }
         }
     }
+
+    // Inverse-Hadamard the 2×2 chroma DC blocks before walking the
+    // chroma 4×4 sub-blocks — each DC value is folded into the
+    // corresponding 4×4 AC block's DC slot.
+    let chroma_dc_2x2: [[[i32; 2]; 2]; 2] = [
+        [
+            [inputs.chroma_dc[0][0], inputs.chroma_dc[0][1]],
+            [inputs.chroma_dc[0][2], inputs.chroma_dc[0][3]],
+        ],
+        [
+            [inputs.chroma_dc[1][0], inputs.chroma_dc[1][1]],
+            [inputs.chroma_dc[1][2], inputs.chroma_dc[1][3]],
+        ],
+    ];
+    let chroma_dc_dequant: [[[i32; 2]; 2]; 2] = [
+        inverse_hadamard_2x2_chroma_dc(chroma_dc_2x2[0], inputs.qp_chroma),
+        inverse_hadamard_2x2_chroma_dc(chroma_dc_2x2[1], inputs.qp_chroma),
+    ];
 
     // Chroma 4:2:0 — chroma plane is half-resolution per axis.
     // Each macroblock covers an 8×8 chroma block (4 × 4×4 sub-blocks)
@@ -146,10 +176,20 @@ pub fn reconstruct_inter_p_mb(
                 is_cb,
             );
             let chroma_idx = 4 * plane + sub;
-            let residual = if is_all_zero(&inputs.chroma_ac[chroma_idx]) {
+            // Inject the inverse-Hadamard chroma DC value into the
+            // 4×4 block's DC slot before running IDCT.  Chroma
+            // sub-block ordering matches the 2×2 DC layout: sub=0
+            // ↔ (0, 0), sub=1 ↔ (0, 1), sub=2 ↔ (1, 0), sub=3 ↔
+            // (1, 1).
+            let dc_row = sub / 2;
+            let dc_col = sub % 2;
+            let dc = chroma_dc_dequant[plane][dc_row][dc_col];
+            let mut ac_with_dc = inputs.chroma_ac[chroma_idx];
+            ac_with_dc[0] = dc;
+            let residual = if is_all_zero(&ac_with_dc) {
                 [[0i32; 4]; 4]
             } else {
-                dequant_and_inverse_transform_4x4(&inputs.chroma_ac[chroma_idx], inputs.qp_chroma)
+                dequant_and_inverse_transform_4x4_pos(&ac_with_dc, inputs.qp_chroma)
             };
 
             for j in 0..4 {
@@ -203,12 +243,14 @@ mod tests {
         let ref_frame = make_frame(120);
         let mvs = [(0i32, 0i32); 16];
         let luma_4x4 = [[0i32; 16]; 16];
+        let chroma_dc = [[0i32; 8]; 2];
         let chroma_ac = [[0i32; 16]; 8];
         let inputs = InterPMbInputs {
             mb_x: 0,
             mb_y: 0,
             mvs_l0: &mvs,
             luma_4x4: &luma_4x4,
+            chroma_dc: &chroma_dc,
             chroma_ac: &chroma_ac,
             qp_y: 26,
             qp_chroma: 26,
@@ -227,16 +269,54 @@ mod tests {
         let ref_frame = Frame::new(16, 16);
         let mvs = [(0i32, 0i32); 16];
         let luma_4x4 = [[0i32; 16]; 16];
+        let chroma_dc = [[0i32; 8]; 2];
         let chroma_ac = [[0i32; 16]; 8];
         let inputs = InterPMbInputs {
             mb_x: 2,
             mb_y: 0,
             mvs_l0: &mvs,
             luma_4x4: &luma_4x4,
+            chroma_dc: &chroma_dc,
             chroma_ac: &chroma_ac,
             qp_y: 26,
             qp_chroma: 26,
         };
         assert!(reconstruct_inter_p_mb(&mut frame, &ref_frame, &inputs).is_err());
+    }
+
+    #[test]
+    fn nonzero_chroma_dc_perturbs_chroma_samples() {
+        let mut frame = Frame::new(16, 16);
+        let ref_frame = make_frame(0);
+        let mvs = [(0i32, 0i32); 16];
+        let luma_4x4 = [[0i32; 16]; 16];
+        // One nonzero chroma DC for Cb sub-block 0 — the inverse
+        // Hadamard distributes it across all four Cb sub-blocks.
+        let mut chroma_dc = [[0i32; 8]; 2];
+        chroma_dc[0][0] = 4;
+        let chroma_ac = [[0i32; 16]; 8];
+        let inputs = InterPMbInputs {
+            mb_x: 0,
+            mb_y: 0,
+            mvs_l0: &mvs,
+            luma_4x4: &luma_4x4,
+            chroma_dc: &chroma_dc,
+            chroma_ac: &chroma_ac,
+            qp_y: 26,
+            qp_chroma: 26,
+        };
+        reconstruct_inter_p_mb(&mut frame, &ref_frame, &inputs).unwrap();
+        // The Cb samples should now differ from the reference's
+        // initial 0; we don't pin the exact value but at least one
+        // sample should be > 0.
+        let mut any_nonzero = false;
+        for y in 0..8 {
+            for x in 0..8 {
+                if frame.get_cb(x, y).unwrap() > 0 {
+                    any_nonzero = true;
+                }
+            }
+        }
+        assert!(any_nonzero, "chroma DC injection did not perturb any Cb sample");
     }
 }
