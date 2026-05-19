@@ -256,6 +256,49 @@ fn clip_qp(qp: i32) -> i32 {
     qp.rem_euclid(52)
 }
 
+/// Position-order layout of a 4×4 block after applying the
+/// standard zig-zag scan to the CAVLC `ResidualBlock`'s
+/// `to_scan_order` output.  Suitable input for
+/// [`crate::h264::transform::dequant_and_inverse_transform_4x4_pos`].
+#[must_use]
+pub fn cavlc_block_to_position_4x4(block: &ResidualBlock) -> [i32; 16] {
+    let scan = block.to_scan_order();
+    const ZIGZAG_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+    let mut out = [0i32; 16];
+    for (i, &val) in scan.iter().enumerate().take(16) {
+        out[ZIGZAG_4X4[i]] = val;
+    }
+    out
+}
+
+/// Position-order layout for the 4 entries of a 4:2:0 chroma DC
+/// block.  Chroma DC scan is the identity [0, 1, 2, 3] in raster
+/// inside a 2×2 layout.
+#[must_use]
+pub fn cavlc_chroma_dc_to_position(block: &ResidualBlock) -> [i32; 4] {
+    let scan = block.to_scan_order();
+    let mut out = [0i32; 4];
+    for (i, &val) in scan.iter().enumerate().take(4) {
+        out[i] = val;
+    }
+    out
+}
+
+/// Position-order layout for a chroma 4×4 AC block (15 entries
+/// starting at scan position 1 — DC slot is filled separately by
+/// the inverse-Hadamard chroma DC).
+#[must_use]
+pub fn cavlc_chroma_ac_to_position(block: &ResidualBlock) -> [i32; 16] {
+    let scan = block.to_scan_order();
+    const ZIGZAG_AC: [usize; 15] =
+        [1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+    let mut out = [0i32; 16];
+    for (i, &val) in scan.iter().enumerate().take(15) {
+        out[ZIGZAG_AC[i]] = val;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
