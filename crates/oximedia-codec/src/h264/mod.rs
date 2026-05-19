@@ -51,6 +51,7 @@ pub mod cabac_tables;
 pub mod cavlc;
 pub mod cavlc_tables;
 pub mod deblock;
+pub mod deblock_frame;
 pub mod decoder;
 pub mod dpb;
 pub mod frame;
@@ -75,6 +76,7 @@ pub use deblock::{
     alpha_threshold, beta_threshold, boundary_strength, deblock_mb_luma, normal_filter_line,
     should_filter_line, strong_filter_line, DeblockBlockInfo,
 };
+pub use deblock_frame::{deblock_frame_luma, DeblockMbState};
 pub use cabac::{
     init_context_state, init_contexts, init_contexts_i_slice, init_contexts_pb_slice,
     CabacContext, CABAC_STATE_LEN,
