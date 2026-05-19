@@ -27,9 +27,10 @@
 //! land.
 
 use crate::h264::frame::{
-    collect_chroma_8x8_neighbours, collect_intra16x16_neighbours, Frame,
+    collect_chroma_8x8_neighbours, collect_intra16x16_neighbours, collect_intra4x4_neighbours,
+    Frame,
 };
-use crate::h264::intra_pred::{predict_16x16, predict_chroma_8x8};
+use crate::h264::intra_pred::{predict_16x16, predict_4x4, predict_chroma_8x8, Intra4x4Mode};
 use crate::h264::macroblock::{Intra16x16PredMode, IntraChromaPredMode};
 use crate::h264::transform::dequant_and_inverse_transform_4x4;
 use crate::CodecError;
@@ -175,6 +176,76 @@ pub fn decode_intra_chroma_8x8(
     Ok(())
 }
 
+/// Decodes one `I_NxN` luma macroblock (16 separate 4×4 intra
+/// predictions) and writes the reconstructed luma samples into the
+/// frame.
+///
+/// `intra4x4_modes` is the array of 16 already-resolved 4×4 intra
+/// modes in raster order — see
+/// [`crate::h264::intra_mode::resolve_intra4x4_mode`] for the
+/// MPM-based resolution from the bitstream's
+/// `(prev_intra4x4_pred_mode_flag, rem_intra4x4_pred_mode)` pair.
+///
+/// Each sub-block is predicted from its own neighbour samples
+/// (gathered fresh from the frame after the previous sub-block's
+/// reconstructed pixels have been written back), then optionally
+/// summed with its residual.
+///
+/// # Errors
+///
+/// Returns [`CodecError::InvalidData`] when the macroblock extends
+/// past the frame.
+pub fn decode_intra_4x4_mb(
+    frame: &mut Frame,
+    mb_x: usize,
+    mb_y: usize,
+    intra4x4_modes: &[Intra4x4Mode; 16],
+    luma_4x4_residuals: &[Residual4x4Scan; 16],
+    qp_y: u8,
+) -> Result<(), CodecError> {
+    let px = mb_x.checked_mul(16).ok_or_else(|| CodecError::InvalidData(
+        "h264 decoder: macroblock x position overflows".into(),
+    ))?;
+    let py = mb_y.checked_mul(16).ok_or_else(|| CodecError::InvalidData(
+        "h264 decoder: macroblock y position overflows".into(),
+    ))?;
+    if px + 16 > frame.width || py + 16 > frame.height {
+        return Err(CodecError::InvalidData(format!(
+            "h264 decoder: macroblock at ({mb_x}, {mb_y}) extends past frame ({}x{})",
+            frame.width, frame.height,
+        )));
+    }
+
+    for sub in 0..16 {
+        let sub_x_in_mb = (sub % 4) * 4;
+        let sub_y_in_mb = (sub / 4) * 4;
+        let block_x = px + sub_x_in_mb;
+        let block_y = py + sub_y_in_mb;
+
+        // Re-gather neighbours after each sub-block — the previous
+        // sub-block may have just written pixels that are this
+        // sub-block's left or top neighbour.
+        let neighbours = collect_intra4x4_neighbours(frame, block_x, block_y);
+        let prediction = predict_4x4(intra4x4_modes[sub], &neighbours);
+
+        let residual_block = match luma_4x4_residuals[sub] {
+            None => [[0i32; 4]; 4],
+            Some(scan) => dequant_and_inverse_transform_4x4(&scan, qp_y),
+        };
+
+        for j in 0..4 {
+            for i in 0..4 {
+                let pred = i32::from(prediction[j][i]);
+                let res = residual_block[j][i];
+                let sample = (pred + res).clamp(0, 255) as u8;
+                frame.set_luma(block_x + i, block_y + j, sample);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +384,60 @@ mod tests {
                     frame.get_cb(7, cy),
                     "({cx}, {cy}) should mirror (7, {cy})",
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn intra_4x4_mb_with_no_neighbours_writes_128_block() {
+        let mut frame = Frame::new(16, 16);
+        let modes = [Intra4x4Mode::Dc; 16];
+        decode_intra_4x4_mb(
+            &mut frame,
+            0,
+            0,
+            &modes,
+            &empty_luma_residuals(),
+            28,
+        )
+        .expect("should decode");
+        // All-DC with no neighbours = 128 fallback for the top-left
+        // 4×4.  Subsequent 4×4 blocks within the MB pick up DC from
+        // the previously-written 128 pixels and stay 128.
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(frame.get_luma(x, y), Some(128), "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn intra_4x4_mb_propagates_neighbour_writes_between_sub_blocks() {
+        let mut frame = Frame::new(16, 32);
+        // Pre-populate the top row (above mb_y == 0 is out-of-frame,
+        // so use mb (0, 1) and write the row above it).
+        for x in 0..16 {
+            frame.set_luma(x, 15, 60);
+        }
+        // Also fill column left of (0, 1) — but at mb_x == 0 there is
+        // no left neighbour anyway, so this is a no-op.
+        // Set all 16 4×4 blocks to Vertical mode.
+        let modes = [Intra4x4Mode::Vertical; 16];
+        decode_intra_4x4_mb(
+            &mut frame,
+            0,
+            1,
+            &modes,
+            &empty_luma_residuals(),
+            28,
+        )
+        .expect("should decode");
+        // Every pixel of macroblock (0, 1) should equal 60: the first
+        // row of 4×4 blocks copies the top row, then subsequent rows
+        // of 4×4 blocks pick up 60 from the just-decoded rows above.
+        for y in 16..32 {
+            for x in 0..16 {
+                assert_eq!(frame.get_luma(x, y), Some(60), "pixel ({x}, {y})");
             }
         }
     }
