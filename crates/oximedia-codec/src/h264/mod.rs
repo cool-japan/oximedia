@@ -41,6 +41,7 @@
 
 pub mod bit_reader;
 pub mod cavlc;
+pub mod frame;
 pub mod intra_pred;
 pub mod macroblock;
 pub mod pps;
@@ -57,6 +58,7 @@ pub use cavlc::{
     read_total_zeros_chroma_dc, read_total_zeros_luma, update_suffix_length, BlockKind,
     ResidualBlock, COEFF_TOKEN_TABLES_PENDING,
 };
+pub use frame::{collect_intra4x4_neighbours, Frame};
 pub use intra_pred::{
     predict_4x4, predict_16x16, predict_chroma_8x8, ChromaIntra8x8Neighbours, Intra16x16Neighbours,
     Intra4x4Mode, Intra4x4Neighbours,
