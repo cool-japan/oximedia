@@ -22,7 +22,9 @@
 //! parse + per-block decode + write back into the frame) is the next
 //! step.
 
-use crate::h264::intra_pred::Intra4x4Neighbours;
+use crate::h264::intra_pred::{
+    ChromaIntra8x8Neighbours, Intra16x16Neighbours, Intra4x4Neighbours,
+};
 
 /// A 4:2:0 YUV frame with byte-per-sample precision.
 ///
@@ -197,6 +199,109 @@ pub fn collect_intra4x4_neighbours(
         top_left,
         top,
         top_right,
+        left,
+    }
+}
+
+/// Gathers neighbour samples for a 16×16 luma macroblock prediction.
+///
+/// `mb_x` and `mb_y` are *macroblock-unit* coordinates (each unit
+/// covers 16 luma samples).
+#[must_use]
+pub fn collect_intra16x16_neighbours(
+    frame: &Frame,
+    mb_x: usize,
+    mb_y: usize,
+) -> Intra16x16Neighbours {
+    let px = mb_x * 16;
+    let py = mb_y * 16;
+
+    let top = if py == 0 {
+        None
+    } else {
+        let mut t = [0u8; 16];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = frame.get_luma(px + i, py - 1).unwrap_or(0);
+        }
+        Some(t)
+    };
+
+    let left = if px == 0 {
+        None
+    } else {
+        let mut l = [0u8; 16];
+        for (j, slot) in l.iter_mut().enumerate() {
+            *slot = frame.get_luma(px - 1, py + j).unwrap_or(0);
+        }
+        Some(l)
+    };
+
+    let top_left = if px == 0 || py == 0 {
+        None
+    } else {
+        frame.get_luma(px - 1, py - 1)
+    };
+
+    Intra16x16Neighbours {
+        top_left,
+        top,
+        left,
+    }
+}
+
+/// Gathers neighbour samples for an 8×8 chroma intra prediction on
+/// one component (Cb or Cr).
+///
+/// `mb_x` / `mb_y` are macroblock-unit coordinates; the corresponding
+/// chroma block's top-left corner sits at `(mb_x * 8, mb_y * 8)` in
+/// chroma-plane coordinates.  `is_cb` picks the Cb plane when true,
+/// otherwise Cr.
+#[must_use]
+pub fn collect_chroma_8x8_neighbours(
+    frame: &Frame,
+    mb_x: usize,
+    mb_y: usize,
+    is_cb: bool,
+) -> ChromaIntra8x8Neighbours {
+    let cx = mb_x * 8;
+    let cy = mb_y * 8;
+    let read = |x: usize, y: usize| -> Option<u8> {
+        if is_cb {
+            frame.get_cb(x, y)
+        } else {
+            frame.get_cr(x, y)
+        }
+    };
+
+    let top = if cy == 0 {
+        None
+    } else {
+        let mut t = [0u8; 8];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = read(cx + i, cy - 1).unwrap_or(0);
+        }
+        Some(t)
+    };
+
+    let left = if cx == 0 {
+        None
+    } else {
+        let mut l = [0u8; 8];
+        for (j, slot) in l.iter_mut().enumerate() {
+            *slot = read(cx - 1, cy + j).unwrap_or(0);
+        }
+        Some(l)
+    };
+
+    let top_left = if cx == 0 || cy == 0 {
+        None
+    } else {
+        read(cx - 1, cy - 1)
+    };
+
+    ChromaIntra8x8Neighbours {
+        top_left,
+        top,
         left,
     }
 }
