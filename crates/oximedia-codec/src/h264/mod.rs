@@ -41,6 +41,7 @@
 
 pub mod bit_reader;
 pub mod cabac;
+pub mod cabac_init_tables;
 pub mod cabac_tables;
 pub mod cavlc;
 pub mod cavlc_tables;
@@ -66,7 +67,10 @@ pub use deblock::{
     alpha_threshold, beta_threshold, boundary_strength, deblock_mb_luma, normal_filter_line,
     should_filter_line, strong_filter_line, DeblockBlockInfo,
 };
-pub use cabac::CabacContext;
+pub use cabac::{
+    init_context_state, init_contexts, init_contexts_i_slice, init_contexts_pb_slice,
+    CabacContext,
+};
 pub use cavlc::{
     decode_residual_block, read_coeff_token, read_level, read_residual_block, read_run_before,
     read_total_zeros_chroma_dc, read_total_zeros_luma, update_suffix_length, BlockKind,
