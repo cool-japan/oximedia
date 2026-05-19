@@ -43,6 +43,7 @@ pub mod bit_reader;
 pub mod cabac;
 pub mod cabac_init_tables;
 pub mod cabac_inter;
+pub mod cabac_inter_b;
 pub mod cabac_inter_mb;
 pub mod cabac_mb;
 pub mod cabac_residual;
@@ -88,6 +89,7 @@ pub use cabac_inter::{
     decode_b_mb_type, decode_p_mb_type, BMbInfo, InterMbResult, InterPartShape, PMbInfo,
     RefListUse, B_MB_TYPE_INFO, P_MB_TYPE_INFO,
 };
+pub use cabac_inter_b::{decode_b_mb_cabac, BMbOutcome};
 pub use cabac_inter_mb::{decode_p_mb_cabac, MbNeighbours, PMbOutcome};
 pub use cabac_mb::{
     decode_chroma_residual, decode_intra_mb, decode_luma_residual, decode_mb_qp_delta,
@@ -139,7 +141,9 @@ pub use macroblock::{
 };
 pub use pps::{parse_pps, PpsRbsp};
 pub use rbsp::{strip_emulation_prevention, trailing_bits_len};
-pub use reconstruct_inter::{reconstruct_inter_p_mb, InterPMbInputs};
+pub use reconstruct_inter::{
+    reconstruct_inter_b_mb, reconstruct_inter_p_mb, InterBMbInputs, InterPMbInputs,
+};
 pub use scaling_list::{
     read_pic_scaling_matrix, read_seq_scaling_matrix, ScalingList4x4, ScalingList8x8,
     ScalingListChoice, ScalingLists,
