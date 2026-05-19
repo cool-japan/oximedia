@@ -216,6 +216,229 @@ fn is_all_zero(block: &[i32; 16]) -> bool {
     block.iter().all(|&c| c == 0)
 }
 
+/// Per-macroblock inputs for a bi-predicted (B-slice) inter
+/// reconstruction.  Mirrors [`InterPMbInputs`] but carries both
+/// L0 and L1 motion data.
+#[derive(Debug, Clone)]
+pub struct InterBMbInputs<'a> {
+    /// Macroblock column.
+    pub mb_x: usize,
+    /// Macroblock row.
+    pub mb_y: usize,
+    /// Per-4×4 L0 motion vectors in luma quarter-pel units.
+    pub mvs_l0: &'a [(i32, i32); 16],
+    /// Per-4×4 L1 motion vectors.
+    pub mvs_l1: &'a [(i32, i32); 16],
+    /// Per-4×4 L0 ref indices; `-1` when this sub-block does not
+    /// use list 0 (B_L1 partitions, B_Direct with `iCbCr` flag, …).
+    pub refs_l0: &'a [i8; 16],
+    /// Per-4×4 L1 ref indices; `-1` when unused.
+    pub refs_l1: &'a [i8; 16],
+    /// Luma residual blocks in row-major position order.
+    pub luma_4x4: &'a [[i32; 16]; 16],
+    /// Chroma DC (Cb at `[0]`, Cr at `[1]`) — first 4 entries used.
+    pub chroma_dc: &'a [[i32; 8]; 2],
+    /// Chroma AC residuals (0..=3 = Cb, 4..=7 = Cr).
+    pub chroma_ac: &'a [[i32; 16]; 8],
+    /// Effective luma QP.
+    pub qp_y: u8,
+    /// Effective chroma QP.
+    pub qp_chroma: u8,
+}
+
+/// Reconstructs one B-slice macroblock with optional bi-prediction.
+///
+/// For each 4×4 sub-block:
+///
+/// - If only `refs_l0[sub] >= 0`: motion-compensate from
+///   `ref_l0_frame` (P-style fetch).
+/// - If only `refs_l1[sub] >= 0`: from `ref_l1_frame`.
+/// - If both: fetch from each, average per sample.
+/// - Otherwise (rare — only B_Direct with neither list used): use
+///   zero prediction.
+///
+/// Residual addition + clipping + write-back is identical to the P
+/// path.
+///
+/// # Errors
+///
+/// Returns [`CodecError::InvalidData`] when the macroblock or its
+/// chroma counterpart extends past the frame.
+pub fn reconstruct_inter_b_mb(
+    frame: &mut Frame,
+    ref_l0_frame: &Frame,
+    ref_l1_frame: &Frame,
+    inputs: &InterBMbInputs<'_>,
+) -> Result<(), CodecError> {
+    let px = inputs.mb_x.checked_mul(16).ok_or_else(|| {
+        CodecError::InvalidData("h264 reconstruct_inter_b: mb_x overflow".into())
+    })?;
+    let py = inputs.mb_y.checked_mul(16).ok_or_else(|| {
+        CodecError::InvalidData("h264 reconstruct_inter_b: mb_y overflow".into())
+    })?;
+    if px + 16 > frame.width || py + 16 > frame.height {
+        return Err(CodecError::InvalidData(format!(
+            "h264 reconstruct_inter_b: mb ({}, {}) extends past frame {}x{}",
+            inputs.mb_x, inputs.mb_y, frame.width, frame.height
+        )));
+    }
+
+    for sub in 0..16 {
+        let sub_x = (sub % 4) * 4;
+        let sub_y = (sub / 4) * 4;
+        let uses_l0 = inputs.refs_l0[sub] >= 0;
+        let uses_l1 = inputs.refs_l1[sub] >= 0;
+        let pred_l0 = if uses_l0 {
+            let (mv_x, mv_y) = inputs.mvs_l0[sub];
+            fetch_luma_4x4_subpel(
+                ref_l0_frame,
+                (px + sub_x) as i32,
+                (py + sub_y) as i32,
+                mv_x,
+                mv_y,
+            )
+        } else {
+            [[0u8; 4]; 4]
+        };
+        let pred_l1 = if uses_l1 {
+            let (mv_x, mv_y) = inputs.mvs_l1[sub];
+            fetch_luma_4x4_subpel(
+                ref_l1_frame,
+                (px + sub_x) as i32,
+                (py + sub_y) as i32,
+                mv_x,
+                mv_y,
+            )
+        } else {
+            [[0u8; 4]; 4]
+        };
+        let prediction: [[u8; 4]; 4] = match (uses_l0, uses_l1) {
+            (true, true) => bipred_average_4x4(&pred_l0, &pred_l1),
+            (true, false) => pred_l0,
+            (false, true) => pred_l1,
+            (false, false) => [[0u8; 4]; 4],
+        };
+        let residual = if is_all_zero(&inputs.luma_4x4[sub]) {
+            [[0i32; 4]; 4]
+        } else {
+            dequant_and_inverse_transform_4x4_pos(&inputs.luma_4x4[sub], inputs.qp_y)
+        };
+        for j in 0..4 {
+            for i in 0..4 {
+                let pred = i32::from(prediction[j][i]);
+                let v = (pred + residual[j][i]).clamp(0, 255) as u8;
+                frame.set_luma(px + sub_x + i, py + sub_y + j, v);
+            }
+        }
+    }
+
+    // Chroma 4:2:0 — analogous bi-pred fetch + residual addition.
+    let chroma_dc_2x2: [[[i32; 2]; 2]; 2] = [
+        [
+            [inputs.chroma_dc[0][0], inputs.chroma_dc[0][1]],
+            [inputs.chroma_dc[0][2], inputs.chroma_dc[0][3]],
+        ],
+        [
+            [inputs.chroma_dc[1][0], inputs.chroma_dc[1][1]],
+            [inputs.chroma_dc[1][2], inputs.chroma_dc[1][3]],
+        ],
+    ];
+    let chroma_dc_dequant: [[[i32; 2]; 2]; 2] = [
+        inverse_hadamard_2x2_chroma_dc(chroma_dc_2x2[0], inputs.qp_chroma),
+        inverse_hadamard_2x2_chroma_dc(chroma_dc_2x2[1], inputs.qp_chroma),
+    ];
+
+    let cx = inputs.mb_x * 8;
+    let cy = inputs.mb_y * 8;
+    let cw = frame.chroma_width();
+    let ch = frame.chroma_height();
+    if cx + 8 > cw || cy + 8 > ch {
+        return Err(CodecError::InvalidData(format!(
+            "h264 reconstruct_inter_b: chroma at ({}, {}) extends past {}x{}",
+            inputs.mb_x, inputs.mb_y, cw, ch
+        )));
+    }
+
+    for plane in 0..2 {
+        let is_cb = plane == 0;
+        for sub in 0..4 {
+            let sub_x = (sub % 2) * 4;
+            let sub_y = (sub / 2) * 4;
+            let luma_sub = (sub_y / 2) * 4 + (sub_x / 2);
+            let uses_l0 = inputs.refs_l0[luma_sub] >= 0;
+            let uses_l1 = inputs.refs_l1[luma_sub] >= 0;
+            let pred_l0 = if uses_l0 {
+                let (mv_x, mv_y) = inputs.mvs_l0[luma_sub];
+                fetch_chroma_4x4_subpel(
+                    ref_l0_frame,
+                    (cx + sub_x) as i32,
+                    (cy + sub_y) as i32,
+                    mv_x,
+                    mv_y,
+                    is_cb,
+                )
+            } else {
+                [[0u8; 4]; 4]
+            };
+            let pred_l1 = if uses_l1 {
+                let (mv_x, mv_y) = inputs.mvs_l1[luma_sub];
+                fetch_chroma_4x4_subpel(
+                    ref_l1_frame,
+                    (cx + sub_x) as i32,
+                    (cy + sub_y) as i32,
+                    mv_x,
+                    mv_y,
+                    is_cb,
+                )
+            } else {
+                [[0u8; 4]; 4]
+            };
+            let prediction: [[u8; 4]; 4] = match (uses_l0, uses_l1) {
+                (true, true) => bipred_average_4x4(&pred_l0, &pred_l1),
+                (true, false) => pred_l0,
+                (false, true) => pred_l1,
+                (false, false) => [[0u8; 4]; 4],
+            };
+            let chroma_idx = 4 * plane + sub;
+            let dc_row = sub / 2;
+            let dc_col = sub % 2;
+            let dc = chroma_dc_dequant[plane][dc_row][dc_col];
+            let mut ac_with_dc = inputs.chroma_ac[chroma_idx];
+            ac_with_dc[0] = dc;
+            let residual = if is_all_zero(&ac_with_dc) {
+                [[0i32; 4]; 4]
+            } else {
+                dequant_and_inverse_transform_4x4_pos(&ac_with_dc, inputs.qp_chroma)
+            };
+            for j in 0..4 {
+                for i in 0..4 {
+                    let pred = i32::from(prediction[j][i]);
+                    let v = (pred + residual[j][i]).clamp(0, 255) as u8;
+                    if is_cb {
+                        frame.set_cb(cx + sub_x + i, cy + sub_y + j, v);
+                    } else {
+                        frame.set_cr(cx + sub_x + i, cy + sub_y + j, v);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Per-sample average of two 4×4 prediction patches with the
+/// standard rounding `(a + b + 1) / 2` per spec § 8.4.2.3.
+fn bipred_average_4x4(a: &[[u8; 4]; 4], b: &[[u8; 4]; 4]) -> [[u8; 4]; 4] {
+    let mut out = [[0u8; 4]; 4];
+    for j in 0..4 {
+        for i in 0..4 {
+            out[j][i] = ((u16::from(a[j][i]) + u16::from(b[j][i]) + 1) >> 1) as u8;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
