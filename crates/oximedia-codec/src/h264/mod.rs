@@ -43,6 +43,7 @@ pub mod bit_reader;
 pub mod cavlc;
 pub mod deblock;
 pub mod decoder;
+pub mod dpb;
 pub mod frame;
 pub mod intra_mode;
 pub mod intra_pred;
@@ -70,6 +71,7 @@ pub use cavlc::{
 pub use decoder::{
     decode_intra_16x16_mb, decode_intra_4x4_mb, decode_intra_chroma_8x8, Residual4x4Scan,
 };
+pub use dpb::{Dpb, DpbEntry, DpbError};
 pub use intra_mode::{
     most_probable_mode, resolve_intra4x4_mode, Intra4x4ModeContext,
 };
