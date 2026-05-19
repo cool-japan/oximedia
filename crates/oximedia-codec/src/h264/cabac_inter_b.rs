@@ -99,14 +99,12 @@ pub fn decode_b_mb_cabac(
     };
 
     if info.direct {
-        // B_Direct_16x16 — fill placeholder MVs/refs.  Full direct
-        // inference per spec § 8.4.1.2 is a follow-up.
-        for b in 0..16 {
-            decoded.ref_l0[b] = 0;
-            decoded.ref_l1[b] = 0;
-            decoded.mv_l0[b] = (0, 0);
-            decoded.mv_l1[b] = (0, 0);
-        }
+        // B_Direct_16x16 — spec § 8.4.1.2.2 spatial direct
+        // prediction.  Per 8×8 sub-MB, derive ref + MV from the
+        // spatial neighbours for each list.  Temporal direct mode
+        // requires the collocated picture's MV cache (not yet
+        // tracked) and is out of scope.
+        apply_b_direct_spatial(neighbours, &mut decoded);
         let cbp_luma = decode_cbp_luma(cabac, states, neighbours.left_cbp, neighbours.top_cbp);
         let cbp_chroma = decode_cbp_chroma(cabac, states, neighbours.left_cbp, neighbours.top_cbp);
         decoded.cbp = (cbp_chroma << 4) | cbp_luma;
@@ -283,6 +281,129 @@ fn decode_partition_for_list_use(
     }
 }
 
+/// Spatial direct prediction for B_Direct_16x16 (spec § 8.4.1.2.2).
+///
+/// Splits the macroblock into 4 8×8 sub-MBs.  For each sub-MB and
+/// each reference list:
+///
+/// 1. Pick the minimum non-negative ref index from the spatial
+///    neighbours (A = left, B = above, C = above-right).  If none
+///    of the three has a valid ref for that list, the sub-MB does
+///    not use that list (ref = -1).
+/// 2. If neither list has a valid ref, fall back to (ref_l0 = 0,
+///    ref_l1 = 0) so the partition becomes Bi with both refs at 0.
+/// 3. Derive the MV via the standard median predictor on the
+///    matching list's neighbour MVs.  This implementation omits
+///    the `directZeroPredictionFlag` shortcut (which requires the
+///    collocated block's MV from the temporal reference and isn't
+///    tracked yet).
+fn apply_b_direct_spatial(neighbours: &MbNeighbours, decoded: &mut InterMbDecoded) {
+    for q in 0..4 {
+        let blocks: [usize; 4] = match q {
+            0 => [0, 1, 4, 5],
+            1 => [2, 3, 6, 7],
+            2 => [8, 9, 12, 13],
+            _ => [10, 11, 14, 15],
+        };
+        let first = blocks[0];
+        let row = first / 4;
+        let col = first % 4;
+
+        let (ref_a_l0, mv_a_l0) = if col == 0 && neighbours.left_available {
+            (neighbours.left_ref[row], neighbours.left_mv[row])
+        } else {
+            (-1, (0, 0))
+        };
+        let (ref_b_l0, mv_b_l0) = if row == 0 && neighbours.top_available {
+            (neighbours.top_ref[col], neighbours.top_mv[col])
+        } else {
+            (-1, (0, 0))
+        };
+        let (ref_c_l0, mv_c_l0) = if row == 0 {
+            (
+                neighbours.top_right_ref,
+                neighbours.top_right_mv.unwrap_or((0, 0)),
+            )
+        } else {
+            (-1, (0, 0))
+        };
+        let (ref_a_l1, mv_a_l1) = if col == 0 && neighbours.left_available {
+            (neighbours.left_ref_l1[row], neighbours.left_mv_l1[row])
+        } else {
+            (-1, (0, 0))
+        };
+        let (ref_b_l1, mv_b_l1) = if row == 0 && neighbours.top_available {
+            (neighbours.top_ref_l1[col], neighbours.top_mv_l1[col])
+        } else {
+            (-1, (0, 0))
+        };
+        let (ref_c_l1, mv_c_l1) = if row == 0 {
+            (
+                neighbours.top_right_ref_l1,
+                neighbours.top_right_mv_l1.unwrap_or((0, 0)),
+            )
+        } else {
+            (-1, (0, 0))
+        };
+
+        let mut ref_l0 = min_nonneg_ref(&[ref_a_l0, ref_b_l0, ref_c_l0]);
+        let mut ref_l1 = min_nonneg_ref(&[ref_a_l1, ref_b_l1, ref_c_l1]);
+        if ref_l0 < 0 && ref_l1 < 0 {
+            ref_l0 = 0;
+            ref_l1 = 0;
+        }
+
+        let mv_l0 = if ref_l0 < 0 {
+            (0, 0)
+        } else {
+            median_mv(
+                if ref_a_l0 == ref_l0 { Some(mv_a_l0) } else { None },
+                if ref_b_l0 == ref_l0 { Some(mv_b_l0) } else { None },
+                if ref_c_l0 == ref_l0 { Some(mv_c_l0) } else { None },
+            )
+        };
+        let mv_l1 = if ref_l1 < 0 {
+            (0, 0)
+        } else {
+            median_mv(
+                if ref_a_l1 == ref_l1 { Some(mv_a_l1) } else { None },
+                if ref_b_l1 == ref_l1 { Some(mv_b_l1) } else { None },
+                if ref_c_l1 == ref_l1 { Some(mv_c_l1) } else { None },
+            )
+        };
+
+        for &b in &blocks {
+            decoded.ref_l0[b] = ref_l0;
+            decoded.ref_l1[b] = ref_l1;
+            decoded.mv_l0[b] = mv_l0;
+            decoded.mv_l1[b] = mv_l1;
+        }
+    }
+}
+
+/// Returns the minimum non-negative ref index in `refs`, or `-1`
+/// when every entry is negative.
+fn min_nonneg_ref(refs: &[i8]) -> i8 {
+    refs.iter().filter(|&&r| r >= 0).min().copied().unwrap_or(-1)
+}
+
+/// Median MV across up to three neighbour MVs, ignoring `None`
+/// entries.  When only one is present that MV wins outright; when
+/// none are present the predictor degrades to `(0, 0)`.
+fn median_mv(
+    a: Option<MotionVector>,
+    b: Option<MotionVector>,
+    c: Option<MotionVector>,
+) -> MotionVector {
+    let ctx = MvPredictionContext {
+        left: a,
+        above: b,
+        above_right: c,
+        above_left: None,
+    };
+    predict_mv_median(&ctx)
+}
+
 fn partitions_for_shape(shape: InterPartShape) -> &'static [&'static [usize]] {
     match shape {
         InterPartShape::P16x16 => &[&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]],
@@ -395,13 +516,21 @@ mod tests {
             left_mv: [(0, 0); 4],
             left_ref: [-1; 4],
             left_mvd_abs: [[0; 2]; 4],
+            left_mv_l1: [(0, 0); 4],
+            left_ref_l1: [-1; 4],
+            left_mvd_abs_l1: [[0; 2]; 4],
             left_is_skip: false,
             top_mv: [(0, 0); 4],
             top_ref: [-1; 4],
             top_mvd_abs: [[0; 2]; 4],
+            top_mv_l1: [(0, 0); 4],
+            top_ref_l1: [-1; 4],
+            top_mvd_abs_l1: [[0; 2]; 4],
             top_is_skip: false,
             top_right_mv: None,
             top_right_ref: -1,
+            top_right_mv_l1: None,
+            top_right_ref_l1: -1,
             left_cbp: 0,
             top_cbp: 0,
             left_chroma_pred_nonzero: false,
