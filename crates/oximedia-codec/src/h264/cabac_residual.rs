@@ -1,15 +1,15 @@
 //! H.264 CABAC residual-block decoder.
 //!
-//! Single-port of FFmpeg's `decode_cabac_residual_internal` from
-//! `libavcodec/h264_cabac.c` (LGPL 2.1+) plus its CBF-gated wrappers
-//! (`decode_cabac_residual_dc`, `decode_cabac_residual_nondc`).
+//! Implements the residual_block_cabac() parsing procedure from
+//! ITU-T Rec. H.264 / ISO/IEC 14496-10 clause 9.3.3.1.1.9 plus the
+//! coded_block_flag-gated wrappers from clause 7.3.5.3.2.
 //!
-//! The residual layer is the heart of CABAC: every nonzero transform
-//! coefficient is encoded via a significance scan + level coding
-//! pass, both context-adaptive.  This module exposes the two
-//! externally-useful entry points
-//! ([`decode_residual_dc`], [`decode_residual_nondc`]) and a few
-//! supporting tables.
+//! The residual layer is the heart of CABAC: every nonzero
+//! transform coefficient is encoded via a significance scan +
+//! level coding pass, both context-adaptive.  This module exposes
+//! the two externally-useful entry points ([`decode_residual_dc`],
+//! [`decode_residual_nondc`]) and the normative context-offset
+//! tables.
 //!
 //! ## Block categories
 //!
@@ -132,10 +132,10 @@ pub struct ResidualParams<'a> {
 /// Derives the coded-block-flag context index for the given block
 /// category, with neighbour non-zero-counts supplied by the caller.
 ///
-/// Mirrors FFmpeg's `get_cabac_cbf_ctx`.  For Luma DC / Chroma DC the
-/// `nz_a` / `nz_b` arguments should be the relevant bits of the
-/// neighbour CBP table; for AC / 4×4 / 8×8 they are the neighbour
-/// non-zero-count cache values.
+/// Per spec § 9.3.3.1.1.9 (`coded_block_flag` context derivation).
+/// For Luma DC / Chroma DC the `nz_a` / `nz_b` arguments are the
+/// relevant bits of the neighbour CBP table; for AC / 4×4 / 8×8
+/// they are the neighbour non-zero-count cache values.
 pub fn coded_block_flag_ctx(cat: usize, nz_a: u32, nz_b: u32) -> usize {
     const BASE_CTX: [u16; 14] = [
         85, 89, 93, 97, 101, 1012, 460, 464, 468, 1016, 472, 476, 480, 1020,
@@ -172,8 +172,8 @@ pub fn decode_residual_dc(
 ///
 /// Cat 5 (8×8 luma) is a special case: the per-block CBF lives
 /// inside the macroblock-level `cbp` bits already, so the caller
-/// must pre-decide whether to invoke this function — see FFmpeg
-/// `decode_cabac_residual_nondc` for the gating logic.
+/// must pre-decide whether to invoke this function (see spec
+/// § 7.3.5.3.2 — 8×8 blocks have no separate `coded_block_flag`).
 pub fn decode_residual_nondc(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],

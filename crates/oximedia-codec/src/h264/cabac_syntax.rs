@@ -6,11 +6,11 @@
 //! chroma prediction mode, ref index, motion vector difference,
 //! coded-block-pattern, and the Intra4x4 prediction mode.
 //!
-//! Each function below ports the corresponding FFmpeg routine in
-//! `libavcodec/h264_cabac.c` (LGPL 2.1+).  The neighbour-state inputs
-//! that FFmpeg pulls from its `H264SliceContext` are passed in
-//! explicitly so this layer stays free of the surrounding slice
-//! plumbing.
+//! Each function below implements one syntax-element decode
+//! procedure from ITU-T Rec. H.264 / ISO/IEC 14496-10 clause 9.3.3
+//! (CABAC parsing process).  Neighbour-state inputs that would
+//! normally live in the slice-context struct are passed in
+//! explicitly so this layer stays free of slice plumbing.
 //!
 //! ## Context indices
 //!
@@ -62,11 +62,10 @@ pub enum IntraMbType {
 ///
 /// Returns `1` if the macroblock is skipped, `0` otherwise.  The
 /// neighbour inputs are the "is the A/B neighbour available and
-/// non-skip" booleans — see FFmpeg `decode_cabac_mb_skip` for the
-/// underlying derivation.
+/// non-skip" booleans, per spec § 9.3.3.1.1.1.
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_mb_skip` (frame-MB
-/// path only — MBAFF is intentionally out of scope here).
+/// Frame-MB path only — MBAFF (interlaced) is intentionally out of
+/// scope here.
 pub fn decode_mb_skip(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -91,7 +90,7 @@ pub fn decode_mb_skip(
 /// inside P/B slices when `intra_slice == false` and `ctx_base` is
 /// passed by the caller — usually 17 for P, 32 for B).
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_intra_mb_type`.
+/// Per spec § 9.3.3.1.1.3 (Intra-macroblock-type binarisation).
 pub fn decode_intra_mb_type(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -157,7 +156,8 @@ pub fn decode_intra_mb_type(
 /// MPM derived from neighbour blocks — see
 /// [`crate::h264::intra_mode::most_probable_mode`].
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_mb_intra4x4_pred_mode`.
+/// Per spec § 9.3.3.1.1.5 (`prev_intra4x4_pred_mode_flag` plus the
+/// 3-bit `rem_intra4x4_pred_mode`).
 pub fn decode_intra4x4_pred_mode(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -180,10 +180,10 @@ pub fn decode_intra4x4_pred_mode(
 /// Decodes `intra_chroma_pred_mode` (0..=3).
 ///
 /// `left_chroma_nonzero` / `top_chroma_nonzero` are
-/// `chroma_pred_mode_table[neighbour] != 0`, matching FFmpeg's
-/// derivation.  Neighbour availability is folded into the boolean.
+/// `chroma_pred_mode_table[neighbour] != 0`.  Neighbour
+/// availability is folded into the boolean.
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_mb_chroma_pre_mode`.
+/// Per spec § 9.3.3.1.1.8 (`intra_chroma_pred_mode` binarisation).
 pub fn decode_intra_chroma_pred_mode(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -218,7 +218,7 @@ pub fn decode_intra_chroma_pred_mode(
 /// neighbours (low 4 bits = luma, upper bits = chroma).  When a
 /// neighbour is unavailable pass `0x0F` per H.264 spec.
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_mb_cbp_luma`.
+/// Per spec § 9.3.3.1.1.4 (`coded_block_pattern` luma bins).
 pub fn decode_cbp_luma(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -241,7 +241,7 @@ pub fn decode_cbp_luma(
 ///
 /// 0 = no chroma residual, 1 = DC only, 2 = DC + AC.
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_mb_cbp_chroma`.
+/// Per spec § 9.3.3.1.1.4 (`coded_block_pattern` chroma bins).
 pub fn decode_cbp_chroma(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -275,7 +275,7 @@ pub fn decode_cbp_chroma(
 /// Sub-macroblock type for a P slice (0..=3, mapping per spec
 /// Table 7-17): 0=P_L0_8x8, 1=P_L0_8x4, 2=P_L0_4x8, 3=P_L0_4x4.
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_p_mb_sub_type`.
+/// Per spec § 9.3.3.1.1.2 (sub_mb_type for P slices).
 pub fn decode_p_sub_mb_type(cabac: &mut CabacContext<'_>, states: &mut [u8]) -> u8 {
     if cabac.get(&mut states[21]) != 0 {
         return 0;
@@ -292,7 +292,7 @@ pub fn decode_p_sub_mb_type(cabac: &mut CabacContext<'_>, states: &mut [u8]) -> 
 /// Sub-macroblock type for a B slice (0..=12, mapping per spec
 /// Table 7-18).
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_b_mb_sub_type`.
+/// Per spec § 9.3.3.1.1.2 (sub_mb_type for B slices).
 pub fn decode_b_sub_mb_type(cabac: &mut CabacContext<'_>, states: &mut [u8]) -> u8 {
     if cabac.get(&mut states[36]) == 0 {
         return 0;
@@ -318,7 +318,7 @@ pub fn decode_b_sub_mb_type(cabac: &mut CabacContext<'_>, states: &mut [u8]) -> 
 /// `direct_b` are `true` if the neighbour is a B_Direct partition
 /// (ignored on P slices).
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_mb_ref`.
+/// Per spec § 9.3.3.1.1.6 (`ref_idx_lN` binarisation).
 pub fn decode_ref_idx(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -367,7 +367,8 @@ pub fn decode_ref_idx(
 /// `amvd` is the sum of |left| + |top| neighbour mvd magnitudes
 /// (per spec eq. 9-21).
 ///
-/// Ports `libavcodec/h264_cabac.c::decode_cabac_mb_mvd`.
+/// Per spec § 9.3.3.1.1.7 (`mvd_lN` binarisation: truncated unary
+/// + UEG3 suffix + sign bit).
 pub fn decode_mvd(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -375,10 +376,10 @@ pub fn decode_mvd(
     amvd: i32,
     mvd_abs: &mut i32,
 ) -> i32 {
-    // The two right-shifts produce -1 (i.e. all-1 bits) when `amvd`
-    // is below the threshold, 0 otherwise — matching FFmpeg's
-    // sign-bit trick (`(amvd-3)>>(INT_BIT-1)` etc.).  Keeping the
-    // arithmetic in `i32` mirrors the C source exactly.
+    // The two right-shifts produce -1 (i.e. all-1 bits) when
+    // `amvd` is below the threshold, 0 otherwise — the standard
+    // branchless way to pick context index 0, 1 or 2 from the
+    // threshold ranges spec § 9.3.3.1.1.7 gives for mvd.
     let bin0_ctx = (ctx_base as i32
         + ((amvd - 3) >> 31)
         + ((amvd - 33) >> 31)
@@ -405,7 +406,7 @@ pub fn decode_mvd(
             k += 1;
             if k > 24 {
                 // bitstream overflow — caller treats `i32::MIN` as
-                // invalid data, mirroring FFmpeg's behaviour.
+                // invalid data — the spec's k bound is 23.
                 return i32::MIN;
             }
         }

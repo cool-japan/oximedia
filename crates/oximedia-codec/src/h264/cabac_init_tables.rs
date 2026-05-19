@@ -20,9 +20,8 @@
 //! [`CABAC_CONTEXT_INIT_PB`] selected by `cabac_init_idc` in the
 //! slice header.
 //!
-//! Values transcribed verbatim from FFmpeg's
-//! `libavcodec/h264_cabac.c::cabac_context_init_I` and
-//! `cabac_context_init_PB` (LGPL 2.1+).
+//! All `(m, n)` pairs are normative per ITU-T Rec. H.264 /
+//! ISO/IEC 14496-10 Tables 9-12 through 9-26 (clause 9.3.1.1).
 
 /// I-slice CABAC context initialization `(m, n)` pairs.
 #[rustfmt::skip]

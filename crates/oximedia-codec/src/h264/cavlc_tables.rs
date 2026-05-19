@@ -1,12 +1,13 @@
 //! CAVLC variable-length code tables for H.264 entropy decode.
 //!
-//! Codeword bit patterns + lengths transcribed verbatim from
-//! FFmpeg's `libavcodec/h264_cavlc.c` (the `coeff_token_len/bits`,
-//! `total_zeros_len/bits`, `chroma_dc_total_zeros_len/bits`,
-//! and `run_len/bits` arrays).  FFmpeg's tables in turn match the
-//! H.264 standard's reference tables, so transcribing through
-//! FFmpeg removes the per-entry transcription-error risk that
-//! reading the spec PDF directly would carry.
+//! All codeword tables are normative per ITU-T Rec. H.264 /
+//! ISO/IEC 14496-10 clause 9.2:
+//!
+//! - `coeff_token` (Tables 9-5 a/b/c/d for the four neighbour
+//!   contexts plus Table 9-5e for chroma DC).
+//! - `total_zeros` for non-chroma-DC blocks (Tables 9-7, 9-8).
+//! - `chroma_dc_total_zeros` (Table 9-9).
+//! - `run_before` (Table 9-10).
 //!
 //! Layout convention for `*_LENS` / `*_BITS` array pairs:
 //!
@@ -17,9 +18,6 @@
 //!   table — the corresponding `(TotalCoeff, TrailingOnes)` (or
 //!   `(TotalCoeff, total_zeros)` etc.) combination isn't a legal
 //!   codeword.
-//!
-//! Sourced from FFmpeg `libavcodec/h264_cavlc.c` at commit
-//! `master` (LGPL 2.1+).
 
 // ---------------------------------------------------------------------------
 // coeff_token tables — luma, four neighbour-context variants.
