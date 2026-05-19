@@ -40,6 +40,8 @@
 //! management) extends the workspace; this module stays parsing-only.
 
 pub mod bit_reader;
+#[cfg(test)]
+mod bitstream_roundtrip;
 pub mod cabac;
 pub mod cabac_init_tables;
 pub mod cabac_inter;
