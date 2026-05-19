@@ -26,7 +26,10 @@
 use crate::h264::cabac::CabacContext;
 use crate::h264::cabac_inter::{decode_p_mb_type, InterMbResult, InterPartShape, P_MB_TYPE_INFO};
 use crate::h264::cabac_mb::decode_mb_qp_delta;
-use crate::h264::cabac_syntax::{decode_cbp_chroma, decode_cbp_luma, decode_mb_skip, decode_mvd, decode_ref_idx};
+use crate::h264::cabac_syntax::{
+    decode_cbp_chroma, decode_cbp_luma, decode_mb_skip, decode_mvd, decode_p_sub_mb_type,
+    decode_ref_idx,
+};
 use crate::h264::inter_cache::{InterMbDecoded, InterSliceCache};
 use crate::h264::mv_pred::{predict_mv_median, MotionVector, MvPredictionContext};
 use crate::h264::slice_header::SliceType;
@@ -186,6 +189,32 @@ pub fn decode_p_mb_cabac(
         ..InterMbDecoded::default()
     };
 
+    if matches!(info.shape, InterPartShape::P8x8) {
+        decode_p_8x8_partitions(
+            cabac,
+            states,
+            neighbours,
+            num_ref_idx_l0_active,
+            info.ref0_only,
+            &mut decoded,
+        );
+        // CBP + mb_qp_delta come after the per-8×8 sub-MB decode
+        // (spec § 7.3.5.1).
+        let cbp_luma = decode_cbp_luma(cabac, states, neighbours.left_cbp, neighbours.top_cbp);
+        let cbp_chroma = decode_cbp_chroma(cabac, states, neighbours.left_cbp, neighbours.top_cbp);
+        decoded.cbp = (cbp_chroma << 4) | cbp_luma;
+        let mb_qp_delta = if decoded.cbp != 0 {
+            decode_mb_qp_delta(cabac, states, prev_qp_delta_nonzero)
+        } else {
+            0
+        };
+        return PMbOutcome::Inter {
+            mb_type_code,
+            decoded,
+            mb_qp_delta,
+        };
+    }
+
     let partitions = partitions_for_shape(info.shape);
     let need_ref = num_ref_idx_l0_active > 1 && !info.ref0_only;
 
@@ -262,6 +291,180 @@ pub fn decode_p_mb_cabac(
         mb_type_code,
         decoded,
         mb_qp_delta,
+    }
+}
+
+/// P_8x8 sub-macroblock decode.
+///
+/// Walks the 4 8×8 quadrants of the macroblock in scan order.
+/// Each quadrant:
+///
+/// 1. Decodes one `sub_mb_type` bin tree (spec § 9.3.3.1.1.2,
+///    contexts 21..=23).
+/// 2. Decodes one `ref_idx_l0` (when `num_ref_idx_l0_active > 1`
+///    and `!ref0_only`).
+/// 3. For each sub-partition the sub_mb_type implies (1 / 2 / 4),
+///    decodes one `mvd_l0_x` + `mvd_l0_y` pair and splats the MV
+///    onto the covered 4×4 blocks.
+fn decode_p_8x8_partitions(
+    cabac: &mut CabacContext<'_>,
+    states: &mut [u8],
+    neighbours: &MbNeighbours,
+    num_ref_idx_l0_active: u8,
+    ref0_only: bool,
+    decoded: &mut InterMbDecoded,
+) {
+    let need_ref = num_ref_idx_l0_active > 1 && !ref0_only;
+
+    // First pass: decode 4 sub_mb_types.
+    let mut sub_mb_types = [0u8; 4];
+    for q in 0..4 {
+        sub_mb_types[q] = decode_p_sub_mb_type(cabac, states);
+    }
+
+    // Second pass: decode 4 ref_idx_l0 (or skip if not signalled).
+    let mut ref_idx = [0i8; 4];
+    if need_ref {
+        for q in 0..4 {
+            let first_block = first_block_of_quadrant(q);
+            let (ref_a, ref_b) = ref_neighbours_for_block(neighbours, first_block);
+            let r = decode_ref_idx(
+                cabac,
+                states,
+                SliceType::P,
+                ref_a as i32,
+                ref_b as i32,
+                false,
+                false,
+            );
+            ref_idx[q] = r.max(0) as i8;
+        }
+    }
+
+    // Third pass: per sub-MB, per sub-partition, decode mvd + MV.
+    for q in 0..4 {
+        let sub_parts = sub_partitions_in_quadrant(q, sub_mb_types[q]);
+        for (sub_pi, blocks) in sub_parts.iter().enumerate() {
+            let first_block = blocks[0];
+            let (mvd_x_a, mvd_x_b, mvd_y_a, mvd_y_b) =
+                mvd_neighbours_for_block(neighbours, first_block);
+
+            let mut mvd_x_abs = 0i32;
+            let mvd_x = decode_mvd(
+                cabac,
+                states,
+                40,
+                (mvd_x_a + mvd_x_b) as i32,
+                &mut mvd_x_abs,
+            );
+            let mut mvd_y_abs = 0i32;
+            let mvd_y = decode_mvd(
+                cabac,
+                states,
+                47,
+                (mvd_y_a + mvd_y_b) as i32,
+                &mut mvd_y_abs,
+            );
+
+            // Median predictor for the sub-partition.  Use the
+            // 16×16 macroblock's median rule with a coarse
+            // per-quadrant fallback — fine-grained sub-MB
+            // neighbour MV tracking is the realm of a richer
+            // mv_pred refactor and isn't pinned by this commit.
+            let mv_ctx = mv_pred_context_for_sub_partition(neighbours, q, sub_pi);
+            let pred = predict_mv_median(&mv_ctx);
+            let mv = (pred.0 + mvd_x, pred.1 + mvd_y);
+
+            for &b in *blocks {
+                decoded.ref_l0[b] = ref_idx[q];
+                decoded.mv_l0[b] = mv;
+                decoded.mvd_abs_l0[b] = [mvd_x_abs.min(255) as u8, mvd_y_abs.min(255) as u8];
+            }
+        }
+    }
+}
+
+/// Returns the 4×4 block index at the top-left corner of an 8×8
+/// quadrant (q ∈ {0, 1, 2, 3}).
+fn first_block_of_quadrant(q: usize) -> usize {
+    match q {
+        0 => 0,
+        1 => 2,
+        2 => 8,
+        _ => 10,
+    }
+}
+
+/// Per (quadrant, sub_mb_type) sub-partition layout — returns the
+/// 4×4 block indices grouped by sub-partition.  Spec Table 7-17
+/// gives the local shapes; this table pre-applies the quadrant
+/// offset so the orchestrator just iterates.
+fn sub_partitions_in_quadrant(q: usize, sub_mb_type: u8) -> &'static [&'static [usize]] {
+    static TABLES: [[&[&[usize]]; 4]; 4] = [
+        // Quadrant 0 (top-left, blocks 0/1/4/5).
+        [
+            &[&[0, 1, 4, 5]],
+            &[&[0, 1], &[4, 5]],
+            &[&[0, 4], &[1, 5]],
+            &[&[0], &[1], &[4], &[5]],
+        ],
+        // Quadrant 1 (top-right, blocks 2/3/6/7).
+        [
+            &[&[2, 3, 6, 7]],
+            &[&[2, 3], &[6, 7]],
+            &[&[2, 6], &[3, 7]],
+            &[&[2], &[3], &[6], &[7]],
+        ],
+        // Quadrant 2 (bottom-left, blocks 8/9/12/13).
+        [
+            &[&[8, 9, 12, 13]],
+            &[&[8, 9], &[12, 13]],
+            &[&[8, 12], &[9, 13]],
+            &[&[8], &[9], &[12], &[13]],
+        ],
+        // Quadrant 3 (bottom-right, blocks 10/11/14/15).
+        [
+            &[&[10, 11, 14, 15]],
+            &[&[10, 11], &[14, 15]],
+            &[&[10, 14], &[11, 15]],
+            &[&[10], &[11], &[14], &[15]],
+        ],
+    ];
+    TABLES[q][sub_mb_type as usize]
+}
+
+/// Coarse median-predictor context for a sub-partition inside a
+/// P_8×8 macroblock.  Uses the 8×8 quadrant's top-left 4×4 as the
+/// reference point for the median rule — the same approximation
+/// the 16×16-only orchestrator uses.
+fn mv_pred_context_for_sub_partition(
+    neighbours: &MbNeighbours,
+    quadrant: usize,
+    _sub_partition: usize,
+) -> MvPredictionContext {
+    let first_block = first_block_of_quadrant(quadrant);
+    let row = first_block / 4;
+    let col = first_block % 4;
+    let left = if col == 0 && neighbours.left_available {
+        Some(neighbours.left_mv[row])
+    } else {
+        None
+    };
+    let above = if row == 0 && neighbours.top_available {
+        Some(neighbours.top_mv[col])
+    } else {
+        None
+    };
+    let above_right = if row == 0 {
+        neighbours.top_right_mv
+    } else {
+        None
+    };
+    MvPredictionContext {
+        left,
+        above,
+        above_right,
+        above_left: None,
     }
 }
 
