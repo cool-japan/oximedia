@@ -455,12 +455,32 @@ fn decode_chroma_residual_inline(
         return Ok(());
     }
 
-    // AC pass.
+    // AC pass.  Per spec § 9.3.3.1.1.9 the CBF context for a
+    // chroma AC block looks at the non-zero counts of its left
+    // (A) and above (B) neighbours within the 2×2 chroma block
+    // grid; at the macroblock boundary the neighbour comes from
+    // the spatially adjacent macroblock.  We don't yet track
+    // chroma nz across macroblock boundaries — for blocks on the
+    // MB edge we treat the neighbour as nz = 0, which matches
+    // the conformance behaviour when the actual neighbour is
+    // intra-coded or out-of-slice.
     let dequants = [ctx.dequant_4x4_cb, ctx.dequant_4x4_cr];
     for plane in 0..2 {
         for i in 0..4 {
             let block = 4 * plane + i;
-            let cbf_ctx = coded_block_flag_ctx(4, 0, 0); // simplified: caller can refine later
+            let in_plane_row = i / 2;
+            let in_plane_col = i % 2;
+            let nz_a = if in_plane_col == 0 {
+                0
+            } else {
+                residual.nz_count_chroma[4 * plane + (i - 1)] as u32
+            };
+            let nz_b = if in_plane_row == 0 {
+                0
+            } else {
+                residual.nz_count_chroma[4 * plane + (i - 2)] as u32
+            };
+            let cbf_ctx = coded_block_flag_ctx(4, nz_a, nz_b);
             let params = ResidualParams {
                 cat: 4,
                 cbf_ctx,
