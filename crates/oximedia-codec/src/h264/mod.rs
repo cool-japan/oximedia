@@ -43,6 +43,7 @@ pub mod bit_reader;
 pub mod cabac;
 pub mod cabac_init_tables;
 pub mod cabac_inter;
+pub mod cabac_inter_mb;
 pub mod cabac_mb;
 pub mod cabac_residual;
 pub mod cabac_syntax;
@@ -80,6 +81,7 @@ pub use cabac_inter::{
     decode_b_mb_type, decode_p_mb_type, BMbInfo, InterMbResult, InterPartShape, PMbInfo,
     RefListUse, B_MB_TYPE_INFO, P_MB_TYPE_INFO,
 };
+pub use cabac_inter_mb::{decode_p_mb_cabac, MbNeighbours, PMbOutcome};
 pub use cabac_mb::{
     decode_chroma_residual, decode_intra_mb, decode_luma_residual, decode_mb_qp_delta,
     ChromaCbfCtxs, Intra4x4Mpms, IntraMbCabac, LumaCbfCtxs, MbLumaResidualInputs, MbResidualState,
