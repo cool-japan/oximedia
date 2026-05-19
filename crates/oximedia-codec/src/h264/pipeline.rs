@@ -379,6 +379,44 @@ impl Decoder {
             .collect()
     }
 
+    /// Constructs RefPicList1 for a B slice per spec § 8.2.4.2.3.
+    /// Short-term refs with POC > current_poc come first (sorted
+    /// ascending by POC), followed by short-term refs with POC <
+    /// current_poc (sorted descending by POC), then long-term
+    /// refs ordered by ascending long_term_idx.
+    ///
+    /// `current_poc` is the POC of the slice currently being
+    /// decoded (used as the pivot for the bi-prediction split).
+    fn build_ref_pic_list_l1(&self, current_poc: i32) -> Vec<&Frame> {
+        let mut higher: Vec<&DpbEntry> = self
+            .dpb
+            .entries
+            .iter()
+            .filter(|e| e.is_short_term_reference && e.poc > current_poc)
+            .collect();
+        higher.sort_by(|a, b| a.poc.cmp(&b.poc));
+        let mut lower: Vec<&DpbEntry> = self
+            .dpb
+            .entries
+            .iter()
+            .filter(|e| e.is_short_term_reference && e.poc < current_poc)
+            .collect();
+        lower.sort_by(|a, b| b.poc.cmp(&a.poc));
+        let mut long_term: Vec<&DpbEntry> = self
+            .dpb
+            .entries
+            .iter()
+            .filter(|e| e.is_long_term_reference)
+            .collect();
+        long_term.sort_by(|a, b| a.long_term_idx.cmp(&b.long_term_idx));
+        higher
+            .into_iter()
+            .chain(lower)
+            .chain(long_term)
+            .map(|e| &e.frame)
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn decode_cabac_slice(
         &mut self,
@@ -1188,6 +1226,30 @@ mod tests {
         // The list is &Frame so we can't read frame_num directly;
         // sanity check the length only here — separate fields
         // tested in poc unit tests.
+    }
+
+    #[test]
+    fn ref_pic_list_l1_splits_on_current_poc() {
+        let mut decoder = Decoder::new();
+        let entry = |poc, st| DpbEntry {
+            frame: Frame::new(16, 16),
+            poc,
+            frame_num: poc,
+            is_short_term_reference: st,
+            is_long_term_reference: false,
+            long_term_idx: None,
+            output_pending: false,
+        };
+        // Three short-term references: POC 2, 4, 6 — we're decoding
+        // at POC 4 so the split is { 6 } | { 2 } (ascending past,
+        // descending before).
+        decoder.dpb.entries.push(entry(2, true));
+        decoder.dpb.entries.push(entry(4, true));
+        decoder.dpb.entries.push(entry(6, true));
+        let list = decoder.build_ref_pic_list_l1(4);
+        // POC 4 == current is excluded; remaining 2 entries.  L1
+        // order for current_poc = 4: {6 (higher), 2 (lower)}.
+        assert_eq!(list.len(), 2);
     }
 
     #[test]
