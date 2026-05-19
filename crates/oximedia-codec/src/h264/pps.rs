@@ -12,6 +12,7 @@
 //! slice-group syntax is bit-skipped without retention.
 
 use crate::h264::bit_reader::BitReader;
+use crate::h264::scaling_list::{read_pic_scaling_matrix, ScalingLists};
 use crate::CodecError;
 
 /// Parsed H.264 Picture Parameter Set.
@@ -55,9 +56,13 @@ pub struct PpsRbsp {
     /// True when transform_8x8 mode is enabled (High Profile and up).
     /// Optional in the bitstream; defaults to `false`.
     pub transform_8x8_mode_flag: bool,
-    /// True when explicit scaling lists follow.  The lists themselves
-    /// are consumed but not currently retained.
+    /// True when explicit scaling lists follow.
     pub pic_scaling_matrix_present_flag: bool,
+    /// Decoded picture-level scaling lists.  Length / shape depends on
+    /// `transform_8x8_mode_flag` (see [`ScalingLists`]).  `None` when
+    /// `pic_scaling_matrix_present_flag` is false — fall back to the
+    /// SPS matrices or the spec defaults.
+    pub scaling_lists: Option<ScalingLists>,
     /// Offset applied to the second chroma component.  Present only
     /// when transform_8x8 mode is enabled; defaults to
     /// `chroma_qp_index_offset` otherwise.
@@ -131,19 +136,26 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PpsRbsp, CodecError> {
     // are still meaningful bits before the RBSP stop bit).
     let mut transform_8x8_mode_flag = false;
     let mut pic_scaling_matrix_present_flag = false;
+    let mut scaling_lists: Option<ScalingLists> = None;
     let mut second_chroma_qp_index_offset = chroma_qp_index_offset;
     if r.more_rbsp_data() {
         transform_8x8_mode_flag = r.read_bit()?;
         pic_scaling_matrix_present_flag = r.read_bit()?;
         if pic_scaling_matrix_present_flag {
-            let lists = 6 + if transform_8x8_mode_flag { 2 } else { 0 };
-            for i in 0..lists {
-                let present = r.read_bit()?;
-                if present {
-                    let size = if i < 6 { 16 } else { 64 };
-                    skip_scaling_list(&mut r, size)?;
-                }
-            }
+            // chroma_format_idc isn't directly visible to the PPS — the
+            // active SPS supplies it.  For PPS-level lists the spec only
+            // signals the 4:2:0 / 4:2:2 layout (2 × 8×8) unless the
+            // referencing SPS sets chroma_format_idc=3.  Without
+            // explicit SPS context here we assume the common case;
+            // callers that need 4:4:4 PPS scaling should reparse with
+            // their known SPS chroma_format_idc via
+            // [`crate::h264::scaling_list::read_pic_scaling_matrix`]
+            // directly.
+            scaling_lists = Some(read_pic_scaling_matrix(
+                &mut r,
+                1,
+                transform_8x8_mode_flag,
+            )?);
         }
         second_chroma_qp_index_offset = r.read_se()?;
     }
@@ -166,6 +178,7 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PpsRbsp, CodecError> {
         redundant_pic_cnt_present_flag,
         transform_8x8_mode_flag,
         pic_scaling_matrix_present_flag,
+        scaling_lists,
         second_chroma_qp_index_offset,
     })
 }
@@ -176,21 +189,6 @@ fn ceil_log2(v: u32) -> u32 {
     } else {
         32 - (v - 1).leading_zeros()
     }
-}
-
-fn skip_scaling_list(r: &mut BitReader<'_>, size: u32) -> Result<(), CodecError> {
-    let mut last_scale: i32 = 8;
-    let mut next_scale: i32 = 8;
-    for _ in 0..size {
-        if next_scale != 0 {
-            let delta_scale = r.read_se()?;
-            next_scale = ((last_scale + delta_scale + 256) % 256) as i32;
-        }
-        if next_scale != 0 {
-            last_scale = next_scale;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
