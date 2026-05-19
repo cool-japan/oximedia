@@ -30,6 +30,7 @@ use std::collections::HashMap;
 
 use crate::h264::bit_reader::BitReader;
 use crate::h264::cabac::{init_contexts, CabacContext};
+use crate::h264::decoder::decode_intra_slice_bitstream;
 use crate::h264::dpb::{Dpb, DpbEntry};
 use crate::h264::frame::Frame;
 use crate::h264::inter_cache::InterSliceCache;
@@ -512,13 +513,16 @@ impl Decoder {
         let mut frame = Frame::new(pic_width, pic_height);
 
         if sh.slice_type == SliceType::I {
+            // Peek at mb_type first.  If the slice starts with an
+            // I_PCM macroblock (mb_type code 25), the rest of the
+            // slice is raw samples — handle it via the PCM
+            // passthrough.  Otherwise dispatch to the existing
+            // CAVLC I-slice walker.
             let mut reader = BitReader::new(rbsp);
             reader.skip_bits(slice_header_bits as u32)?;
+            let probe_pos = reader.bits_consumed();
             let mb_type = reader.read_ue()?;
             if mb_type == 25 {
-                // I_PCM.  After mb_type, pcm_alignment_zero_bit
-                // pads to a byte boundary, then 384 raw bytes for
-                // 4:2:0.
                 let bits_consumed = reader.bits_consumed();
                 let aligned_byte = bits_consumed.div_ceil(8);
                 if rbsp.len() < aligned_byte + 384 {
@@ -530,11 +534,19 @@ impl Decoder {
                 write_pcm_macroblock_420(&mut frame, 0, 0, &samples)?;
                 return Ok(frame);
             }
+            // Non-PCM CAVLC I-slice: rewind to the start of
+            // slice_data and hand off to the per-macroblock walker.
+            let mut reader = BitReader::new(rbsp);
+            reader.skip_bits(probe_pos as u32)?;
+            decode_intra_slice_bitstream(&mut reader, sps, pps, sh, &mut frame)?;
+            return Ok(frame);
         }
 
-        // Other CAVLC paths are not yet wired through pipeline.rs;
-        // return a mid-grey frame so callers see a well-formed
-        // picture and the slice still counts toward the DPB.
+        // P / B CAVLC slice loop is not yet wired through
+        // pipeline.rs (the inter-CAVLC walker is the last piece on
+        // the roadmap).  Fall back to a mid-grey frame so callers
+        // still see a well-formed picture and the slice counts
+        // toward the DPB.
         for y in 0..pic_height {
             for x in 0..pic_width {
                 frame.set_luma(x, y, 128);
@@ -546,8 +558,6 @@ impl Decoder {
                 frame.set_cr(x, y, 128);
             }
         }
-        // Touch sps to avoid `unused` and to make the dependency on
-        // chroma_format_idc explicit; future expansion will need it.
         let _ = sps.chroma_format_idc;
         Ok(frame)
     }
