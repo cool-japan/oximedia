@@ -1,12 +1,40 @@
 //! Build script for oximedia-vaapi-sys.
 //!
-//! libva is a Linux-only API typically discovered via pkg-config (`libva`,
-//! `libva-drm`, `libva-x11`). When pkg-config isn't installed or the
-//! package is missing — or we're not on Linux — we emit empty bindings so
-//! the workspace still builds.
+//! libva is a Linux-only API discovered via pkg-config (`libva`,
+//! `libva-drm`, `libva-x11`).  Discovery is **opt-in only**: the
+//! workspace's root README promises "no `pkg-config`" out of the
+//! box, so without the `pkg-config` cargo feature the build script
+//! emits empty bindings and the workspace stays buildable on any
+//! host without system VAAPI headers.
 
 use std::env;
 use std::path::PathBuf;
+
+#[cfg(feature = "pkg-config")]
+fn probe_libva() -> Vec<PathBuf> {
+    // Probe each library; we don't require X11 to be present
+    // (DRM-only headless builds are common in render farms).
+    let mut include_paths: Vec<PathBuf> = Vec::new();
+    let mut linked_any = false;
+
+    for pkg in ["libva", "libva-drm", "libva-x11"] {
+        if let Ok(l) = pkg_config::Config::new().probe(pkg) {
+            include_paths.extend(l.include_paths.iter().cloned());
+            linked_any = true;
+        }
+    }
+
+    if linked_any {
+        include_paths
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(not(feature = "pkg-config"))]
+fn probe_libva() -> Vec<PathBuf> {
+    Vec::new()
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
@@ -25,32 +53,12 @@ fn main() {
         return;
     }
 
-    // Probe each library; we don't require X11 to be present (DRM-only
-    // headless builds are common in render farms).
-    let libva = pkg_config::Config::new().probe("libva");
-    let libva_drm = pkg_config::Config::new().probe("libva-drm");
-    let libva_x11 = pkg_config::Config::new().probe("libva-x11");
+    let include_paths = probe_libva();
 
-    let mut include_paths: Vec<PathBuf> = Vec::new();
-    let mut linked_any = false;
-
-    if let Ok(l) = &libva {
-        include_paths.extend(l.include_paths.iter().cloned());
-        linked_any = true;
-    }
-    if let Ok(l) = &libva_drm {
-        include_paths.extend(l.include_paths.iter().cloned());
-        linked_any = true;
-    }
-    if let Ok(l) = &libva_x11 {
-        include_paths.extend(l.include_paths.iter().cloned());
-        linked_any = true;
-    }
-
-    if !linked_any {
+    if include_paths.is_empty() {
         std::fs::write(
             &bindings_path,
-            "// oximedia-vaapi-sys: empty bindings (pkg-config 'libva' not found)\n",
+            "// oximedia-vaapi-sys: empty bindings (pkg-config feature off or libva not found)\n",
         )
         .expect("write empty bindings");
         return;
