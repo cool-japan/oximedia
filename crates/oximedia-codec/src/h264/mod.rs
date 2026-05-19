@@ -60,8 +60,8 @@ pub mod vui;
 
 pub use bit_reader::BitReader;
 pub use deblock::{
-    alpha_threshold, beta_threshold, boundary_strength, normal_filter_line, should_filter_line,
-    strong_filter_line, DeblockBlockInfo,
+    alpha_threshold, beta_threshold, boundary_strength, deblock_mb_luma, normal_filter_line,
+    should_filter_line, strong_filter_line, DeblockBlockInfo,
 };
 pub use cavlc::{
     decode_residual_block, read_coeff_token, read_level, read_residual_block, read_run_before,
