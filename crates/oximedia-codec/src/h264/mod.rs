@@ -41,6 +41,7 @@
 
 pub mod bit_reader;
 pub mod cavlc;
+pub mod cavlc_tables;
 pub mod deblock;
 pub mod decoder;
 pub mod dpb;
@@ -66,7 +67,7 @@ pub use deblock::{
 pub use cavlc::{
     decode_residual_block, read_coeff_token, read_level, read_residual_block, read_run_before,
     read_total_zeros_chroma_dc, read_total_zeros_luma, update_suffix_length, BlockKind,
-    ResidualBlock, COEFF_TOKEN_TABLES_PENDING,
+    ResidualBlock,
 };
 pub use decoder::{
     decode_i_slice, decode_inter_p_l0_16x16_mb, decode_intra_16x16_mb, decode_intra_4x4_mb,
