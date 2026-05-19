@@ -77,8 +77,9 @@ pub use slice_header::{
 };
 pub use sps::{parse_sps, SpsRbsp};
 pub use transform::{
-    dequant_and_inverse_transform_4x4, dequantize_4x4, inverse_scan_4x4, inverse_transform_1d_4,
-    inverse_transform_4x4, level_scale_4x4,
+    dequant_and_inverse_transform_4x4, dequantize_4x4, hadamard_1d_4, hadamard_2x2, hadamard_4x4,
+    inverse_hadamard_2x2_chroma_dc, inverse_hadamard_4x4_luma_dc, inverse_scan_4x4,
+    inverse_transform_1d_4, inverse_transform_4x4, level_scale_4x4,
 };
 pub use vui::{
     parse_vui, AspectRatioInfo, BitstreamRestriction, ChromaLocInfo, ColourDescription,
