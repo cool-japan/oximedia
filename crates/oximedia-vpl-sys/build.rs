@@ -3,31 +3,18 @@
 //! Intel oneVPL is the replacement for the old Media SDK / libmfx and is
 //! the supported QSV (Quick Sync Video) entry point.
 //!
-//! Discovery order (each tried only if the previous fails):
-//! 1. `VPL_ROOT` env var → header at `${VPL_ROOT}/include/vpl/mfx.h`.
-//! 2. `pkg-config --cflags --libs vpl` — **opt-in only**, requires
-//!    the `pkg-config` cargo feature.  The workspace's README
-//!    promises "no `pkg-config`" out of the box, so we only probe
-//!    when the user explicitly asks for it.
+//! Discovery is intentionally env-var only — no `pkg-config`, no
+//! system probing — to honour the workspace README's "one cargo add,
+//! no system library installations" promise.
 //!
-//! If neither route resolves (or we're on a non-Linux/Windows
-//! target), we emit empty bindings so the workspace still builds.
+//! If `VPL_ROOT` is set we generate real bindings against
+//! `${VPL_ROOT}/include/vpl/mfx.h` and link `-lvpl`.  Otherwise we
+//! emit an empty bindings file so the workspace stays buildable on
+//! every host.  Callers that want hardware-accelerated QSV install
+//! oneVPL themselves and set `VPL_ROOT`.
 
 use std::env;
 use std::path::PathBuf;
-
-#[cfg(feature = "pkg-config")]
-fn probe_pkg_config() -> Option<Vec<PathBuf>> {
-    pkg_config::Config::new()
-        .probe("vpl")
-        .ok()
-        .map(|lib| lib.include_paths)
-}
-
-#[cfg(not(feature = "pkg-config"))]
-fn probe_pkg_config() -> Option<Vec<PathBuf>> {
-    None
-}
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
@@ -47,19 +34,15 @@ fn main() {
         return;
     }
 
-    // VPL_ROOT wins.  pkg-config is a no-op without the opt-in feature.
-    let include_dirs: Vec<PathBuf> = if let Ok(root) = env::var("VPL_ROOT") {
-        vec![PathBuf::from(root).join("include")]
-    } else if let Some(paths) = probe_pkg_config() {
-        paths
-    } else {
+    let Ok(root) = env::var("VPL_ROOT") else {
         std::fs::write(
             &bindings_path,
-            "// oximedia-vpl-sys: empty bindings (no VPL_ROOT, pkg-config feature off)\n",
+            "// oximedia-vpl-sys: empty bindings (VPL_ROOT not set)\n",
         )
         .expect("write empty bindings");
         return;
     };
+    let include_dirs = [PathBuf::from(&root).join("include")];
 
     let mut builder = bindgen::Builder::default().header("wrapper.h");
     for inc in &include_dirs {
@@ -83,6 +66,9 @@ fn main() {
         .write_to_file(&bindings_path)
         .expect("write bindings.rs");
 
-    // Link the dispatcher; the runtime drivers it loads belong to the user.
+    // Link the dispatcher; the runtime drivers it loads belong to
+    // the user.  Add VPL_ROOT/lib to the search path so the linker
+    // finds the dispatcher without a system-wide install.
+    println!("cargo:rustc-link-search=native={}/lib", root);
     println!("cargo:rustc-link-lib=vpl");
 }

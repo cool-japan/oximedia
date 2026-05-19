@@ -15,17 +15,8 @@ links = "va-vaapi-sys"
 [lib]
 name = "oximedia_vaapi_sys"
 
-[features]
-# Off by default — the workspace's "one cargo add, no system deps"
-# promise (root README) means we must not probe `pkg-config` at
-# build time unless the user opts in.  Enabling this feature lets
-# the build script discover system-installed libva via
-# `pkg-config --cflags --libs libva libva-drm libva-x11`.
-pkg-config = ["dep:pkg-config"]
-
 [build-dependencies]
 bindgen = { workspace = true }
-pkg-config = { workspace = true, optional = true }
 
 [lints.rust]
 unsafe_code = "allow"

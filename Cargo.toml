@@ -555,7 +555,6 @@ oxiarc-deflate = "0.3.0"
 oxiarc-lz4 = "0.3.0"
 oxiarc-zstd = "0.3.0"
 bindgen = "0.72"
-pkg-config = "0.3"
 
 # AWS SDK (ring-based TLS; default-features = false avoids aws-lc-sys)
 aws-config = { version = "1.8", default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
