@@ -220,13 +220,22 @@ src/
 
 ## Patent Policy
 
-All codecs are royalty-free:
+OxiMedia's default position is royalty-free.
 
-**Supported codecs**: AV1, VP9, VP8, Theora, Opus
+**Supported codecs (always royalty-free)**: AV1, VP9, VP8, Theora, Opus, H.263.
 
-**Rejected codecs**: H.264, H.265, AAC, AC-3, DTS
+**Supported codecs (post-expiry)**: H.264 / AVC. The MPEG-LA AVC patent
+pool wound down its licensing program in December 2024 and the bulk of
+essential patents have reached their 20-year terms. Individual users
+deploying H.264 commercially should still consult counsel, but the
+project no longer rejects H.264 at the source level. See
+`docs/codec_status.md` for the full status entry.
 
-When a patent-encumbered codec is detected in a container, a `PatentViolation` error is returned.
+**Rejected codecs**: H.265 / HEVC, AAC, AC-3, DTS. These remain in
+active licensing pools.
+
+When one of the rejected codecs is detected in a container, a
+`PatentViolation` error is returned.
 
 ## Policy
 
