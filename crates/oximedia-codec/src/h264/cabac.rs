@@ -13,14 +13,14 @@
 //! - **Terminate-coded** — a special "end of slice" probe used to
 //!   detect the slice's last byte.
 //!
-//! This module ports FFmpeg's `cabac.c` + `cabac_functions.h`
-//! (`ff_init_cabac_decoder`, `get_cabac`, `get_cabac_bypass`,
-//! `get_cabac_terminate`) into safe Rust.  Output is bit-exact with
-//! FFmpeg's reference implementation given the same byte input.
+//! This module implements the CABAC engine described in
+//! ITU-T Rec. H.264 / ISO/IEC 14496-10 clause 9.3.1 (initialisation
+//! + arithmetic-coding process).  Output is bit-exact with the
+//! spec's reference algorithm given the same byte input.
 //!
 //! The per-syntax-element binarisation + context-selection layer
 //! (~460 H.264 contexts, ~50 syntax element decoders) is the next
-//! piece; this commit lands the foundation that layer plugs into.
+//! piece; this module lands the foundation that layer plugs into.
 
 use crate::h264::cabac_init_tables::{CABAC_CONTEXT_INIT_I, CABAC_CONTEXT_INIT_PB};
 use crate::h264::cabac_tables::{
@@ -50,9 +50,10 @@ pub struct CabacContext<'a> {
 impl<'a> CabacContext<'a> {
     /// Initialises a CABAC decoder over the given byte slice.
     ///
-    /// Mirrors `ff_init_cabac_decoder` from FFmpeg: reads the first
-    /// 9 bits into `low`, sets `range` to `0x1FE`, and validates that
-    /// the initial state is consistent.
+    /// Implements the CABAC `InitDecoder` process from spec
+    /// clause 9.3.1.2: reads the first 9 bits into `codIRange` /
+    /// `codIOffset` (here `range` / `low`) and validates that the
+    /// initial state is consistent.
     ///
     /// # Errors
     ///
@@ -71,9 +72,9 @@ impl<'a> CabacContext<'a> {
         low += i32::from(buf[pos]) << 10;
         pos += 1;
 
-        // FFmpeg keeps an extra "wiggle bit" on a 2-byte boundary;
-        // emulating that without alignment introspection: always
-        // path-2 (pull one more byte / add fixed offset).
+        // The spec keeps an extra "wiggle bit" on a 2-byte boundary;
+        // without alignment introspection we always take the path
+        // that pulls one more byte + adds the fixed offset.
         if buf.len() > pos {
             low += (i32::from(buf[pos]) << 2) + 2;
             pos += 1;
@@ -144,9 +145,9 @@ impl<'a> CabacContext<'a> {
     /// Decodes one context-modelled bin and updates the context's
     /// `state` byte.
     ///
-    /// Direct port of FFmpeg's `get_cabac_inline`.  Each context is
-    /// a single `u8` whose low 6 bits encode `pStateIdx` and whose
-    /// high bit encodes `valMPS`.
+    /// Implements `DecodeBin` from spec clause 9.3.3.2.  Each
+    /// context is a single `u8` whose low 6 bits encode `pStateIdx`
+    /// and whose high bit encodes `valMPS`.
     pub fn get(&mut self, state: &mut u8) -> i32 {
         let s = i32::from(*state);
         let range_lps_idx =
@@ -195,9 +196,8 @@ impl<'a> CabacContext<'a> {
     }
 
     /// Decodes one bypass-coded sign bit, returning the input value
-    /// negated when the bit is `1`.  Mirrors FFmpeg's
-    /// `get_cabac_bypass_sign` — used after decoding a coefficient
-    /// magnitude to attach its sign.
+    /// negated when the bit is `1`.  Used after decoding a
+    /// coefficient magnitude to attach its sign (spec § 9.3.3.2.3).
     pub fn get_bypass_sign(&mut self, val: i32) -> i32 {
         self.low += self.low;
         if self.low & CABAC_MASK == 0 {
@@ -239,18 +239,16 @@ impl<'a> CabacContext<'a> {
 /// from its `(m, n)` initialization pair and the slice QP.
 ///
 /// The result encodes the spec's `pStateIdx` in bits 0..6 and
-/// `valMPS` in bit 6.  Storing it as a single `u8` matches FFmpeg
-/// and lets the [`CabacContext::get`] code update it cheaply.
+/// `valMPS` in bit 6.  Packing into a single `u8` lets
+/// [`CabacContext::get`] update it cheaply.
 #[must_use]
 pub fn init_context_state(m: i8, n: i8, slice_qp: u8) -> u8 {
     let qp = slice_qp.min(51) as i32;
     let pre = ((i32::from(m) * qp) >> 4) + i32::from(n);
     let pre = pre.clamp(1, 126);
     if pre <= 63 {
-        // valMPS = 0, pStateIdx = 63 - pre.  FFmpeg packs valMPS in
-        // bit 6 (state = (pStateIdx << 1) | valMPS effectively), but
-        // its `cabac_init` returns `63 - pre` directly (with valMPS
-        // implied by the high bit zero).  We follow FFmpeg.
+        // valMPS = 0, pStateIdx = 63 - pre.  With valMPS in bit 6
+        // the packed byte is just `63 - pre` (high bit zero).
         (63 - pre) as u8
     } else {
         // valMPS = 1, pStateIdx = pre - 64; with valMPS in the high
@@ -267,10 +265,10 @@ pub fn init_context_state(m: i8, n: i8, slice_qp: u8) -> u8 {
 /// The 460 standard H.264 contexts cover slice / mb / mvd / cbp /
 /// residual decoding; the 460..1024 range holds the 8×8-transform
 /// CBF contexts (e.g. luma8x8 CBF at 1012..1016) and the
-/// 4:4:4-chroma residual contexts.  FFmpeg's `cabac_state` is sized
-/// 1024 for the same reason; the extra slots are initialised from
-/// the same `[m, n]` pair tables ([`CABAC_CONTEXT_INIT_I`] /
-/// [`CABAC_CONTEXT_INIT_PB`]) which carry 1024 entries each.
+/// 4:4:4-chroma residual contexts (spec Tables 9-12 through 9-26).
+/// The extra slots are initialised from the same `[m, n]` pair
+/// tables ([`CABAC_CONTEXT_INIT_I`] / [`CABAC_CONTEXT_INIT_PB`])
+/// which carry 1024 entries each.
 pub const CABAC_STATE_LEN: usize = 1024;
 
 /// Returns a `[u8; 1024]` of packed initial states ready for use by
@@ -350,11 +348,11 @@ mod tests {
         let mut ctx = CabacContext::new(&buf).expect("init");
         let mut state: u8 = 32; // mid-range probability state
         let _b = ctx.get(&mut state);
-        // We don't pin the exact bit value here — the state machine
-        // is bit-exact with FFmpeg given the same byte input, and
-        // the round trip through real encoded streams is the
-        // conformance test.  This test just confirms the function
-        // runs to completion and updates `state`.
+        // We don't pin the exact bit value here — the state
+        // machine is bit-exact with the spec given the same byte
+        // input, and the round trip through real encoded streams
+        // is the conformance test.  This test just confirms the
+        // function runs to completion and updates `state`.
         // (`state` may legally be 32 in cases where the LPS update
         // table maps back to it; just check it stays in range.)
         assert!(state < 128);

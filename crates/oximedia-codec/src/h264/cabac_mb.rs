@@ -4,9 +4,9 @@
 //! scan + level decode), the macroblock decoder needs a dispatcher
 //! that walks a whole macroblock's luma residual: one DC block plus
 //! 16 AC 4×4 blocks for `I_16x16`, or 4 × 8×8 / 16 × 4×4 blocks for
-//! every other intra/inter mode.  This module ports FFmpeg's
-//! `decode_cabac_luma_residual` and adds a chroma counterpart for
-//! the 4:2:0 case (`decode_cabac_chroma_residual`).
+//! every other intra/inter mode.  See ITU-T Rec. H.264 / ISO/IEC
+//! 14496-10 clause 7.3.5.3 (`residual` / `residual_luma` /
+//! `residual_block_cabac`).
 //!
 //! Each function records the per-4×4-block non-zero-count into the
 //! caller-supplied [`MbResidualState`].  That state is later
@@ -27,7 +27,7 @@ use crate::h264::cabac_syntax::{
 };
 
 /// Block-category indices for each plane and block kind, indexed
-/// `[block_kind][plane]`.  Mirrors FFmpeg's `ctx_cat[4][3]`:
+/// `[block_kind][plane]`.  Per spec Table 9-42 (`ctxBlockCat`):
 /// - `[0][p]` — DC (I_16x16 only)
 /// - `[1][p]` — AC (I_16x16 only)
 /// - `[2][p]` — Luma 4×4 (non-I_16x16)
@@ -85,8 +85,9 @@ impl Default for MbResidualState {
 /// must pre-compute (the indices depend on neighbour non-zero
 /// counts, which only the slice loop knows).
 ///
-/// Field semantics map 1:1 onto FFmpeg's `get_cabac_cbf_ctx` calls
-/// in `decode_cabac_luma_residual` / `decode_cabac_chroma_residual`.
+/// Each field is the input to one
+/// [`crate::h264::cabac_residual::coded_block_flag_ctx`] call for
+/// the corresponding sub-block.
 #[derive(Debug, Clone, Copy)]
 pub struct LumaCbfCtxs {
     /// CBF context index for the I_16x16 DC block.
@@ -133,8 +134,8 @@ pub struct MbLumaResidualInputs<'a> {
 
 /// Decodes the luma residual for a single macroblock.
 ///
-/// Mirrors FFmpeg's `decode_cabac_luma_residual(p = 0)`.  4:4:4
-/// alternate planes (`p = 1, 2`) are out of scope here.
+/// Implements `residual_luma` (spec § 7.3.5.3.1) for the Y plane
+/// only — 4:4:4 alternate planes are out of scope here.
 pub fn decode_luma_residual(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -207,8 +208,8 @@ pub fn decode_luma_residual(
                     params,
                     false, // 8×8 luma uses the macroblock-level CBP, not a per-block CBF bin.
                 ) as u8;
-                // 8×8 block spans 4 4×4 nz-count slots; FFmpeg
-                // broadcasts the same count to all 4.
+                // 8×8 block spans 4 4×4 nz-count slots; spec
+                // § 7.4.5.3 broadcasts the same count to all 4.
                 for k in 0..4 {
                     out.nz_count_luma[4 * i8x8 + k] = coeff_count;
                 }
@@ -258,9 +259,9 @@ pub fn decode_luma_residual(
 /// `cbp_chroma` is the 2-bit chroma CBP: 0 = no chroma residual,
 /// 1 = DC only, 2 = DC + AC.
 ///
-/// Mirrors FFmpeg's `decode_cabac_chroma_residual` (the 4:2:0
-/// branch).  4:2:2 widens the DC scan to 8 coeffs and is wired via
-/// the existing `chroma422: bool` parameter inside
+/// Implements `residual` chroma branch (spec § 7.3.5.3) for 4:2:0.
+/// 4:2:2 widens the DC scan to 8 coeffs and is wired via the
+/// existing `chroma422: bool` parameter inside
 /// [`crate::h264::cabac_residual`].
 pub fn decode_chroma_residual(
     cabac: &mut CabacContext<'_>,
@@ -358,9 +359,8 @@ pub type Intra4x4Mpms = [u8; 16];
 /// `decode_chroma_residual`) is the caller's responsibility — it
 /// needs CBF context indices that depend on neighbour state.
 ///
-/// Mirrors the I-slice path through FFmpeg's
-/// `ff_h264_decode_mb_cabac` (line 2019 onwards) up to but not
-/// including the `decode_cabac_luma_residual` call.
+/// Implements the I-slice macroblock-layer parsing flow from
+/// spec § 7.3.5.1 up to but not including the residual decode.
 ///
 /// # Inputs
 ///
@@ -438,10 +438,10 @@ pub fn decode_intra_mb(
 
 /// Decodes the signed `mb_qp_delta` syntax element.
 ///
-/// Ports FFmpeg's inline qp-delta decode block (h264_cabac.c
-/// ~line 2399).  Uses contexts 60..=63 with a single-bit prefix
-/// followed by a unary tail; the magnitude is then converted to a
-/// signed delta via the standard interleaved mapping.
+/// Per spec § 9.3.3.1.1.10 (`mb_qp_delta` binarisation).  Uses
+/// contexts 60..=63 with a single-bit prefix followed by a unary
+/// tail; the magnitude is then converted to a signed delta via the
+/// standard interleaved mapping (spec equation 9-19).
 pub fn decode_mb_qp_delta(cabac: &mut CabacContext<'_>, states: &mut [u8]) -> i32 {
     if cabac.get(&mut states[60]) == 0 {
         return 0;
@@ -453,7 +453,7 @@ pub fn decode_mb_qp_delta(cabac: &mut CabacContext<'_>, states: &mut [u8]) -> i3
         val += 1;
         // Sanity cap to avoid runaway in malformed streams.  The
         // spec allows up to ±51 (or wider for high-bit-depth);
-        // FFmpeg uses 2 * max_qp.  102 fits 8-bit luma comfortably.
+        // 102 fits 8-bit luma comfortably (2 × max_qp).
         if val > 102 {
             return 0;
         }

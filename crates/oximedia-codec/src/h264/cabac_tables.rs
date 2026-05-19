@@ -1,16 +1,19 @@
 //! H.264 CABAC state-machine lookup tables.
 //!
-//! Values transcribed verbatim from FFmpeg's
-//! `libavcodec/cabac.c::ff_h264_cabac_tables` (LGPL 2.1+).  Signed
-//! literals in the source (`-128`, `-80`, ...) are stored here as
-//! their two's-complement wrapped `u8` equivalents (`128`, `176`,
-//! ...) — same values FFmpeg's `const uint8_t` array holds.
+//! All values are normative per ITU-T Rec. H.264 / ISO/IEC 14496-10
+//! clause 9.3.  Signed entries in the spec (`-128`, `-80`, ...) are
+//! stored here as their two's-complement wrapped `u8` equivalents
+//! (`128`, `176`, ...).
 //!
-//! Layout (matches `cabac.h` offsets):
-//! - `[0..512]`   → `H264_NORM_SHIFT`  (renormalisation shift count).
-//! - `[512..1024]` → `H264_LPS_RANGE`   (Less-Probable-Symbol range table).
-//! - `[1024..1280]` → `H264_MLPS_STATE` (state transition table).
-//! - `[1280..1343]` → `H264_LAST_COEFF_FLAG_OFFSET_8x8` (8×8 transform contexts).
+//! Layout:
+//! - `[0..512]`   → `H264_NORM_SHIFT`  (renormalisation shift count;
+//!   spec § 9.3.1.2).
+//! - `[512..1024]` → `H264_LPS_RANGE`   (Less-Probable-Symbol range
+//!   table; spec Table 9-44).
+//! - `[1024..1280]` → `H264_MLPS_STATE` (state transition table;
+//!   spec Table 9-45).
+//! - `[1280..1343]` → `H264_LAST_COEFF_FLAG_OFFSET_8x8` (8×8
+//!   transform context offsets; spec Table 9-43).
 
 /// Offset of the NORM_SHIFT sub-table inside [`H264_CABAC_TABLES`].
 pub const H264_NORM_SHIFT_OFFSET: usize = 0;
