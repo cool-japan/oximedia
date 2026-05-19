@@ -71,7 +71,8 @@ pub use cavlc::{
 };
 pub use decoder::{
     decode_i_slice, decode_inter_p_l0_16x16_mb, decode_intra_16x16_mb, decode_intra_4x4_mb,
-    decode_intra_chroma_8x8, IntraLumaSpec, IntraMacroblock, Residual4x4Scan,
+    decode_intra_chroma_8x8, decode_intra_slice_bitstream, IntraLumaSpec, IntraMacroblock,
+    Residual4x4Scan,
 };
 pub use dpb::{Dpb, DpbEntry, DpbError};
 pub use intra_mode::{
