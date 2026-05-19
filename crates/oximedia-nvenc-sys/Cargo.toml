@@ -1,0 +1,30 @@
+[package]
+name = "oximedia-nvenc-sys"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "FFI bindings to the NVIDIA Video Codec SDK (NVENC / NVDEC). Linux + Windows."
+keywords = ["nvenc", "nvdec", "ffi", "nvidia", "cuda"]
+categories = ["external-ffi-bindings", "multimedia"]
+links = "nvidia-encode-nvenc-sys"
+
+[lib]
+name = "oximedia_nvenc_sys"
+
+[build-dependencies]
+bindgen = { workspace = true }
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+non_camel_case_types = "allow"
+non_snake_case = "allow"
+non_upper_case_globals = "allow"
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }

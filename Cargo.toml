@@ -111,6 +111,12 @@ members = [
     "crates/oximedia-cdn",
     "crates/oximedia-pipeline",
     "crates/oximedia-image-transform",
+    "crates/oximedia-vtb-sys",
+    "crates/oximedia-nvenc-sys",
+    "crates/oximedia-vpl-sys",
+    "crates/oximedia-vaapi-sys",
+    "crates/oximedia-amf-sys",
+    "crates/oximedia-vtb",
     "oximedia-wasm",
     "benches",
 ]
@@ -415,6 +421,8 @@ parking_lot = "0.12"
 uuid = { version = "1.23", features = ["v4", "serde", "js"] }
 prometheus = "0.14"
 cc = "1"
+bindgen = "0.72"
+pkg-config = "0.3"
 oxiarc-archive = "0.2.6"
 oxiarc-deflate = "0.2.6"
 oxiarc-lz4 = "0.2.6"

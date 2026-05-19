@@ -136,6 +136,43 @@ OxiMedia classifies each decoder with one of four honesty labels.
   compensation, loop filter.
 - **Effort to promote to Verified:** medium.
 
+### H.264 / AVC — Functional
+
+- **Module:** `crates/oximedia-codec/src/h264/`
+- **Current state:** Full Annex-B byte stream → `Frame` pipeline behind
+  the `Decoder` driver in `pipeline.rs`. SPS / PPS / slice-header parsing,
+  CAVLC and CABAC entropy decoding, intra prediction (4×4 / 16×16 /
+  chroma 8×8), 4×4 integer inverse transform with Hadamard luma + chroma
+  DC dequant, sub-pel motion compensation (6-tap luma, bilinear chroma),
+  median MV prediction, P (all partition shapes including P_8x8 sub-mb)
+  and B (16×16 / 16×8 / 8×16 / B_8x8 / B_Direct spatial) macroblock
+  orchestrators, multi-reference and bi-predicted reconstruction, DPB
+  with POC types 0/1/2 and RefPicList0 + RefPicList1 construction,
+  in-loop deblocking for luma and chroma 4:2:0.
+- **Known approximations:** B-slice CAVLC walks but emits placeholders
+  (proper bin tree expansion is the headline remaining gap);
+  `ref_pic_list_modification` ops are parsed but not yet applied;
+  weighted prediction parsed but not yet applied;
+  `directZeroPredictionFlag` for B_Direct (temporal MV cache) not
+  tracked.
+- **Out of scope (deliberate):** High profile (8×8 transform, custom
+  scaling lists), 4:2:2 / 4:4:4 chroma, MBAFF / field coding, SP/SI
+  slices.
+- **Tests:** 279 unit tests plus a synthetic Annex-B → pixel-exact
+  round-trip suite (`bitstream_roundtrip.rs`). The round-trip proves
+  the encoder + decoder agree; it does not prove conformance against
+  JVT-AVC reference vectors.
+- **Patent status:** The MPEG-LA AVC patent pool wound down its
+  licensing program in December 2024. The bulk of AVC-essential
+  patents originated from late-1990s / early-2000s filings and have
+  reached or are within a year of their 20-year terms. Individual
+  patents in certain jurisdictions may still exist; commercial users
+  should consult counsel. Open-source distribution in the United
+  States is generally considered safe as of 2026.
+- **Effort to promote to Verified:** specialist (JVT-AVC conformance
+  suite integration + bit-exact agreement against a reference decoder
+  on the full test-vector set).
+
 ### APV — Functional
 
 - **Module:** `crates/oximedia-codec/src/apv/`

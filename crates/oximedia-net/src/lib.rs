@@ -71,6 +71,7 @@ pub mod buffer_model;
 pub mod cdn;
 pub mod connection_pool;
 pub mod dash;
+pub mod depacketize;
 pub mod error;
 pub mod fec;
 pub mod fec_interleave;
