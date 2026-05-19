@@ -32,6 +32,7 @@ use crate::h264::frame::{
 };
 use crate::h264::intra_pred::{predict_16x16, predict_4x4, predict_chroma_8x8, Intra4x4Mode};
 use crate::h264::macroblock::{Intra16x16PredMode, IntraChromaPredMode};
+use crate::h264::motion::{fetch_chroma_4x4_subpel, fetch_luma_4x4_integer};
 use crate::h264::transform::dequant_and_inverse_transform_4x4;
 use crate::CodecError;
 
@@ -168,6 +169,121 @@ pub fn decode_intra_chroma_8x8(
                     frame.set_cb(cx + x, cy + y, sample);
                 } else {
                     frame.set_cr(cx + x, cy + y, sample);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Decodes one P-macroblock with a single 16×16 motion vector (the
+/// `P_L0_16x16` partition shape) and writes the reconstructed
+/// samples into the frame.
+///
+/// `ref_frame` is the L0 reference frame.  `mv_x` / `mv_y` are the
+/// quarter-pel motion vector for luma; chroma uses the same numeric
+/// MV interpreted as eighth-pel against the half-resolution chroma
+/// plane (the H.264 4:2:0 derivation).
+///
+/// Only the integer-pel luma fetch path is implemented in this
+/// commit; sub-pel luma offsets fall back to integer-pel fetch with
+/// the offset truncated, which is non-conformant but lets the
+/// orchestrator function be wired up and tested before the full
+/// luma quarter-pel filter dispatch lands.
+///
+/// # Errors
+///
+/// Returns [`CodecError::InvalidData`] when the macroblock extends
+/// past the output frame.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_inter_p_l0_16x16_mb(
+    frame: &mut Frame,
+    ref_frame: &Frame,
+    mb_x: usize,
+    mb_y: usize,
+    mv_x: i32,
+    mv_y: i32,
+    luma_4x4_residuals: &[Residual4x4Scan; 16],
+    chroma_cb_residuals: &[Residual4x4Scan; 4],
+    chroma_cr_residuals: &[Residual4x4Scan; 4],
+    qp_y: u8,
+    qp_chroma: u8,
+) -> Result<(), CodecError> {
+    let px = mb_x
+        .checked_mul(16)
+        .ok_or_else(|| CodecError::InvalidData("mb_x overflow".into()))?;
+    let py = mb_y
+        .checked_mul(16)
+        .ok_or_else(|| CodecError::InvalidData("mb_y overflow".into()))?;
+    if px + 16 > frame.width || py + 16 > frame.height {
+        return Err(CodecError::InvalidData(format!(
+            "macroblock at ({mb_x}, {mb_y}) extends past frame"
+        )));
+    }
+
+    // Luma: integer-pel fetch (sub-pel offset truncated for now).
+    let int_mv_x = mv_x >> 2;
+    let int_mv_y = mv_y >> 2;
+    for sub in 0..16 {
+        let sub_x_in_mb = (sub % 4) * 4;
+        let sub_y_in_mb = (sub / 4) * 4;
+        let ref_x = (px as i32 + sub_x_in_mb as i32) + int_mv_x;
+        let ref_y = (py as i32 + sub_y_in_mb as i32) + int_mv_y;
+        let prediction = fetch_luma_4x4_integer(ref_frame, ref_x, ref_y);
+        let residual = match luma_4x4_residuals[sub] {
+            None => [[0i32; 4]; 4],
+            Some(scan) => dequant_and_inverse_transform_4x4(&scan, qp_y),
+        };
+        for j in 0..4 {
+            for i in 0..4 {
+                let pred = i32::from(prediction[j][i]);
+                let v = (pred + residual[j][i]).clamp(0, 255) as u8;
+                frame.set_luma(px + sub_x_in_mb + i, py + sub_y_in_mb + j, v);
+            }
+        }
+    }
+
+    // Chroma: half-resolution.  MV is interpreted as eighth-pel
+    // against the chroma plane.  Both Cb and Cr use the same MV.
+    let cx = mb_x * 8;
+    let cy = mb_y * 8;
+    let chroma_mv_x = mv_x; // already eighth-pel resolution for 4:2:0
+    let chroma_mv_y = mv_y;
+    for component_is_cb in [true, false] {
+        let residuals = if component_is_cb {
+            chroma_cb_residuals
+        } else {
+            chroma_cr_residuals
+        };
+        for sub in 0..4 {
+            let sub_x_in_block = (sub % 2) * 4;
+            let sub_y_in_block = (sub / 2) * 4;
+            let block_cx = (cx + sub_x_in_block) as i32;
+            let block_cy = (cy + sub_y_in_block) as i32;
+            let prediction = fetch_chroma_4x4_subpel(
+                ref_frame,
+                block_cx,
+                block_cy,
+                chroma_mv_x,
+                chroma_mv_y,
+                component_is_cb,
+            );
+            let residual = match residuals[sub] {
+                None => [[0i32; 4]; 4],
+                Some(scan) => dequant_and_inverse_transform_4x4(&scan, qp_chroma),
+            };
+            for j in 0..4 {
+                for i in 0..4 {
+                    let pred = i32::from(prediction[j][i]);
+                    let v = (pred + residual[j][i]).clamp(0, 255) as u8;
+                    let dst_x = cx + sub_x_in_block + i;
+                    let dst_y = cy + sub_y_in_block + j;
+                    if component_is_cb {
+                        frame.set_cb(dst_x, dst_y, v);
+                    } else {
+                        frame.set_cr(dst_x, dst_y, v);
+                    }
                 }
             }
         }
@@ -552,6 +668,50 @@ mod tests {
         for y in 16..32 {
             for x in 0..16 {
                 assert_eq!(frame.get_luma(x, y), Some(60), "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn inter_p_l0_16x16_with_zero_mv_copies_reference_frame() {
+        // Reference frame filled with a recognisable pattern.
+        let mut reference = Frame::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                reference.set_luma(x, y, (x ^ y) as u8 * 8);
+            }
+        }
+        for cy in 0..8 {
+            for cx in 0..8 {
+                reference.set_cb(cx, cy, 64);
+                reference.set_cr(cx, cy, 192);
+            }
+        }
+        let mut frame = Frame::new(16, 16);
+        decode_inter_p_l0_16x16_mb(
+            &mut frame,
+            &reference,
+            0,
+            0,
+            0,
+            0,
+            &empty_luma_residuals(),
+            &empty_chroma_residuals(),
+            &empty_chroma_residuals(),
+            28,
+            28,
+        )
+        .expect("should decode");
+
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(frame.get_luma(x, y), reference.get_luma(x, y));
+            }
+        }
+        for cy in 0..8 {
+            for cx in 0..8 {
+                assert_eq!(frame.get_cb(cx, cy), Some(64));
+                assert_eq!(frame.get_cr(cx, cy), Some(192));
             }
         }
     }
