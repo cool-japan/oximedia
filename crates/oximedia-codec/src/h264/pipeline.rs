@@ -628,19 +628,15 @@ impl Decoder {
                         cache.record_inter_mb(mb.mb_x, &decoded, 0, 0);
                     }
                     MbCavlcKind::InterP {
+                        mb_type,
                         motion,
                         luma_blocks,
                         chroma_dc,
                         chroma_ac,
-                        is_16x16,
                         ..
                     } => {
-                        let _ = is_16x16;
-                        let (per_block_mvs, decoded) = decode_p_mvs_cavlc(
-                            mb,
-                            motion,
-                            &neighbours,
-                        );
+                        let (per_block_mvs, decoded) =
+                            decode_p_mvs_cavlc(mb, *mb_type, motion, &neighbours);
                         let luma_4x4 = build_luma_4x4(luma_blocks);
                         let chroma_dc_pos = build_chroma_dc(chroma_dc);
                         let chroma_ac_pos = build_chroma_ac(chroma_ac);
@@ -852,10 +848,10 @@ fn extract_chroma_ac_plane(all: &[[i32; 16]; 8], plane: usize) -> [[i32; 16]; 4]
 /// [`InterMbDecoded`] view suitable for `record_inter_mb`.
 fn decode_p_mvs_cavlc(
     mb: &crate::h264::slice_cavlc::MbCavlcDecoded,
+    mb_type: MbType,
     motion: &crate::h264::macroblock::InterMotionInfo,
     neighbours: &MbNeighbours,
 ) -> ([MotionVector; 16], InterMbDecoded) {
-    let mb_type = mb_type_from_kind(&mb.kind);
     let partitions = cavlc_partitions(mb_type);
     let mut per_block_mvs = [(0i32, 0i32); 16];
     let mut decoded = InterMbDecoded::default();
@@ -901,25 +897,11 @@ fn decode_p_mvs_cavlc(
     (per_block_mvs, decoded)
 }
 
-fn mb_type_from_kind(kind: &MbCavlcKind) -> MbType {
-    match kind {
-        MbCavlcKind::InterP { is_16x16: true, .. } => MbType::PL0_16x16,
-        MbCavlcKind::InterP { .. } => {
-            // The slice_cavlc walker doesn't currently carry the
-            // distinction between 16x8 and 8x16 in MbCavlcKind, so
-            // we'd need to extend the type or read the parser
-            // layer.  Default to 16x8 here — `cavlc_partitions`
-            // covers both shapes the same way for 2 partitions of
-            // 8 blocks each.  Multi-partition handling becomes
-            // bit-exact once MbCavlcKind exposes the shape.
-            MbType::PL0L0_16x8
-        }
-        _ => MbType::PL0_16x16,
-    }
-}
-
-/// Returns the 4×4 block indices covered by each partition for a
-/// CAVLC P-slice macroblock.
+/// Returns the 4×4 block indices covered by each partition of a
+/// CAVLC P-slice macroblock type.  P_8x8 and P_8x8ref0 are
+/// flattened to four 8×8 quadrants — sub-MB-level partitioning
+/// inside each quadrant uses motion.sub_mb_types when bit-exact
+/// reconstruction lands.
 fn cavlc_partitions(mb_type: MbType) -> &'static [&'static [usize]] {
     match mb_type {
         MbType::PL0_16x16 => &[&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]],
@@ -930,6 +912,12 @@ fn cavlc_partitions(mb_type: MbType) -> &'static [&'static [usize]] {
         MbType::PL0L0_8x16 => &[
             &[0, 1, 4, 5, 8, 9, 12, 13],
             &[2, 3, 6, 7, 10, 11, 14, 15],
+        ],
+        MbType::P8x8 | MbType::P8x8Ref0 => &[
+            &[0, 1, 4, 5],
+            &[2, 3, 6, 7],
+            &[8, 9, 12, 13],
+            &[10, 11, 14, 15],
         ],
         _ => &[&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]],
     }

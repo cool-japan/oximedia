@@ -66,9 +66,12 @@ pub enum MbCavlcKind {
         chroma_ac: [Option<ResidualBlock>; 8],
     },
     /// Inter P macroblock (16×16 / 16×8 / 8×16 / 8×8 partition
-    /// shapes — recognised but residual decode is wired only for
-    /// 16×16 in this commit).
+    /// shapes).
     InterP {
+        /// Concrete P-slice mb_type — drives the partition layout
+        /// the reconstruction loop uses to splat MVs across 4×4
+        /// blocks.
+        mb_type: MbType,
         /// Parsed motion info.
         motion: InterMotionInfo,
         /// 4-bit luma + 2-bit chroma CBP.
@@ -79,10 +82,6 @@ pub enum MbCavlcKind {
         chroma_dc: [Option<ResidualBlock>; 2],
         /// Chroma AC blocks (4 Cb + 4 Cr).
         chroma_ac: [Option<ResidualBlock>; 8],
-        /// 16×16-only flag — true for `P_L0_16x16`, false for
-        /// 16×8 / 8×16 / 8×8.  The reconstruction wiring in
-        /// `pipeline.rs` only handles the 16×16 case.
-        is_16x16: bool,
     },
     /// Recognised but not yet wired through CAVLC reconstruction.
     Unsupported,
@@ -283,16 +282,19 @@ pub fn parse_slice_cavlc(
         }
 
         let kind = match layer.mb_type {
-            MbType::PL0_16x16 | MbType::PL0L0_16x8 | MbType::PL0L0_8x16 => {
-                let is_16x16 = matches!(layer.mb_type, MbType::PL0_16x16);
+            MbType::PL0_16x16
+            | MbType::PL0L0_16x8
+            | MbType::PL0L0_8x16
+            | MbType::P8x8
+            | MbType::P8x8Ref0 => {
                 let motion = layer.motion.clone().unwrap_or_default();
                 MbCavlcKind::InterP {
+                    mb_type: layer.mb_type,
                     motion,
                     cbp: layer.coded_block_pattern,
                     luma_blocks,
                     chroma_dc,
                     chroma_ac,
-                    is_16x16,
                 }
             }
             MbType::INxN | MbType::I16x16 { .. } => MbCavlcKind::Intra {
