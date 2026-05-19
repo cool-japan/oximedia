@@ -46,6 +46,7 @@ pub mod frame;
 pub mod intra_mode;
 pub mod intra_pred;
 pub mod macroblock;
+pub mod motion;
 pub mod pps;
 pub mod rbsp;
 pub mod scaling_list;
@@ -66,6 +67,7 @@ pub use decoder::{
 pub use intra_mode::{
     most_probable_mode, resolve_intra4x4_mode, Intra4x4ModeContext,
 };
+pub use motion::{chroma_bilinear, luma_6tap_unclipped, luma_half_pel, rounded_average};
 pub use frame::{
     collect_chroma_8x8_neighbours, collect_intra16x16_neighbours, collect_intra4x4_neighbours,
     Frame,
