@@ -62,6 +62,7 @@ pub mod motion;
 pub mod mv_pred;
 pub mod pps;
 pub mod rbsp;
+pub mod reconstruct_inter;
 pub mod scaling_list;
 pub mod slice_cabac;
 pub mod slice_header;
@@ -132,6 +133,7 @@ pub use macroblock::{
 };
 pub use pps::{parse_pps, PpsRbsp};
 pub use rbsp::{strip_emulation_prevention, trailing_bits_len};
+pub use reconstruct_inter::{reconstruct_inter_p_mb, InterPMbInputs};
 pub use scaling_list::{
     read_pic_scaling_matrix, read_seq_scaling_matrix, ScalingList4x4, ScalingList8x8,
     ScalingListChoice, ScalingLists,
