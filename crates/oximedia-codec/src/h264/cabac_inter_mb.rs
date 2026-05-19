@@ -256,8 +256,13 @@ pub fn decode_p_mb_cabac(
             // Neighbour ref view for this partition: pick the first
             // 4×4 of the partition as the reference point for the
             // CABAC ctx selection — matches spec § 9.3.3.1.1.6.
+            // For in-macroblock neighbours we look at any 4×4 that
+            // a previous partition has already populated in
+            // `decoded.ref_l0`; this turns the simplified -1
+            // fallback into the spec-correct in-MB neighbour.
             let first_block = blocks[0];
-            let (ref_a, ref_b) = ref_neighbours_for_block(neighbours, first_block);
+            let (ref_a, ref_b) =
+                ref_neighbours_for_block_with_inmb(neighbours, first_block, &decoded.ref_l0);
             let r = decode_ref_idx(
                 cabac,
                 states,
@@ -541,6 +546,31 @@ fn ref_neighbours_for_block(neighbours: &MbNeighbours, block: usize) -> (i8, i8)
         if neighbours.top_available { neighbours.top_ref[col] } else { -1 }
     } else {
         -1
+    };
+    (ref_a, ref_b)
+}
+
+/// Variant of [`ref_neighbours_for_block`] that consults the
+/// `in_mb_refs` array for in-macroblock neighbours.  Used after a
+/// previous partition in the current macroblock has populated
+/// `decoded.ref_l0[..]` so the next partition's CABAC context
+/// sees the spec-correct neighbour.
+fn ref_neighbours_for_block_with_inmb(
+    neighbours: &MbNeighbours,
+    block: usize,
+    in_mb_refs: &[i8; 16],
+) -> (i8, i8) {
+    let row = block / 4;
+    let col = block % 4;
+    let ref_a = if col == 0 {
+        if neighbours.left_available { neighbours.left_ref[row] } else { -1 }
+    } else {
+        in_mb_refs[row * 4 + (col - 1)]
+    };
+    let ref_b = if row == 0 {
+        if neighbours.top_available { neighbours.top_ref[col] } else { -1 }
+    } else {
+        in_mb_refs[(row - 1) * 4 + col]
     };
     (ref_a, ref_b)
 }
