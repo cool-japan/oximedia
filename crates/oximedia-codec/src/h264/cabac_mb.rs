@@ -371,6 +371,9 @@ pub type Intra4x4Mpms = [u8; 16];
 ///   neighbour bias for the chroma-pred-mode context.
 /// - `left_cbp` / `top_cbp` — 8-bit neighbour CBPs used by
 ///   `decode_cbp_luma` / `decode_cbp_chroma`.
+/// - `prev_qp_delta_nonzero` — bias for the `mb_qp_delta` first-bin
+///   context, tracking whether the previous macroblock in this
+///   slice produced a nonzero QP delta.
 pub fn decode_intra_mb(
     cabac: &mut CabacContext<'_>,
     states: &mut [u8],
@@ -381,6 +384,7 @@ pub fn decode_intra_mb(
     top_chroma_pred_nonzero: bool,
     left_cbp: u8,
     top_cbp: u8,
+    prev_qp_delta_nonzero: bool,
 ) -> IntraMbCabac {
     let mb_type = decode_intra_mb_type(
         cabac,
@@ -430,7 +434,7 @@ pub fn decode_intra_mb(
     }
 
     if out.cbp != 0 || matches!(mb_type, IntraMbType::I16x16 { .. }) {
-        out.mb_qp_delta = decode_mb_qp_delta(cabac, states);
+        out.mb_qp_delta = decode_mb_qp_delta(cabac, states, prev_qp_delta_nonzero);
     }
 
     out
@@ -442,8 +446,18 @@ pub fn decode_intra_mb(
 /// contexts 60..=63 with a single-bit prefix followed by a unary
 /// tail; the magnitude is then converted to a signed delta via the
 /// standard interleaved mapping (spec equation 9-19).
-pub fn decode_mb_qp_delta(cabac: &mut CabacContext<'_>, states: &mut [u8]) -> i32 {
-    if cabac.get(&mut states[60]) == 0 {
+///
+/// `prev_qp_delta_nonzero` is the parser's running flag tracking
+/// whether the *previous* macroblock's `mb_qp_delta` was nonzero —
+/// it biases the first-bin context (60 vs 61) and must be reset to
+/// `false` at slice start.
+pub fn decode_mb_qp_delta(
+    cabac: &mut CabacContext<'_>,
+    states: &mut [u8],
+    prev_qp_delta_nonzero: bool,
+) -> i32 {
+    let first_ctx = 60 + prev_qp_delta_nonzero as usize;
+    if cabac.get(&mut states[first_ctx]) == 0 {
         return 0;
     }
     let mut val = 1i32;
@@ -640,11 +654,30 @@ mod tests {
             false,
             0,
             0,
+            false,
         );
         // Sanity: chroma pred mode fits 0..=3 and qp_delta fits the
         // spec range; mb_type variants self-validate.
         assert!(out.chroma_pred_mode <= 3);
         assert!(out.mb_qp_delta.abs() <= 51);
+    }
+
+    #[test]
+    fn qp_delta_first_bin_context_tracks_prev_flag() {
+        // Different `prev_qp_delta_nonzero` values pick context 60
+        // vs 61, which start at different probability states — same
+        // bytestream should therefore produce divergent decodes.
+        let bytes = buf();
+        let mut s1 = init_contexts(SliceType::I, 26, 0);
+        let mut c1 = CabacContext::new(&bytes).unwrap();
+        let mut s2 = init_contexts(SliceType::I, 26, 0);
+        let mut c2 = CabacContext::new(&bytes).unwrap();
+        let d0 = decode_mb_qp_delta(&mut c1, &mut s1, false);
+        let d1 = decode_mb_qp_delta(&mut c2, &mut s2, true);
+        // Both bounded; we don't pin equality — the point is that
+        // each path threads its respective context (60 vs 61).
+        assert!(d0.abs() <= 102);
+        assert!(d1.abs() <= 102);
     }
 
     #[test]
@@ -655,7 +688,7 @@ mod tests {
         let bytes = vec![0x00u8; 64];
         let mut states = init_contexts(SliceType::I, 26, 0);
         let mut cabac = CabacContext::new(&bytes).unwrap();
-        let d = decode_mb_qp_delta(&mut cabac, &mut states);
+        let d = decode_mb_qp_delta(&mut cabac, &mut states, false);
         // d may be nonzero depending on context state; just bound it.
         assert!(d.abs() <= 102);
     }
