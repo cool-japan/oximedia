@@ -21,6 +21,8 @@
 //! retained.
 
 use crate::h264::bit_reader::BitReader;
+use crate::h264::scaling_list::{read_seq_scaling_matrix, ScalingLists};
+use crate::h264::vui::{parse_vui, VuiParameters};
 use crate::CodecError;
 
 /// All extended-profile profile_idc values for which the High-profile
@@ -70,9 +72,12 @@ pub struct SpsRbsp {
     /// transform precision normally applied at low QP.
     pub qpprime_y_zero_transform_bypass_flag: bool,
     /// True when explicit 4x4 / 8x8 scaling lists follow the basic SPS
-    /// syntax in the bitstream.  Their values are consumed but not
-    /// currently retained.
+    /// syntax in the bitstream.
     pub seq_scaling_matrix_present_flag: bool,
+    /// Decoded scaling lists when `seq_scaling_matrix_present_flag` is
+    /// true.  When false, callers should fall back to the spec's
+    /// flat / default matrices.
+    pub scaling_lists: Option<ScalingLists>,
     /// `log2_max_frame_num_minus4` from the spec; the actual modulus is
     /// `1 << (log2_max_frame_num_minus4 + 4)`.
     pub log2_max_frame_num_minus4: u32,
@@ -117,10 +122,10 @@ pub struct SpsRbsp {
     pub frame_crop_top_offset: u32,
     /// See `frame_crop_left_offset`.
     pub frame_crop_bottom_offset: u32,
-    /// True when VUI parameters follow.  The VUI itself is not parsed
-    /// here; consult `bits_remaining_after_vui_flag` on the bit reader
-    /// to confirm the rest of the RBSP.
+    /// True when VUI parameters follow.
     pub vui_parameters_present_flag: bool,
+    /// Decoded VUI parameters when `vui_parameters_present_flag` is true.
+    pub vui: Option<VuiParameters>,
 }
 
 impl SpsRbsp {
@@ -187,6 +192,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SpsRbsp, CodecError> {
     let mut qpprime_y_zero_transform_bypass_flag = false;
     let mut seq_scaling_matrix_present_flag = false;
 
+    let mut scaling_lists: Option<ScalingLists> = None;
     if HIGH_PROFILE_IDCS.contains(&profile_idc) {
         chroma_format_idc = r.read_ue()?;
         if chroma_format_idc == 3 {
@@ -198,19 +204,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SpsRbsp, CodecError> {
         seq_scaling_matrix_present_flag = r.read_bit()?;
 
         if seq_scaling_matrix_present_flag {
-            // Consume scaling lists.  H.264 §7.3.2.1.1.1: for each of 8
-            // (or 12 when chroma_format_idc == 3) potential scaling lists,
-            // a present flag is followed by the list itself, encoded as
-            // sequences of se(v) deltas.  We bit-skip but do not store
-            // them — most production streams reuse the default matrices.
-            let lists = if chroma_format_idc == 3 { 12 } else { 8 };
-            for i in 0..lists {
-                let present = r.read_bit()?;
-                if present {
-                    let size = if i < 6 { 16 } else { 64 };
-                    skip_scaling_list(&mut r, size)?;
-                }
-            }
+            scaling_lists = Some(read_seq_scaling_matrix(&mut r, chroma_format_idc)?);
         }
     }
 
@@ -270,7 +264,11 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SpsRbsp, CodecError> {
     };
 
     let vui_parameters_present_flag = r.read_bit()?;
-    // Intentionally do not descend into the VUI here.
+    let vui = if vui_parameters_present_flag {
+        Some(parse_vui(&mut r)?)
+    } else {
+        None
+    };
 
     Ok(SpsRbsp {
         profile_idc,
@@ -283,6 +281,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SpsRbsp, CodecError> {
         bit_depth_chroma: (bit_depth_chroma_minus8 + 8) as u8,
         qpprime_y_zero_transform_bypass_flag,
         seq_scaling_matrix_present_flag,
+        scaling_lists,
         log2_max_frame_num_minus4,
         pic_order_cnt_type,
         log2_max_pic_order_cnt_lsb_minus4,
@@ -303,22 +302,8 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SpsRbsp, CodecError> {
         frame_crop_top_offset,
         frame_crop_bottom_offset,
         vui_parameters_present_flag,
+        vui,
     })
-}
-
-fn skip_scaling_list(r: &mut BitReader<'_>, size: u32) -> Result<(), CodecError> {
-    let mut last_scale: i32 = 8;
-    let mut next_scale: i32 = 8;
-    for _ in 0..size {
-        if next_scale != 0 {
-            let delta_scale = r.read_se()?;
-            next_scale = ((last_scale + delta_scale + 256) % 256) as i32;
-        }
-        if next_scale != 0 {
-            last_scale = next_scale;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -510,6 +495,8 @@ mod tests {
             frame_crop_top_offset: 0,
             frame_crop_bottom_offset: 4, // 4 * 2 = 8 luma rows cropped off bottom
             vui_parameters_present_flag: false,
+            vui: None,
+            scaling_lists: None,
         };
         assert_eq!(sps.dimensions(), (1920, 1088));
         assert_eq!(sps.cropped_dimensions(), (1920, 1080));

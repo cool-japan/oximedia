@@ -43,6 +43,117 @@ use crate::h264::pps::PpsRbsp;
 use crate::h264::sps::SpsRbsp;
 use crate::CodecError;
 
+/// One entry in a reference-picture-list modification command stream.
+///
+/// Spec syntax: `modification_of_pic_nums_idc` plus its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefPicListModOp {
+    /// `modification_of_pic_nums_idc == 0`: subtract
+    /// `abs_diff_pic_num_minus1 + 1` from the current picture number.
+    SubtractAbsDiffPicNum(u32),
+    /// `modification_of_pic_nums_idc == 1`: add the same.
+    AddAbsDiffPicNum(u32),
+    /// `modification_of_pic_nums_idc == 2`: assign long-term picture
+    /// number `long_term_pic_num`.
+    LongTermPicNum(u32),
+}
+
+/// Reference picture list modification for one list (L0 or L1).
+///
+/// `present` is true iff the slice header signalled the surrounding
+/// `ref_pic_list_modification_flag_lX = 1`. When false, the modification
+/// loop was not entered and `ops` is empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefPicListModification {
+    /// True when the slice signalled the modification flag.
+    pub present: bool,
+    /// Modification operations in spec order. Terminated by an implicit
+    /// `modification_of_pic_nums_idc == 3` that is not stored here.
+    pub ops: Vec<RefPicListModOp>,
+}
+
+/// A single luma + optional chroma weight/offset pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WeightEntry {
+    /// Luma weight (signed). `None` means luma flag was 0 — caller
+    /// uses the implied default.
+    pub luma: Option<(i32, i32)>,
+    /// Per-chroma-component (Cb, Cr) weight + offset pair. `None`
+    /// means the chroma flag was 0 or the stream is monochrome.
+    pub chroma: Option<[(i32, i32); 2]>,
+}
+
+/// `pred_weight_table()` from H.264 §7.3.3.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredWeightTable {
+    /// `luma_log2_weight_denom`.
+    pub luma_log2_weight_denom: u32,
+    /// `chroma_log2_weight_denom`. Present iff stream isn't monochrome.
+    pub chroma_log2_weight_denom: Option<u32>,
+    /// Per-list weights for L0.
+    pub weights_l0: Vec<WeightEntry>,
+    /// Per-list weights for L1 (B-slices only; empty for P).
+    pub weights_l1: Vec<WeightEntry>,
+}
+
+/// One memory management control operation from
+/// `dec_ref_pic_marking()` (non-IDR adaptive path), H.264 §7.3.3.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmcoOp {
+    /// MMCO 1: mark short-term picture indicated by
+    /// `difference_of_pic_nums_minus1` as unused for reference.
+    ShortTermUnused {
+        /// `difference_of_pic_nums_minus1`.
+        difference_of_pic_nums_minus1: u32,
+    },
+    /// MMCO 2: mark long-term picture as unused.
+    LongTermUnused {
+        /// `long_term_pic_num`.
+        long_term_pic_num: u32,
+    },
+    /// MMCO 3: assign a long-term frame index to a short-term picture.
+    AssignLongTerm {
+        /// `difference_of_pic_nums_minus1`.
+        difference_of_pic_nums_minus1: u32,
+        /// `long_term_frame_idx`.
+        long_term_frame_idx: u32,
+    },
+    /// MMCO 4: update `MaxLongTermFrameIdx`.
+    MaxLongTermIdxPlus1 {
+        /// `max_long_term_frame_idx_plus1`.
+        max_long_term_frame_idx_plus1: u32,
+    },
+    /// MMCO 5: mark all reference pictures as unused.
+    AllUnused,
+    /// MMCO 6: assign long-term frame index to current picture.
+    AssignCurrentLongTerm {
+        /// `long_term_frame_idx`.
+        long_term_frame_idx: u32,
+    },
+}
+
+/// `dec_ref_pic_marking()` payload, broken out by IDR vs adaptive case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecRefPicMarking {
+    /// IDR slice: two flags signal output suppression and whether the
+    /// IDR picture should immediately become a long-term reference.
+    Idr {
+        /// `no_output_of_prior_pics_flag`.
+        no_output_of_prior_pics: bool,
+        /// `long_term_reference_flag`.
+        long_term_reference: bool,
+    },
+    /// Non-IDR slice with no adaptive control — DPB sliding-window
+    /// behaviour applies (`adaptive_ref_pic_marking_mode_flag == 0`).
+    SlidingWindow,
+    /// Non-IDR adaptive control: a sequence of MMCO operations
+    /// terminated by an implicit MMCO 0 (not stored here).
+    Adaptive {
+        /// MMCO operations in spec order.
+        ops: Vec<MmcoOp>,
+    },
+}
+
 /// H.264 slice type, after the spec's `% 5` collapse of values 5..=9.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SliceType {
@@ -136,6 +247,16 @@ pub struct SliceHeader {
     pub slice_qp_delta: i32,
     /// Effective slice QP: PPS `pic_init_qp_minus26 + 26 + slice_qp_delta`.
     pub slice_qp_y: i32,
+    /// Reference picture list modification for L0 (P / SP / B slices).
+    pub ref_pic_list_modification_l0: RefPicListModification,
+    /// Reference picture list modification for L1 (B slices only).
+    pub ref_pic_list_modification_l1: RefPicListModification,
+    /// Prediction weight table, when the PPS / slice combination
+    /// signalled one.
+    pub pred_weight_table: Option<PredWeightTable>,
+    /// Decoded reference picture marking commands. Present iff the
+    /// enclosing NAL unit was a reference (`nal_ref_idc != 0`).
+    pub dec_ref_pic_marking: Option<DecRefPicMarking>,
 }
 
 /// Parses a slice header RBSP (emulation prevention already removed).
@@ -250,27 +371,37 @@ pub fn parse_slice_header(
         }
     }
 
-    // Reference picture list modification — bit-skipped here.  See the
-    // module doc for scope notes.
-    if !slice_type.is_intra() {
-        consume_ref_pic_list_modification(&mut r)?;
-    }
-    if slice_type.is_bi_predictive() {
-        consume_ref_pic_list_modification(&mut r)?;
-    }
+    let ref_pic_list_modification_l0 = if !slice_type.is_intra() {
+        read_ref_pic_list_modification(&mut r)?
+    } else {
+        RefPicListModification::default()
+    };
+    let ref_pic_list_modification_l1 = if slice_type.is_bi_predictive() {
+        read_ref_pic_list_modification(&mut r)?
+    } else {
+        RefPicListModification::default()
+    };
 
-    // Prediction weight table.
-    if (pps.weighted_pred_flag
+    let pred_weight_table = if (pps.weighted_pred_flag
         && matches!(slice_type, SliceType::P | SliceType::SP))
         || (pps.weighted_bipred_idc == 1 && slice_type.is_bi_predictive())
     {
-        consume_pred_weight_table(&mut r, sps, num_ref_idx_l0, num_ref_idx_l1)?;
-    }
+        Some(read_pred_weight_table(
+            &mut r,
+            sps,
+            num_ref_idx_l0,
+            num_ref_idx_l1,
+            slice_type.is_bi_predictive(),
+        )?)
+    } else {
+        None
+    };
 
-    // Decoded reference picture marking.
-    if ctx.nal_ref_idc != 0 {
-        consume_dec_ref_pic_marking(&mut r, ctx.is_idr)?;
-    }
+    let dec_ref_pic_marking = if ctx.nal_ref_idc != 0 {
+        Some(read_dec_ref_pic_marking(&mut r, ctx.is_idr)?)
+    } else {
+        None
+    };
 
     // cabac_init_idc when entropy mode is CABAC and we're not intra.
     if pps.entropy_coding_mode_flag && !slice_type.is_intra() {
@@ -298,107 +429,133 @@ pub fn parse_slice_header(
         num_ref_idx_l1_active_minus1: num_ref_idx_l1,
         slice_qp_delta,
         slice_qp_y,
+        ref_pic_list_modification_l0,
+        ref_pic_list_modification_l1,
+        pred_weight_table,
+        dec_ref_pic_marking,
     })
 }
 
-fn consume_ref_pic_list_modification(r: &mut BitReader<'_>) -> Result<(), CodecError> {
-    let modification_flag = r.read_bit()?;
-    if !modification_flag {
-        return Ok(());
-    }
-    loop {
-        let op = r.read_ue()?;
-        match op {
-            0 | 1 => {
-                let _abs_diff_pic_num_minus1 = r.read_ue()?;
-            }
-            2 => {
-                let _long_term_pic_num = r.read_ue()?;
-            }
-            3 => return Ok(()),
-            _ => {
-                return Err(CodecError::InvalidData(format!(
-                    "h264 slice_header: invalid ref_pic_list_modification op {op}"
-                )));
+fn read_ref_pic_list_modification(
+    r: &mut BitReader<'_>,
+) -> Result<RefPicListModification, CodecError> {
+    let present = r.read_bit()?;
+    let mut ops = Vec::new();
+    if present {
+        loop {
+            let op = r.read_ue()?;
+            match op {
+                0 => ops.push(RefPicListModOp::SubtractAbsDiffPicNum(r.read_ue()?)),
+                1 => ops.push(RefPicListModOp::AddAbsDiffPicNum(r.read_ue()?)),
+                2 => ops.push(RefPicListModOp::LongTermPicNum(r.read_ue()?)),
+                3 => break,
+                _ => {
+                    return Err(CodecError::InvalidData(format!(
+                        "h264 slice_header: invalid ref_pic_list_modification op {op}"
+                    )));
+                }
             }
         }
     }
+    Ok(RefPicListModification { present, ops })
 }
 
-fn consume_pred_weight_table(
+fn read_pred_weight_table(
     r: &mut BitReader<'_>,
     sps: &SpsRbsp,
     num_ref_l0: u32,
     num_ref_l1: u32,
-) -> Result<(), CodecError> {
-    let _luma_log2_weight_denom = r.read_ue()?;
-    if sps.chroma_format_idc != 0 {
-        let _chroma_log2_weight_denom = r.read_ue()?;
-    }
-    consume_weights_for_list(r, sps, num_ref_l0)?;
-    consume_weights_for_list(r, sps, num_ref_l1)?;
-    Ok(())
+    is_bi: bool,
+) -> Result<PredWeightTable, CodecError> {
+    let luma_log2_weight_denom = r.read_ue()?;
+    let chroma_log2_weight_denom = if sps.chroma_format_idc != 0 {
+        Some(r.read_ue()?)
+    } else {
+        None
+    };
+    let weights_l0 = read_weight_list(r, sps, num_ref_l0)?;
+    let weights_l1 = if is_bi {
+        read_weight_list(r, sps, num_ref_l1)?
+    } else {
+        Vec::new()
+    };
+    Ok(PredWeightTable {
+        luma_log2_weight_denom,
+        chroma_log2_weight_denom,
+        weights_l0,
+        weights_l1,
+    })
 }
 
-fn consume_weights_for_list(
+fn read_weight_list(
     r: &mut BitReader<'_>,
     sps: &SpsRbsp,
     num_ref_minus1: u32,
-) -> Result<(), CodecError> {
+) -> Result<Vec<WeightEntry>, CodecError> {
+    let mut entries = Vec::with_capacity((num_ref_minus1 as usize).saturating_add(1));
     for _ in 0..=num_ref_minus1 {
-        let luma_weight_flag = r.read_bit()?;
-        if luma_weight_flag {
-            let _luma_weight = r.read_se()?;
-            let _luma_offset = r.read_se()?;
+        let mut entry = WeightEntry::default();
+        let luma_flag = r.read_bit()?;
+        if luma_flag {
+            let w = r.read_se()?;
+            let o = r.read_se()?;
+            entry.luma = Some((w, o));
         }
         if sps.chroma_format_idc != 0 {
-            let chroma_weight_flag = r.read_bit()?;
-            if chroma_weight_flag {
-                for _ in 0..2 {
-                    let _chroma_weight = r.read_se()?;
-                    let _chroma_offset = r.read_se()?;
-                }
+            let chroma_flag = r.read_bit()?;
+            if chroma_flag {
+                let cb = (r.read_se()?, r.read_se()?);
+                let cr = (r.read_se()?, r.read_se()?);
+                entry.chroma = Some([cb, cr]);
             }
         }
+        entries.push(entry);
     }
-    Ok(())
+    Ok(entries)
 }
 
-fn consume_dec_ref_pic_marking(
+fn read_dec_ref_pic_marking(
     r: &mut BitReader<'_>,
     is_idr: bool,
-) -> Result<(), CodecError> {
+) -> Result<DecRefPicMarking, CodecError> {
     if is_idr {
-        let _no_output_of_prior_pics_flag = r.read_bit()?;
-        let _long_term_reference_flag = r.read_bit()?;
-        return Ok(());
+        let no_output_of_prior_pics = r.read_bit()?;
+        let long_term_reference = r.read_bit()?;
+        return Ok(DecRefPicMarking::Idr {
+            no_output_of_prior_pics,
+            long_term_reference,
+        });
     }
     let adaptive = r.read_bit()?;
     if !adaptive {
-        return Ok(());
+        return Ok(DecRefPicMarking::SlidingWindow);
     }
+    let mut ops = Vec::new();
     loop {
         let op = r.read_ue()?;
         match op {
-            0 => return Ok(()),
-            1 | 3 => {
-                let _difference_of_pic_nums_minus1 = r.read_ue()?;
-                if op == 3 {
-                    let _long_term_frame_idx = r.read_ue()?;
-                }
+            0 => break,
+            1 => ops.push(MmcoOp::ShortTermUnused {
+                difference_of_pic_nums_minus1: r.read_ue()?,
+            }),
+            2 => ops.push(MmcoOp::LongTermUnused {
+                long_term_pic_num: r.read_ue()?,
+            }),
+            3 => {
+                let diff = r.read_ue()?;
+                let idx = r.read_ue()?;
+                ops.push(MmcoOp::AssignLongTerm {
+                    difference_of_pic_nums_minus1: diff,
+                    long_term_frame_idx: idx,
+                });
             }
-            2 => {
-                let _long_term_pic_num = r.read_ue()?;
-            }
-            4 => {
-                let _max_long_term_frame_idx_plus1 = r.read_ue()?;
-            }
-            5 => {
-                // Mark all reference pictures as unused for reference.
-            }
-            6 => {
-                let _long_term_frame_idx = r.read_ue()?;
-            }
+            4 => ops.push(MmcoOp::MaxLongTermIdxPlus1 {
+                max_long_term_frame_idx_plus1: r.read_ue()?,
+            }),
+            5 => ops.push(MmcoOp::AllUnused),
+            6 => ops.push(MmcoOp::AssignCurrentLongTerm {
+                long_term_frame_idx: r.read_ue()?,
+            }),
             _ => {
                 return Err(CodecError::InvalidData(format!(
                     "h264 slice_header: invalid memory_management_control op {op}"
@@ -406,6 +563,7 @@ fn consume_dec_ref_pic_marking(
             }
         }
     }
+    Ok(DecRefPicMarking::Adaptive { ops })
 }
 
 #[cfg(test)]
@@ -446,6 +604,8 @@ mod tests {
             frame_crop_top_offset: 0,
             frame_crop_bottom_offset: 0,
             vui_parameters_present_flag: false,
+            vui: None,
+            scaling_lists: None,
         }
     }
 
@@ -468,6 +628,7 @@ mod tests {
             redundant_pic_cnt_present_flag: false,
             transform_8x8_mode_flag: false,
             pic_scaling_matrix_present_flag: false,
+            scaling_lists: None,
             second_chroma_qp_index_offset: 0,
         }
     }
@@ -521,6 +682,121 @@ mod tests {
         assert_eq!(sh.slice_qp_delta, 0);
         // pic_init_qp_minus26 = 2 -> initial QP 28, slice_qp_delta 0 -> 28.
         assert_eq!(sh.slice_qp_y, 28);
+        // Intra slice: no ref-list modification, no pred weight table.
+        assert!(!sh.ref_pic_list_modification_l0.present);
+        assert!(sh.ref_pic_list_modification_l1.ops.is_empty());
+        assert!(sh.pred_weight_table.is_none());
+        // IDR + nal_ref_idc != 0: marking is the Idr variant.
+        match sh.dec_ref_pic_marking {
+            Some(DecRefPicMarking::Idr {
+                no_output_of_prior_pics,
+                long_term_reference,
+            }) => {
+                assert!(!no_output_of_prior_pics);
+                assert!(!long_term_reference);
+            }
+            other => panic!("expected Idr marking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retains_p_slice_ref_pic_list_modification_and_mmco() {
+        // Build a P-slice with:
+        //   first_mb_in_slice = 0
+        //   slice_type = 0 (P)
+        //   pic_parameter_set_id = 0
+        //   frame_num = 5
+        //   pic_order_cnt_lsb = 5
+        //   num_ref_idx_active_override_flag = 0
+        //   ref_pic_list_modification_l0:
+        //     present = 1
+        //     op codes: 0 (subtract), abs_diff_pic_num_minus1 = 2
+        //               3 (end)
+        //   dec_ref_pic_marking (non-IDR, adaptive):
+        //     adaptive = 1
+        //     MMCO 1 with difference_of_pic_nums_minus1 = 3
+        //     MMCO 0 (end)
+        //   slice_qp_delta = 0
+        //   RBSP stop bit
+        let mut bits = Vec::new();
+        push_ue(&mut bits, 0); // first_mb_in_slice
+        push_ue(&mut bits, 0); // slice_type = P
+        push_ue(&mut bits, 0); // pic_parameter_set_id
+        push_bits_msb(&mut bits, 5, 4); // frame_num
+        push_bits_msb(&mut bits, 5, 4); // pic_order_cnt_lsb
+        // num_ref_idx_active_override_flag = 0
+        bits.push(false);
+        // ref_pic_list_modification flag = 1
+        bits.push(true);
+        push_ue(&mut bits, 0); // op = 0 (Subtract)
+        push_ue(&mut bits, 2); // abs_diff_pic_num_minus1 = 2
+        push_ue(&mut bits, 3); // end op
+        // adaptive_ref_pic_marking_mode_flag = 1
+        bits.push(true);
+        push_ue(&mut bits, 1); // MMCO 1
+        push_ue(&mut bits, 3); // difference_of_pic_nums_minus1
+        push_ue(&mut bits, 0); // MMCO 0 (end)
+        push_se(&mut bits, 0); // slice_qp_delta
+        bits.push(true); // stop bit
+        while bits.len() % 8 != 0 {
+            bits.push(false);
+        }
+        let rbsp = pack_bits_msb(&bits);
+        let sps = baseline_sps();
+        let pps = baseline_pps();
+        let ctx = NalContext {
+            nal_ref_idc: 2,
+            is_idr: false,
+        };
+        let sh = parse_slice_header(&rbsp, &sps, &pps, ctx).expect("should parse");
+        assert_eq!(sh.slice_type, SliceType::P);
+        assert_eq!(sh.frame_num, 5);
+        assert!(sh.ref_pic_list_modification_l0.present);
+        assert_eq!(
+            sh.ref_pic_list_modification_l0.ops,
+            vec![RefPicListModOp::SubtractAbsDiffPicNum(2)],
+        );
+        match sh.dec_ref_pic_marking {
+            Some(DecRefPicMarking::Adaptive { ops }) => {
+                assert_eq!(
+                    ops,
+                    vec![MmcoOp::ShortTermUnused {
+                        difference_of_pic_nums_minus1: 3
+                    }]
+                );
+            }
+            other => panic!("expected Adaptive marking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sliding_window_marking_when_non_idr_and_no_adaptive() {
+        // Non-IDR I-slice with nal_ref_idc != 0 and adaptive flag = 0.
+        let mut bits = Vec::new();
+        push_ue(&mut bits, 0); // first_mb_in_slice
+        push_ue(&mut bits, 2); // slice_type = I
+        push_ue(&mut bits, 0); // pic_parameter_set_id
+        push_bits_msb(&mut bits, 1, 4); // frame_num
+        push_bits_msb(&mut bits, 1, 4); // pic_order_cnt_lsb
+        // adaptive_ref_pic_marking_mode_flag = 0 -> sliding window
+        bits.push(false);
+        push_se(&mut bits, 0); // slice_qp_delta
+        bits.push(true); // stop bit
+        while bits.len() % 8 != 0 {
+            bits.push(false);
+        }
+        let rbsp = pack_bits_msb(&bits);
+        let sps = baseline_sps();
+        let pps = baseline_pps();
+        let ctx = NalContext {
+            nal_ref_idc: 1,
+            is_idr: false,
+        };
+        let sh = parse_slice_header(&rbsp, &sps, &pps, ctx).expect("should parse");
+        assert!(matches!(
+            sh.dec_ref_pic_marking,
+            Some(DecRefPicMarking::SlidingWindow)
+        ));
     }
 
     #[test]

@@ -1,8 +1,11 @@
 //! H.264 bitstream-syntax parsers.
 //!
 //! This module provides the typed parsers that turn raw NAL-unit
-//! payloads into structured data: SPS, PPS, and slice header.  It is
-//! intentionally *parsing-only* — no reconstruction is performed.
+//! payloads into structured data: SPS (with VUI and scaling lists),
+//! PPS (with scaling lists), and slice header (with ref-list
+//! modification, prediction weight table, and decoded reference
+//! picture marking).  It is intentionally *parsing-only* — no
+//! reconstruction is performed.
 //!
 //! ## Pipeline
 //!
@@ -18,31 +21,45 @@
 //!    - Type 1 or 5 → [`slice_header::parse_slice_header`] (with the
 //!      SPS / PPS / nal context produced above)
 //!
-//! ## Scope
+//! ## What is retained
 //!
 //! - **SPS**: profile / level / dimensions / picture order count /
-//!   reference frame count / cropping / VUI presence flag.  Scaling
-//!   lists are consumed but not retained.  VUI body is not parsed.
-//! - **PPS**: entropy coder, default ref list sizes, QP, weighted
-//!   prediction flags, deblocking control, transform_8x8 mode, and
-//!   chroma QP offsets.  Slice-group maps for `num_slice_groups > 0`
-//!   are consumed but not retained.
-//! - **Slice header**: the prefix every decoder needs to place a slice
-//!   in its picture, pick references, and recover the slice's effective
-//!   QP.  Reference-list modification, prediction weight tables, and
-//!   adaptive MMCO are consumed but not retained.
+//!   reference frame count / cropping plus, when signalled, the full
+//!   VUI body and any custom scaling matrices.
+//! - **PPS**: entropy mode, ref-list defaults, QP, deblocking control,
+//!   transform_8x8 mode, chroma QP offsets, plus any picture-level
+//!   scaling matrices.
+//! - **Slice header**: the prefix every decoder needs (`first_mb_in_slice`,
+//!   `slice_type`, `frame_num`, IDR/field fields, picture order count
+//!   info, num_ref_idx overrides, slice_qp_delta / effective QP) plus
+//!   structured retention of reference-picture-list modification, the
+//!   prediction weight table, and decoded reference-picture marking
+//!   (IDR / sliding-window / adaptive MMCO variants).
 //!
-//! Future PRs are expected to extend retention rather than rewrite the
-//! parser shape.
+//! Future reconstruction (intra prediction, IDCT, deblocking, DPB
+//! management) extends the workspace; this module stays parsing-only.
 
 pub mod bit_reader;
 pub mod pps;
 pub mod rbsp;
+pub mod scaling_list;
 pub mod slice_header;
 pub mod sps;
+pub mod vui;
 
 pub use bit_reader::BitReader;
 pub use pps::{parse_pps, PpsRbsp};
 pub use rbsp::{strip_emulation_prevention, trailing_bits_len};
-pub use slice_header::{parse_slice_header, NalContext, SliceHeader, SliceType};
+pub use scaling_list::{
+    read_pic_scaling_matrix, read_seq_scaling_matrix, ScalingList4x4, ScalingList8x8,
+    ScalingListChoice, ScalingLists,
+};
+pub use slice_header::{
+    parse_slice_header, DecRefPicMarking, MmcoOp, NalContext, PredWeightTable, RefPicListModOp,
+    RefPicListModification, SliceHeader, SliceType, WeightEntry,
+};
 pub use sps::{parse_sps, SpsRbsp};
+pub use vui::{
+    parse_vui, AspectRatioInfo, BitstreamRestriction, ChromaLocInfo, ColourDescription,
+    CpbSchedule, ExtendedSar, HrdParameters, TimingInfo, VideoSignalType, VuiParameters,
+};
