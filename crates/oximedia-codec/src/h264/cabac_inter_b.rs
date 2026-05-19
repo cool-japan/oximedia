@@ -22,11 +22,45 @@ use crate::h264::cabac_inter::{decode_b_mb_type, BMbInfo, InterMbResult, InterPa
 use crate::h264::cabac_inter_mb::MbNeighbours;
 use crate::h264::cabac_mb::decode_mb_qp_delta;
 use crate::h264::cabac_syntax::{
-    decode_cbp_chroma, decode_cbp_luma, decode_mb_skip, decode_mvd, decode_ref_idx,
+    decode_b_sub_mb_type, decode_cbp_chroma, decode_cbp_luma, decode_mb_skip, decode_mvd,
+    decode_ref_idx,
 };
 use crate::h264::inter_cache::InterMbDecoded;
 use crate::h264::mv_pred::{predict_mv_median, MotionVector, MvPredictionContext};
 use crate::h264::slice_header::SliceType;
+
+/// B-slice sub-macroblock metadata (spec Table 7-18).  Indexed by
+/// the 4-bit `sub_mb_type` value 0..=12 emitted by
+/// [`crate::h264::cabac_syntax::decode_b_sub_mb_type`].
+#[derive(Debug, Clone, Copy)]
+struct BSubMbInfo {
+    /// Number of motion partitions inside the 8×8 sub-MB
+    /// (1 / 2 / 4).
+    partition_count: u8,
+    /// Which reference lists each partition reads from.  Every
+    /// partition of a given sub_mb_type uses the same list usage.
+    list_use: RefListUse,
+    /// Shape index: 0 = 8×8, 1 = 8×4, 2 = 4×8, 3 = 4×4.  Drives
+    /// the sub-partition block layout in
+    /// [`b_sub_partitions_in_quadrant`].
+    shape: u8,
+}
+
+const B_SUB_MB_TYPE_INFO: [BSubMbInfo; 13] = [
+    BSubMbInfo { partition_count: 1, list_use: RefListUse::Direct, shape: 0 }, // B_Direct_8x8
+    BSubMbInfo { partition_count: 1, list_use: RefListUse::L0,     shape: 0 }, // B_L0_8x8
+    BSubMbInfo { partition_count: 1, list_use: RefListUse::L1,     shape: 0 }, // B_L1_8x8
+    BSubMbInfo { partition_count: 1, list_use: RefListUse::BiPred, shape: 0 }, // B_Bi_8x8
+    BSubMbInfo { partition_count: 2, list_use: RefListUse::L0,     shape: 1 }, // B_L0_8x4
+    BSubMbInfo { partition_count: 2, list_use: RefListUse::L0,     shape: 2 }, // B_L0_4x8
+    BSubMbInfo { partition_count: 2, list_use: RefListUse::L1,     shape: 1 }, // B_L1_8x4
+    BSubMbInfo { partition_count: 2, list_use: RefListUse::L1,     shape: 2 }, // B_L1_4x8
+    BSubMbInfo { partition_count: 2, list_use: RefListUse::BiPred, shape: 1 }, // B_Bi_8x4
+    BSubMbInfo { partition_count: 2, list_use: RefListUse::BiPred, shape: 2 }, // B_Bi_4x8
+    BSubMbInfo { partition_count: 4, list_use: RefListUse::L0,     shape: 3 }, // B_L0_4x4
+    BSubMbInfo { partition_count: 4, list_use: RefListUse::L1,     shape: 3 }, // B_L1_4x4
+    BSubMbInfo { partition_count: 4, list_use: RefListUse::BiPred, shape: 3 }, // B_Bi_4x4
+];
 
 /// Outcome of a B-slice macroblock decode.
 #[derive(Debug, Clone, Copy)]
@@ -116,12 +150,17 @@ pub fn decode_b_mb_cabac(
         return BMbOutcome::Direct { decoded, mb_qp_delta };
     }
 
-    // B_8x8 (code 22) has a sub-mb layer that's out of scope for
-    // this commit.  Fall back to a zero-fill so the slice loop
-    // doesn't read stale memory; the orchestrator picks it up via
-    // BMbInfo::partition_count = 4 + shape = P8x8 and the caller
-    // can detect this is a partial decode.
     if mb_type_code == 22 {
+        // B_8x8: per-quadrant sub_mb_type + per-sub-MB ref + per-
+        // sub-partition mvd.
+        decode_b_8x8_partitions(
+            cabac,
+            states,
+            neighbours,
+            num_ref_idx_l0_active,
+            num_ref_idx_l1_active,
+            &mut decoded,
+        );
         let cbp_luma = decode_cbp_luma(cabac, states, neighbours.left_cbp, neighbours.top_cbp);
         let cbp_chroma = decode_cbp_chroma(cabac, states, neighbours.left_cbp, neighbours.top_cbp);
         decoded.cbp = (cbp_chroma << 4) | cbp_luma;
@@ -278,6 +317,335 @@ fn decode_partition_for_list_use(
             decoded.mv_l1[b] = mv;
             decoded.mvd_abs_l1[b] = [mvd_x_abs.min(255) as u8, mvd_y_abs.min(255) as u8];
         }
+    }
+}
+
+/// B_8×8 sub-macroblock decode.
+///
+/// For each of 4 8×8 quadrants:
+///
+/// 1. Decode `sub_mb_type` via the B sub-mb-type bin tree (spec
+///    § 9.3.3.1.1.2, contexts 36..=39).
+/// 2. For B_Direct sub-MBs, fill MVs/refs via spatial direct (per
+///    quadrant).
+/// 3. Otherwise decode one `ref_idx_lN` per used list (when
+///    `num_ref_idx_lN_active > 1`), then for each sub-partition
+///    decode one `mvd_lN_x` + `mvd_lN_y` pair per used list.
+///
+/// The decoded ref + MV + |mvd| values are splatted across the
+/// 4×4 blocks covered by each sub-partition (spec Table 7-18 +
+/// the absolute block indices via [`b_sub_partitions_in_quadrant`]).
+fn decode_b_8x8_partitions(
+    cabac: &mut CabacContext<'_>,
+    states: &mut [u8],
+    neighbours: &MbNeighbours,
+    num_ref_idx_l0_active: u8,
+    num_ref_idx_l1_active: u8,
+    decoded: &mut InterMbDecoded,
+) {
+    let need_ref_l0 = num_ref_idx_l0_active > 1;
+    let need_ref_l1 = num_ref_idx_l1_active > 1;
+
+    // Pass 1: decode 4 sub_mb_types.
+    let mut sub_types = [0u8; 4];
+    for q in 0..4 {
+        sub_types[q] = decode_b_sub_mb_type(cabac, states).min(12);
+    }
+    let infos: [BSubMbInfo; 4] = [
+        B_SUB_MB_TYPE_INFO[sub_types[0] as usize],
+        B_SUB_MB_TYPE_INFO[sub_types[1] as usize],
+        B_SUB_MB_TYPE_INFO[sub_types[2] as usize],
+        B_SUB_MB_TYPE_INFO[sub_types[3] as usize],
+    ];
+
+    // Pass 2: per-sub-MB ref_idx (for non-Direct sub-MBs that use
+    // each list).  ref_idx is decoded ONCE per sub-MB and shared
+    // across all sub-partitions.
+    let mut ref_l0_per_q = [0i8; 4];
+    let mut ref_l1_per_q = [0i8; 4];
+    for q in 0..4 {
+        let info = infos[q];
+        let first_block = first_block_of_b_quadrant(q);
+        let (ref_a, ref_b) = ref_neighbours_for_block(neighbours, first_block);
+        if matches!(info.list_use, RefListUse::L0 | RefListUse::BiPred) {
+            ref_l0_per_q[q] = if need_ref_l0 {
+                decode_ref_idx(
+                    cabac,
+                    states,
+                    SliceType::B,
+                    ref_a as i32,
+                    ref_b as i32,
+                    false,
+                    false,
+                )
+                .max(0) as i8
+            } else {
+                0
+            };
+        }
+        if matches!(info.list_use, RefListUse::L1 | RefListUse::BiPred) {
+            ref_l1_per_q[q] = if need_ref_l1 {
+                decode_ref_idx(
+                    cabac,
+                    states,
+                    SliceType::B,
+                    ref_a as i32,
+                    ref_b as i32,
+                    false,
+                    false,
+                )
+                .max(0) as i8
+            } else {
+                0
+            };
+        }
+    }
+
+    // Pass 3: per-quadrant, per-sub-partition mvd + MV splat.
+    for q in 0..4 {
+        let info = infos[q];
+        if matches!(info.list_use, RefListUse::Direct) {
+            // Spatial direct for this quadrant only.
+            apply_b_direct_spatial_quadrant(neighbours, q, decoded);
+            continue;
+        }
+
+        let sub_parts = b_sub_partitions_in_quadrant(q, info.shape);
+        for blocks in sub_parts {
+            let first_block = blocks[0];
+
+            if matches!(info.list_use, RefListUse::L0 | RefListUse::BiPred) {
+                let (mvd_x_a, mvd_x_b, mvd_y_a, mvd_y_b) =
+                    mvd_neighbours_for_block(neighbours, first_block);
+                let mut mvd_x_abs = 0i32;
+                let mvd_x = decode_mvd(
+                    cabac,
+                    states,
+                    40,
+                    (mvd_x_a + mvd_x_b) as i32,
+                    &mut mvd_x_abs,
+                );
+                let mut mvd_y_abs = 0i32;
+                let mvd_y = decode_mvd(
+                    cabac,
+                    states,
+                    47,
+                    (mvd_y_a + mvd_y_b) as i32,
+                    &mut mvd_y_abs,
+                );
+                let mv_ctx = MvPredictionContext {
+                    left: neighbour_l0_left_mv(neighbours, first_block),
+                    above: neighbour_l0_top_mv(neighbours, first_block),
+                    above_right: if first_block / 4 == 0 {
+                        neighbours.top_right_mv
+                    } else {
+                        None
+                    },
+                    above_left: None,
+                };
+                let pred = predict_mv_median(&mv_ctx);
+                let mv = (pred.0 + mvd_x, pred.1 + mvd_y);
+                for &b in *blocks {
+                    decoded.ref_l0[b] = ref_l0_per_q[q];
+                    decoded.mv_l0[b] = mv;
+                    decoded.mvd_abs_l0[b] = [mvd_x_abs.min(255) as u8, mvd_y_abs.min(255) as u8];
+                }
+            }
+
+            if matches!(info.list_use, RefListUse::L1 | RefListUse::BiPred) {
+                let (mvd_x_a, mvd_x_b, mvd_y_a, mvd_y_b) =
+                    mvd_neighbours_for_block(neighbours, first_block);
+                let mut mvd_x_abs = 0i32;
+                let mvd_x = decode_mvd(
+                    cabac,
+                    states,
+                    40,
+                    (mvd_x_a + mvd_x_b) as i32,
+                    &mut mvd_x_abs,
+                );
+                let mut mvd_y_abs = 0i32;
+                let mvd_y = decode_mvd(
+                    cabac,
+                    states,
+                    47,
+                    (mvd_y_a + mvd_y_b) as i32,
+                    &mut mvd_y_abs,
+                );
+                let mv_ctx = MvPredictionContext {
+                    left: neighbour_l1_left_mv(neighbours, first_block),
+                    above: neighbour_l1_top_mv(neighbours, first_block),
+                    above_right: if first_block / 4 == 0 {
+                        neighbours.top_right_mv_l1
+                    } else {
+                        None
+                    },
+                    above_left: None,
+                };
+                let pred = predict_mv_median(&mv_ctx);
+                let mv = (pred.0 + mvd_x, pred.1 + mvd_y);
+                for &b in *blocks {
+                    decoded.ref_l1[b] = ref_l1_per_q[q];
+                    decoded.mv_l1[b] = mv;
+                    decoded.mvd_abs_l1[b] = [mvd_x_abs.min(255) as u8, mvd_y_abs.min(255) as u8];
+                }
+            }
+        }
+    }
+}
+
+fn first_block_of_b_quadrant(q: usize) -> usize {
+    match q {
+        0 => 0,
+        1 => 2,
+        2 => 8,
+        _ => 10,
+    }
+}
+
+/// Block layout per (quadrant, B sub-MB shape).  Shape: 0 = 8×8,
+/// 1 = 8×4, 2 = 4×8, 3 = 4×4.
+fn b_sub_partitions_in_quadrant(q: usize, shape: u8) -> &'static [&'static [usize]] {
+    static TABLES: [[&[&[usize]]; 4]; 4] = [
+        [
+            &[&[0, 1, 4, 5]],
+            &[&[0, 1], &[4, 5]],
+            &[&[0, 4], &[1, 5]],
+            &[&[0], &[1], &[4], &[5]],
+        ],
+        [
+            &[&[2, 3, 6, 7]],
+            &[&[2, 3], &[6, 7]],
+            &[&[2, 6], &[3, 7]],
+            &[&[2], &[3], &[6], &[7]],
+        ],
+        [
+            &[&[8, 9, 12, 13]],
+            &[&[8, 9], &[12, 13]],
+            &[&[8, 12], &[9, 13]],
+            &[&[8], &[9], &[12], &[13]],
+        ],
+        [
+            &[&[10, 11, 14, 15]],
+            &[&[10, 11], &[14, 15]],
+            &[&[10, 14], &[11, 15]],
+            &[&[10], &[11], &[14], &[15]],
+        ],
+    ];
+    TABLES[q][shape as usize]
+}
+
+/// Spatial direct prediction confined to one 8×8 quadrant — used
+/// by B_8x8 when its sub_mb_type is `B_Direct_8x8`.
+fn apply_b_direct_spatial_quadrant(
+    neighbours: &MbNeighbours,
+    quadrant: usize,
+    decoded: &mut InterMbDecoded,
+) {
+    let blocks: [usize; 4] = match quadrant {
+        0 => [0, 1, 4, 5],
+        1 => [2, 3, 6, 7],
+        2 => [8, 9, 12, 13],
+        _ => [10, 11, 14, 15],
+    };
+    let first = blocks[0];
+    let row = first / 4;
+    let col = first % 4;
+
+    let ref_l0_a = if col == 0 && neighbours.left_available {
+        neighbours.left_ref[row]
+    } else {
+        -1
+    };
+    let ref_l0_b = if row == 0 && neighbours.top_available {
+        neighbours.top_ref[col]
+    } else {
+        -1
+    };
+    let ref_l0_c = if row == 0 { neighbours.top_right_ref } else { -1 };
+    let ref_l1_a = if col == 0 && neighbours.left_available {
+        neighbours.left_ref_l1[row]
+    } else {
+        -1
+    };
+    let ref_l1_b = if row == 0 && neighbours.top_available {
+        neighbours.top_ref_l1[col]
+    } else {
+        -1
+    };
+    let ref_l1_c = if row == 0 {
+        neighbours.top_right_ref_l1
+    } else {
+        -1
+    };
+
+    let mut ref_l0 = min_nonneg_ref(&[ref_l0_a, ref_l0_b, ref_l0_c]);
+    let mut ref_l1 = min_nonneg_ref(&[ref_l1_a, ref_l1_b, ref_l1_c]);
+    if ref_l0 < 0 && ref_l1 < 0 {
+        ref_l0 = 0;
+        ref_l1 = 0;
+    }
+
+    let mv_l0 = if ref_l0 < 0 {
+        (0, 0)
+    } else {
+        median_mv(
+            neighbour_l0_left_mv(neighbours, first),
+            neighbour_l0_top_mv(neighbours, first),
+            if row == 0 { neighbours.top_right_mv } else { None },
+        )
+    };
+    let mv_l1 = if ref_l1 < 0 {
+        (0, 0)
+    } else {
+        median_mv(
+            neighbour_l1_left_mv(neighbours, first),
+            neighbour_l1_top_mv(neighbours, first),
+            if row == 0 { neighbours.top_right_mv_l1 } else { None },
+        )
+    };
+
+    for &b in &blocks {
+        decoded.ref_l0[b] = ref_l0;
+        decoded.ref_l1[b] = ref_l1;
+        decoded.mv_l0[b] = mv_l0;
+        decoded.mv_l1[b] = mv_l1;
+    }
+}
+
+fn neighbour_l0_left_mv(neighbours: &MbNeighbours, block: usize) -> Option<MotionVector> {
+    let row = block / 4;
+    let col = block % 4;
+    if col == 0 && neighbours.left_available {
+        Some(neighbours.left_mv[row])
+    } else {
+        None
+    }
+}
+fn neighbour_l0_top_mv(neighbours: &MbNeighbours, block: usize) -> Option<MotionVector> {
+    let row = block / 4;
+    let col = block % 4;
+    if row == 0 && neighbours.top_available {
+        Some(neighbours.top_mv[col])
+    } else {
+        None
+    }
+}
+fn neighbour_l1_left_mv(neighbours: &MbNeighbours, block: usize) -> Option<MotionVector> {
+    let row = block / 4;
+    let col = block % 4;
+    if col == 0 && neighbours.left_available {
+        Some(neighbours.left_mv_l1[row])
+    } else {
+        None
+    }
+}
+fn neighbour_l1_top_mv(neighbours: &MbNeighbours, block: usize) -> Option<MotionVector> {
+    let row = block / 4;
+    let col = block % 4;
+    if row == 0 && neighbours.top_available {
+        Some(neighbours.top_mv_l1[col])
+    } else {
+        None
     }
 }
 
