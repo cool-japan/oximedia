@@ -176,6 +176,120 @@ pub fn decode_intra_chroma_8x8(
     Ok(())
 }
 
+/// Parsed-and-resolved info for one macroblock that an I-slice
+/// decoder needs to reconstruct pixels.
+#[derive(Debug, Clone)]
+pub struct IntraMacroblock {
+    /// Macroblock coordinates in macroblock units.
+    pub mb_x: usize,
+    /// Macroblock coordinates in macroblock units.
+    pub mb_y: usize,
+    /// Luma intra mode plus residual payload for this macroblock.
+    pub luma: IntraLumaSpec,
+    /// Chroma intra prediction mode (shared by both components).
+    pub chroma_mode: IntraChromaPredMode,
+    /// Per-block residual coefficients for Cb (4 blocks in raster).
+    pub chroma_cb_residuals: [Residual4x4Scan; 4],
+    /// Per-block residual coefficients for Cr (4 blocks in raster).
+    pub chroma_cr_residuals: [Residual4x4Scan; 4],
+    /// Effective luma QP for this macroblock.
+    pub qp_y: u8,
+    /// Effective chroma QP for this macroblock.
+    pub qp_chroma: u8,
+}
+
+/// Luma side of an intra macroblock.
+///
+/// One enum variant per macroblock type the I-slice decoder
+/// supports.  `I_PCM` and the inter macroblock types are not
+/// included — those land in their own follow-ups.
+#[derive(Debug, Clone)]
+pub enum IntraLumaSpec {
+    /// `I_16x16` macroblock: single 16×16 prediction plus 16 per-4×4
+    /// residual blocks.
+    Sixteen16 {
+        /// Prediction direction.
+        pred_mode: Intra16x16PredMode,
+        /// 16 per-4×4-block residual coefficient arrays.
+        residuals: [Residual4x4Scan; 16],
+    },
+    /// `I_NxN` macroblock: 16 separate 4×4 predictions, each with
+    /// its own mode and residual.
+    NxN {
+        /// 16 per-sub-block intra modes in raster order.
+        modes: [Intra4x4Mode; 16],
+        /// 16 per-sub-block residual coefficient arrays.
+        residuals: [Residual4x4Scan; 16],
+    },
+}
+
+/// Decodes one I-slice from a list of already-parsed and resolved
+/// intra macroblocks and writes the reconstructed samples into the
+/// frame.
+///
+/// `macroblocks` must cover the slice in raster order; the function
+/// applies each macroblock in turn.  Callers are responsible for
+/// having already parsed the slice header, resolved each macroblock
+/// type, applied the MPM logic to recover per-block intra-4×4 modes,
+/// and decoded the residual coefficients (via the entropy decoder
+/// once the CAVLC coefficient-decode tables land).
+///
+/// # Errors
+///
+/// Returns [`CodecError::InvalidData`] when any macroblock extends
+/// past the frame.
+pub fn decode_i_slice(
+    frame: &mut Frame,
+    macroblocks: &[IntraMacroblock],
+) -> Result<(), CodecError> {
+    for mb in macroblocks {
+        match &mb.luma {
+            IntraLumaSpec::Sixteen16 {
+                pred_mode,
+                residuals,
+            } => {
+                decode_intra_16x16_mb(
+                    frame,
+                    mb.mb_x,
+                    mb.mb_y,
+                    *pred_mode,
+                    residuals,
+                    mb.qp_y,
+                )?;
+            }
+            IntraLumaSpec::NxN { modes, residuals } => {
+                decode_intra_4x4_mb(
+                    frame,
+                    mb.mb_x,
+                    mb.mb_y,
+                    modes,
+                    residuals,
+                    mb.qp_y,
+                )?;
+            }
+        }
+        decode_intra_chroma_8x8(
+            frame,
+            mb.mb_x,
+            mb.mb_y,
+            mb.chroma_mode,
+            &mb.chroma_cb_residuals,
+            mb.qp_chroma,
+            true,
+        )?;
+        decode_intra_chroma_8x8(
+            frame,
+            mb.mb_x,
+            mb.mb_y,
+            mb.chroma_mode,
+            &mb.chroma_cr_residuals,
+            mb.qp_chroma,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
 /// Decodes one `I_NxN` luma macroblock (16 separate 4×4 intra
 /// predictions) and writes the reconstructed luma samples into the
 /// frame.
@@ -438,6 +552,40 @@ mod tests {
         for y in 16..32 {
             for x in 0..16 {
                 assert_eq!(frame.get_luma(x, y), Some(60), "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_i_slice_walks_macroblocks_in_order() {
+        // 32x32 frame -> 2x2 macroblocks.  Build four I_16x16 DC
+        // macroblocks with no residuals; expect every pixel = 128.
+        let mut frame = Frame::new(32, 32);
+        let mb = |mb_x: usize, mb_y: usize| IntraMacroblock {
+            mb_x,
+            mb_y,
+            luma: IntraLumaSpec::Sixteen16 {
+                pred_mode: Intra16x16PredMode::Dc,
+                residuals: empty_luma_residuals(),
+            },
+            chroma_mode: IntraChromaPredMode::Dc,
+            chroma_cb_residuals: empty_chroma_residuals(),
+            chroma_cr_residuals: empty_chroma_residuals(),
+            qp_y: 28,
+            qp_chroma: 28,
+        };
+        let mbs = vec![mb(0, 0), mb(1, 0), mb(0, 1), mb(1, 1)];
+        decode_i_slice(&mut frame, &mbs).expect("should decode slice");
+
+        for y in 0..32 {
+            for x in 0..32 {
+                assert_eq!(frame.get_luma(x, y), Some(128), "luma ({x}, {y})");
+            }
+        }
+        for cy in 0..16 {
+            for cx in 0..16 {
+                assert_eq!(frame.get_cb(cx, cy), Some(128), "Cb ({cx}, {cy})");
+                assert_eq!(frame.get_cr(cx, cy), Some(128), "Cr ({cx}, {cy})");
             }
         }
     }
