@@ -26,13 +26,21 @@
 //! tested end-to-end before the CAVLC `coeff_token` lookup tables
 //! land.
 
+use crate::h264::bit_reader::BitReader;
+use crate::h264::cavlc::{read_residual_block, BlockKind};
 use crate::h264::frame::{
     collect_chroma_8x8_neighbours, collect_intra16x16_neighbours, collect_intra4x4_neighbours,
     Frame,
 };
+use crate::h264::intra_mode::{most_probable_mode, resolve_intra4x4_mode, Intra4x4ModeContext};
 use crate::h264::intra_pred::{predict_16x16, predict_4x4, predict_chroma_8x8, Intra4x4Mode};
-use crate::h264::macroblock::{Intra16x16PredMode, IntraChromaPredMode};
+use crate::h264::macroblock::{
+    parse_macroblock_layer, Intra16x16PredMode, IntraChromaPredMode, MbType,
+};
 use crate::h264::motion::{fetch_chroma_4x4_subpel, fetch_luma_4x4_integer};
+use crate::h264::pps::PpsRbsp;
+use crate::h264::slice_header::{SliceHeader, SliceType};
+use crate::h264::sps::SpsRbsp;
 use crate::h264::transform::dequant_and_inverse_transform_4x4;
 use crate::CodecError;
 
@@ -474,6 +482,202 @@ pub fn decode_intra_4x4_mb(
     }
 
     Ok(())
+}
+
+/// Decodes one entire I-slice from a bitstream into the frame buffer.
+///
+/// `r` is the bit reader positioned at the start of the slice data
+/// (after the slice header).  `sps`, `pps`, and `slice_header`
+/// describe the slice context.  `frame` is the output frame
+/// (already allocated to the SPS's dimensions).
+///
+/// The function walks macroblocks in raster order, parses each
+/// macroblock_layer, decodes its residual coefficient blocks via
+/// CAVLC, resolves intra modes (including MPM for `I_NxN`), and
+/// dispatches each macroblock to the appropriate intra orchestrator.
+///
+/// # Errors
+///
+/// Returns [`CodecError::InvalidData`] when the bitstream is
+/// malformed, when CABAC is signalled by the PPS (not supported in
+/// this path), or when the slice is not an I-slice.
+pub fn decode_intra_slice_bitstream(
+    r: &mut BitReader<'_>,
+    sps: &SpsRbsp,
+    pps: &PpsRbsp,
+    slice_header: &SliceHeader,
+    frame: &mut Frame,
+) -> Result<(), CodecError> {
+    if pps.entropy_coding_mode_flag {
+        return Err(CodecError::InvalidData(
+            "h264 decoder: CABAC entropy mode not yet supported".into(),
+        ));
+    }
+    if !matches!(slice_header.slice_type, SliceType::I | SliceType::SI) {
+        return Err(CodecError::InvalidData(format!(
+            "h264 decoder: decode_intra_slice_bitstream got non-I slice {:?}",
+            slice_header.slice_type
+        )));
+    }
+
+    let mbs_wide = (sps.pic_width_in_mbs_minus1 + 1) as usize;
+    let mbs_tall_units = (sps.pic_height_in_map_units_minus1 + 1) as usize;
+    let mbs_tall = if sps.frame_mbs_only_flag {
+        mbs_tall_units
+    } else {
+        mbs_tall_units * 2
+    };
+
+    let qp_y_initial = (pps.pic_init_qp_minus26 + 26 + slice_header.slice_qp_delta) as u8;
+    let mut qp_y = qp_y_initial;
+
+    let mut intra_mode_context = Intra4x4ModeContext::default();
+
+    let mut mb_idx = slice_header.first_mb_in_slice as usize;
+    while mb_idx < mbs_wide * mbs_tall {
+        let mb_x = mb_idx % mbs_wide;
+        let mb_y = mb_idx / mbs_wide;
+        let mb_layer = parse_macroblock_layer(r, sps, pps, slice_header.slice_type)?;
+        let qp_chroma = qp_y; // Simplified — proper chroma QP derivation
+                              // applies the PPS's chroma_qp_index_offset
+                              // and the qpY → qpC mapping table.
+
+        match mb_layer.mb_type {
+            MbType::I16x16 { pred_mode, .. } => {
+                // I_16x16 residuals: 16 4x4 AC blocks + 1 DC block.
+                // For now treat all as plain 4x4 blocks.
+                let mut residuals: [Residual4x4Scan; 16] = [None; 16];
+                for slot in residuals.iter_mut().take(16) {
+                    let blk = read_residual_block(r, BlockKind::Luma4x4, 0)?;
+                    *slot = if blk.total_coeff > 0 {
+                        Some(blk.to_scan_order_padded())
+                    } else {
+                        None
+                    };
+                }
+                let chroma_cb = read_chroma_residuals(r)?;
+                let chroma_cr = read_chroma_residuals(r)?;
+                let chroma_mode = mb_layer
+                    .intra_chroma_pred_mode
+                    .unwrap_or(IntraChromaPredMode::Dc);
+                decode_intra_16x16_mb(frame, mb_x, mb_y, pred_mode, &residuals, qp_y)?;
+                decode_intra_chroma_8x8(
+                    frame,
+                    mb_x,
+                    mb_y,
+                    chroma_mode,
+                    &chroma_cb,
+                    qp_chroma,
+                    true,
+                )?;
+                decode_intra_chroma_8x8(
+                    frame,
+                    mb_x,
+                    mb_y,
+                    chroma_mode,
+                    &chroma_cr,
+                    qp_chroma,
+                    false,
+                )?;
+                intra_mode_context = Intra4x4ModeContext::default();
+            }
+            MbType::INxN => {
+                let intra_nxn = mb_layer
+                    .intra_nxn
+                    .as_ref()
+                    .ok_or_else(|| CodecError::InvalidData("INxN without intra_nxn".into()))?;
+                let mut modes = [Intra4x4Mode::Dc; 16];
+                for (idx, mode) in modes.iter_mut().enumerate() {
+                    let mpm = most_probable_mode(
+                        intra_mode_context.top_of(idx),
+                        intra_mode_context.left_of(idx),
+                    );
+                    let prev_flag = intra_nxn
+                        .prev_intra4x4_pred_mode_flag
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(false);
+                    let rem = intra_nxn.rem_intra4x4_pred_mode.get(idx).copied().flatten();
+                    *mode = resolve_intra4x4_mode(prev_flag, rem, mpm)?;
+                    intra_mode_context.set(idx, *mode);
+                }
+                let mut residuals: [Residual4x4Scan; 16] = [None; 16];
+                for slot in residuals.iter_mut().take(16) {
+                    let blk = read_residual_block(r, BlockKind::Luma4x4, 0)?;
+                    *slot = if blk.total_coeff > 0 {
+                        Some(blk.to_scan_order_padded())
+                    } else {
+                        None
+                    };
+                }
+                let chroma_cb = read_chroma_residuals(r)?;
+                let chroma_cr = read_chroma_residuals(r)?;
+                let chroma_mode = mb_layer
+                    .intra_chroma_pred_mode
+                    .unwrap_or(IntraChromaPredMode::Dc);
+                decode_intra_4x4_mb(frame, mb_x, mb_y, &modes, &residuals, qp_y)?;
+                decode_intra_chroma_8x8(
+                    frame,
+                    mb_x,
+                    mb_y,
+                    chroma_mode,
+                    &chroma_cb,
+                    qp_chroma,
+                    true,
+                )?;
+                decode_intra_chroma_8x8(
+                    frame,
+                    mb_x,
+                    mb_y,
+                    chroma_mode,
+                    &chroma_cr,
+                    qp_chroma,
+                    false,
+                )?;
+            }
+            other => {
+                return Err(CodecError::InvalidData(format!(
+                    "h264 decoder: macroblock type {other:?} not yet supported in intra slice"
+                )));
+            }
+        }
+
+        if mb_layer.mb_qp_delta != 0 {
+            qp_y = ((qp_y as i32 + mb_layer.mb_qp_delta + 52) % 52) as u8;
+        }
+        mb_idx += 1;
+    }
+    Ok(())
+}
+
+fn read_chroma_residuals(
+    r: &mut BitReader<'_>,
+) -> Result<[Residual4x4Scan; 4], CodecError> {
+    let mut residuals: [Residual4x4Scan; 4] = [None; 4];
+    for slot in residuals.iter_mut().take(4) {
+        let blk = read_residual_block(r, BlockKind::ChromaAc, 0)?;
+        *slot = if blk.total_coeff > 0 {
+            Some(blk.to_scan_order_padded())
+        } else {
+            None
+        };
+    }
+    Ok(residuals)
+}
+
+impl crate::h264::cavlc::ResidualBlock {
+    /// Pads the to_scan_order() output to a fixed 16-element scan-order
+    /// array, zero-filling the high-frequency tail.  Used by the
+    /// orchestrator to feed dequantize+inverse_transform_4x4 which
+    /// expects a length-16 array.
+    pub fn to_scan_order_padded(&self) -> [i32; 16] {
+        let v = self.to_scan_order();
+        let mut out = [0i32; 16];
+        for (i, &x) in v.iter().take(16).enumerate() {
+            out[i] = x;
+        }
+        out
+    }
 }
 
 #[cfg(test)]
