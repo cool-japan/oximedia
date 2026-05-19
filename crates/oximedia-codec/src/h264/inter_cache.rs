@@ -120,6 +120,12 @@ pub struct TopRowSlot {
     pub mv_l0: [MotionVector; 4],
     /// 4-entry strip of L0 absolute MVD magnitudes.
     pub mvd_abs_l0: [[u8; 2]; 4],
+    /// 4-entry strip of L1 ref indices (B-slice only; -1 elsewhere).
+    pub ref_l1: [i8; 4],
+    /// 4-entry strip of L1 motion vectors.
+    pub mv_l1: [MotionVector; 4],
+    /// 4-entry strip of L1 absolute MVD magnitudes.
+    pub mvd_abs_l1: [[u8; 2]; 4],
     /// 4-entry strip of non-zero counts (luma).
     pub nz_count: [u8; 4],
     /// Packed CBP of the top neighbour (for chroma_pred_mode +
@@ -150,6 +156,12 @@ pub struct LeftColSlot {
     pub mv_l0: [MotionVector; 4],
     /// 4-entry strip of L0 absolute MVD magnitudes.
     pub mvd_abs_l0: [[u8; 2]; 4],
+    /// 4-entry strip of L1 ref indices (B-slice only).
+    pub ref_l1: [i8; 4],
+    /// 4-entry strip of L1 motion vectors.
+    pub mv_l1: [MotionVector; 4],
+    /// 4-entry strip of L1 absolute MVD magnitudes.
+    pub mvd_abs_l1: [[u8; 2]; 4],
     /// 4-entry strip of non-zero counts (luma).
     pub nz_count: [u8; 4],
     /// Packed CBP of the left neighbour.
@@ -216,6 +228,24 @@ impl InterSliceCache {
             decoded.nz_count_luma[bottom_idx[2]],
             decoded.nz_count_luma[bottom_idx[3]],
         ];
+        let bottom_ref_l1 = [
+            decoded.ref_l1[bottom_idx[0]],
+            decoded.ref_l1[bottom_idx[1]],
+            decoded.ref_l1[bottom_idx[2]],
+            decoded.ref_l1[bottom_idx[3]],
+        ];
+        let bottom_mv_l1 = [
+            decoded.mv_l1[bottom_idx[0]],
+            decoded.mv_l1[bottom_idx[1]],
+            decoded.mv_l1[bottom_idx[2]],
+            decoded.mv_l1[bottom_idx[3]],
+        ];
+        let bottom_mvd_l1 = [
+            decoded.mvd_abs_l1[bottom_idx[0]],
+            decoded.mvd_abs_l1[bottom_idx[1]],
+            decoded.mvd_abs_l1[bottom_idx[2]],
+            decoded.mvd_abs_l1[bottom_idx[3]],
+        ];
 
         let is_b_direct =
             !decoded.is_intra && !decoded.is_skip && decoded.cbp == 0 && decoded.mb_type_code == 0;
@@ -228,6 +258,9 @@ impl InterSliceCache {
             ref_l0: bottom_ref_l0,
             mv_l0: bottom_mv_l0,
             mvd_abs_l0: bottom_mvd_l0,
+            ref_l1: bottom_ref_l1,
+            mv_l1: bottom_mv_l1,
+            mvd_abs_l1: bottom_mvd_l1,
             nz_count: bottom_nz,
             cbp: decoded.cbp,
             chroma_pred_mode,
@@ -260,6 +293,24 @@ impl InterSliceCache {
             decoded.nz_count_luma[right_idx[2]],
             decoded.nz_count_luma[right_idx[3]],
         ];
+        let right_ref_l1 = [
+            decoded.ref_l1[right_idx[0]],
+            decoded.ref_l1[right_idx[1]],
+            decoded.ref_l1[right_idx[2]],
+            decoded.ref_l1[right_idx[3]],
+        ];
+        let right_mv_l1 = [
+            decoded.mv_l1[right_idx[0]],
+            decoded.mv_l1[right_idx[1]],
+            decoded.mv_l1[right_idx[2]],
+            decoded.mv_l1[right_idx[3]],
+        ];
+        let right_mvd_l1 = [
+            decoded.mvd_abs_l1[right_idx[0]],
+            decoded.mvd_abs_l1[right_idx[1]],
+            decoded.mvd_abs_l1[right_idx[2]],
+            decoded.mvd_abs_l1[right_idx[3]],
+        ];
 
         self.left_col = LeftColSlot {
             available: true,
@@ -269,6 +320,9 @@ impl InterSliceCache {
             ref_l0: right_ref_l0,
             mv_l0: right_mv_l0,
             mvd_abs_l0: right_mvd_l0,
+            ref_l1: right_ref_l1,
+            mv_l1: right_mv_l1,
+            mvd_abs_l1: right_mvd_l1,
             nz_count: right_nz,
             cbp: decoded.cbp,
             chroma_pred_mode,

@@ -44,27 +44,43 @@ pub struct MbNeighbours {
     pub top_available: bool,
     /// `true` when the top-right macroblock exists.
     pub top_right_available: bool,
-    /// Left neighbour bottom-row MV (4 entries: rows 0..=3 of the
+    /// Left neighbour bottom-row L0 MV (4 entries: rows 0..=3 of the
     /// current macroblock see the left MB's column 3 sub-blocks).
     pub left_mv: [MotionVector; 4],
-    /// Left neighbour ref_l0 (4 entries, rows 0..=3).
+    /// Left neighbour L0 ref (4 entries, rows 0..=3).
     pub left_ref: [i8; 4],
-    /// Left neighbour absolute MVD magnitudes (rows 0..=3).
+    /// Left neighbour absolute L0 MVD magnitudes (rows 0..=3).
     pub left_mvd_abs: [[u8; 2]; 4],
+    /// Left neighbour L1 MV strip (B-slice).
+    pub left_mv_l1: [MotionVector; 4],
+    /// Left neighbour L1 ref strip (B-slice).
+    pub left_ref_l1: [i8; 4],
+    /// Left neighbour absolute L1 MVD magnitudes (B-slice).
+    pub left_mvd_abs_l1: [[u8; 2]; 4],
     /// Left neighbour is a Skip MB.
     pub left_is_skip: bool,
-    /// Top neighbour bottom-row MV (4 entries: cols 0..=3).
+    /// Top neighbour bottom-row L0 MV (4 entries: cols 0..=3).
     pub top_mv: [MotionVector; 4],
-    /// Top neighbour ref_l0 (4 entries, cols 0..=3).
+    /// Top neighbour L0 ref (4 entries, cols 0..=3).
     pub top_ref: [i8; 4],
-    /// Top neighbour absolute MVD magnitudes (cols 0..=3).
+    /// Top neighbour absolute L0 MVD magnitudes (cols 0..=3).
     pub top_mvd_abs: [[u8; 2]; 4],
+    /// Top neighbour L1 MV strip (B-slice).
+    pub top_mv_l1: [MotionVector; 4],
+    /// Top neighbour L1 ref strip (B-slice).
+    pub top_ref_l1: [i8; 4],
+    /// Top neighbour absolute L1 MVD magnitudes (B-slice).
+    pub top_mvd_abs_l1: [[u8; 2]; 4],
     /// Top neighbour is a Skip MB.
     pub top_is_skip: bool,
-    /// Top-right neighbour bottom-left 4×4 MV (single entry).
+    /// Top-right neighbour bottom-left 4×4 L0 MV (single entry).
     pub top_right_mv: Option<MotionVector>,
-    /// Top-right neighbour ref_l0 (single entry, -1 if unused).
+    /// Top-right neighbour L0 ref (single entry, -1 if unused).
     pub top_right_ref: i8,
+    /// Top-right neighbour L1 MV (B-slice).
+    pub top_right_mv_l1: Option<MotionVector>,
+    /// Top-right neighbour L1 ref (B-slice).
+    pub top_right_ref_l1: i8,
     /// 8-bit left-neighbour CBP (low 4 = luma, bits 4..=5 = chroma).
     pub left_cbp: u8,
     /// 8-bit top-neighbour CBP.
@@ -95,10 +111,16 @@ impl MbNeighbours {
             left_mv: left.mv_l0,
             left_ref: left.ref_l0,
             left_mvd_abs: left.mvd_abs_l0,
+            left_mv_l1: left.mv_l1,
+            left_ref_l1: left.ref_l1,
+            left_mvd_abs_l1: left.mvd_abs_l1,
             left_is_skip: left.is_skip,
             top_mv: top.mv_l0,
             top_ref: top.ref_l0,
             top_mvd_abs: top.mvd_abs_l0,
+            top_mv_l1: top.mv_l1,
+            top_ref_l1: top.ref_l1,
+            top_mvd_abs_l1: top.mvd_abs_l1,
             top_is_skip: top.is_skip,
             top_right_mv: top_right_slot.and_then(|s| {
                 if s.available {
@@ -111,6 +133,16 @@ impl MbNeighbours {
             }),
             top_right_ref: top_right_slot
                 .map(|s| if s.available { s.ref_l0[0] } else { -1 })
+                .unwrap_or(-1),
+            top_right_mv_l1: top_right_slot.and_then(|s| {
+                if s.available {
+                    Some(s.mv_l1[0])
+                } else {
+                    None
+                }
+            }),
+            top_right_ref_l1: top_right_slot
+                .map(|s| if s.available { s.ref_l1[0] } else { -1 })
                 .unwrap_or(-1),
             left_cbp: left.cbp,
             top_cbp: top.cbp,
@@ -605,13 +637,21 @@ mod tests {
             left_mv: [(0, 0); 4],
             left_ref: [-1; 4],
             left_mvd_abs: [[0; 2]; 4],
+            left_mv_l1: [(0, 0); 4],
+            left_ref_l1: [-1; 4],
+            left_mvd_abs_l1: [[0; 2]; 4],
             left_is_skip: false,
             top_mv: [(0, 0); 4],
             top_ref: [-1; 4],
             top_mvd_abs: [[0; 2]; 4],
+            top_mv_l1: [(0, 0); 4],
+            top_ref_l1: [-1; 4],
+            top_mvd_abs_l1: [[0; 2]; 4],
             top_is_skip: false,
             top_right_mv: None,
             top_right_ref: -1,
+            top_right_mv_l1: None,
+            top_right_ref_l1: -1,
             left_cbp: 0,
             top_cbp: 0,
             left_chroma_pred_nonzero: false,
