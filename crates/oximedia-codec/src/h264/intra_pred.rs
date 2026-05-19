@@ -6,15 +6,20 @@
 //! top-left corner sample and (for some 4×4 modes) the four samples
 //! above-and-right of the current 4×4 block.
 //!
-//! This module covers the 4×4 luma path: the nine prediction modes
-//! defined by H.264 plus the neighbour-availability rules that pick
-//! fallback values when a required neighbour sample isn't yet
-//! reconstructed (e.g. the top-left block of a slice has no top or
-//! left neighbour at all).
+//! Three intra paths are covered:
 //!
-//! The 16×16 luma and 8×8 chroma intra modes are not yet implemented
-//! — they share fewer modes (4 each) and are simpler in shape; they
-//! will arrive in a follow-up.
+//! - **4×4 luma** — nine modes used by `I_NxN` macroblocks.
+//! - **16×16 luma** — four modes (Vertical, Horizontal, DC, Plane)
+//!   used by `I_16x16` macroblocks.
+//! - **Chroma 8×8 (4:2:0)** — four modes (DC, Horizontal, Vertical,
+//!   Plane) shared by all intra-coded macroblocks for the Cb / Cr
+//!   components.
+//!
+//! All paths handle neighbour-availability fallbacks: where a required
+//! neighbour sample isn't reconstructed yet (slice boundary, picture
+//! edge, constrained-intra-pred), the modes fall back to the spec
+//! defaults — typically a constant of `128` or a derived DC from
+//! whatever neighbours *are* present.
 
 /// One of the nine H.264 intra-4×4 prediction modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +341,277 @@ fn predict_horizontal_up(n: &Intra4x4Neighbours) -> [[u8; 4]; 4] {
     out
 }
 
+// ---------------------------------------------------------------------------
+// 16×16 luma intra prediction (used by I_16x16 macroblocks)
+// ---------------------------------------------------------------------------
+
+/// Neighbour samples for one 16×16 luma intra prediction.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Intra16x16Neighbours {
+    /// Top-left corner sample (one pixel diagonally up-left of `(0, 0)`).
+    pub top_left: Option<u8>,
+    /// Top neighbour row — 16 samples.
+    pub top: Option<[u8; 16]>,
+    /// Left neighbour column — 16 samples.
+    pub left: Option<[u8; 16]>,
+}
+
+/// The four 16×16 luma intra prediction modes from the macroblock layer.
+pub use crate::h264::macroblock::Intra16x16PredMode;
+
+/// Predicts a 16×16 luma block under the given mode.
+#[must_use]
+pub fn predict_16x16(
+    mode: Intra16x16PredMode,
+    n: &Intra16x16Neighbours,
+) -> [[u8; 16]; 16] {
+    match mode {
+        Intra16x16PredMode::Vertical => predict_16x16_vertical(n),
+        Intra16x16PredMode::Horizontal => predict_16x16_horizontal(n),
+        Intra16x16PredMode::Dc => predict_16x16_dc(n),
+        Intra16x16PredMode::Plane => predict_16x16_plane(n),
+    }
+}
+
+fn predict_16x16_vertical(n: &Intra16x16Neighbours) -> [[u8; 16]; 16] {
+    let top = match n.top {
+        Some(t) => t,
+        None => return [[128u8; 16]; 16],
+    };
+    let mut out = [[0u8; 16]; 16];
+    for row in &mut out {
+        *row = top;
+    }
+    out
+}
+
+fn predict_16x16_horizontal(n: &Intra16x16Neighbours) -> [[u8; 16]; 16] {
+    let left = match n.left {
+        Some(l) => l,
+        None => return [[128u8; 16]; 16],
+    };
+    let mut out = [[0u8; 16]; 16];
+    for (y, row) in out.iter_mut().enumerate() {
+        *row = [left[y]; 16];
+    }
+    out
+}
+
+fn predict_16x16_dc(n: &Intra16x16Neighbours) -> [[u8; 16]; 16] {
+    let dc = match (n.top, n.left) {
+        (Some(t), Some(l)) => {
+            let sum: u32 = t.iter().chain(l.iter()).map(|&v| u32::from(v)).sum();
+            ((sum + 16) >> 5) as u8
+        }
+        (Some(t), None) => {
+            let sum: u32 = t.iter().map(|&v| u32::from(v)).sum();
+            ((sum + 8) >> 4) as u8
+        }
+        (None, Some(l)) => {
+            let sum: u32 = l.iter().map(|&v| u32::from(v)).sum();
+            ((sum + 8) >> 4) as u8
+        }
+        (None, None) => 128,
+    };
+    [[dc; 16]; 16]
+}
+
+fn predict_16x16_plane(n: &Intra16x16Neighbours) -> [[u8; 16]; 16] {
+    let (top, left, tl) = match (n.top, n.left, n.top_left) {
+        (Some(t), Some(l), Some(p)) => (t, l, p),
+        _ => return [[128u8; 16]; 16],
+    };
+    // H = Σ_{i=0..7} (i+1) * (top[8+i] - top[6-i])   ; at i=7, top[6-i] = top[-1] = top_left
+    // V = Σ_{j=0..7} (j+1) * (left[8+j] - left[6-j]) ; at j=7, left[6-j] = left[-1] = top_left
+    let mut h_sum: i32 = 0;
+    for i in 0..8 {
+        let right = i32::from(top[8 + i]);
+        let leftward = if i == 7 {
+            i32::from(tl)
+        } else {
+            i32::from(top[6 - i])
+        };
+        h_sum += (i as i32 + 1) * (right - leftward);
+    }
+    let mut v_sum: i32 = 0;
+    for j in 0..8 {
+        let down = i32::from(left[8 + j]);
+        let upward = if j == 7 {
+            i32::from(tl)
+        } else {
+            i32::from(left[6 - j])
+        };
+        v_sum += (j as i32 + 1) * (down - upward);
+    }
+    let b = (5 * h_sum + 32) >> 6;
+    let c = (5 * v_sum + 32) >> 6;
+    let a = 16 * (i32::from(left[15]) + i32::from(top[15]));
+    let mut out = [[0u8; 16]; 16];
+    for y in 0..16 {
+        for x in 0..16 {
+            let v = (a + b * (x as i32 - 7) + c * (y as i32 - 7) + 16) >> 5;
+            out[y][x] = v.clamp(0, 255) as u8;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Chroma 8×8 intra prediction (4:2:0)
+// ---------------------------------------------------------------------------
+
+/// Neighbour samples for one 8×8 chroma intra prediction (per component).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChromaIntra8x8Neighbours {
+    /// Top-left corner chroma sample.
+    pub top_left: Option<u8>,
+    /// Top neighbour row — 8 samples.
+    pub top: Option<[u8; 8]>,
+    /// Left neighbour column — 8 samples.
+    pub left: Option<[u8; 8]>,
+}
+
+/// The four 8×8 chroma intra prediction modes from the macroblock layer.
+pub use crate::h264::macroblock::IntraChromaPredMode;
+
+/// Predicts an 8×8 chroma block under the given mode.
+#[must_use]
+pub fn predict_chroma_8x8(
+    mode: IntraChromaPredMode,
+    n: &ChromaIntra8x8Neighbours,
+) -> [[u8; 8]; 8] {
+    match mode {
+        IntraChromaPredMode::Dc => predict_chroma_dc(n),
+        IntraChromaPredMode::Horizontal => predict_chroma_horizontal(n),
+        IntraChromaPredMode::Vertical => predict_chroma_vertical(n),
+        IntraChromaPredMode::Plane => predict_chroma_plane(n),
+    }
+}
+
+fn predict_chroma_vertical(n: &ChromaIntra8x8Neighbours) -> [[u8; 8]; 8] {
+    let top = match n.top {
+        Some(t) => t,
+        None => return [[128u8; 8]; 8],
+    };
+    let mut out = [[0u8; 8]; 8];
+    for row in &mut out {
+        *row = top;
+    }
+    out
+}
+
+fn predict_chroma_horizontal(n: &ChromaIntra8x8Neighbours) -> [[u8; 8]; 8] {
+    let left = match n.left {
+        Some(l) => l,
+        None => return [[128u8; 8]; 8],
+    };
+    let mut out = [[0u8; 8]; 8];
+    for (y, row) in out.iter_mut().enumerate() {
+        *row = [left[y]; 8];
+    }
+    out
+}
+
+/// Chroma DC is special: the 8×8 block is split into four 4×4
+/// quadrants, each averaging a different subset of the neighbour
+/// samples.  Quadrants 0 and 3 (top-left and bottom-right of the
+/// chroma block) take both top and left contributions; quadrants 1
+/// and 2 take one preferred neighbour subset and fall back to the
+/// other when their preferred is absent.
+fn predict_chroma_dc(n: &ChromaIntra8x8Neighbours) -> [[u8; 8]; 8] {
+    let top_a = n.top.map(|t| sum_u8(&t[..4]));
+    let top_b = n.top.map(|t| sum_u8(&t[4..]));
+    let left_a = n.left.map(|l| sum_u8(&l[..4]));
+    let left_b = n.left.map(|l| sum_u8(&l[4..]));
+
+    let q_tl = dc_average_4_4(top_a, left_a);
+    let q_tr = dc_average_prefer_top(top_b, left_a);
+    let q_bl = dc_average_prefer_left(left_b, top_a);
+    let q_br = dc_average_4_4(top_b, left_b);
+
+    let mut out = [[0u8; 8]; 8];
+    for y in 0..4 {
+        for x in 0..4 {
+            out[y][x] = q_tl;
+            out[y][x + 4] = q_tr;
+            out[y + 4][x] = q_bl;
+            out[y + 4][x + 4] = q_br;
+        }
+    }
+    out
+}
+
+fn sum_u8(samples: &[u8]) -> u32 {
+    samples.iter().map(|&v| u32::from(v)).sum()
+}
+
+fn dc_average_4_4(sum_top: Option<u32>, sum_left: Option<u32>) -> u8 {
+    match (sum_top, sum_left) {
+        (Some(t), Some(l)) => ((t + l + 4) >> 3) as u8,
+        (Some(t), None) => ((t + 2) >> 2) as u8,
+        (None, Some(l)) => ((l + 2) >> 2) as u8,
+        (None, None) => 128,
+    }
+}
+
+fn dc_average_prefer_top(sum_top: Option<u32>, sum_left_fallback: Option<u32>) -> u8 {
+    if let Some(t) = sum_top {
+        ((t + 2) >> 2) as u8
+    } else if let Some(l) = sum_left_fallback {
+        ((l + 2) >> 2) as u8
+    } else {
+        128
+    }
+}
+
+fn dc_average_prefer_left(sum_left: Option<u32>, sum_top_fallback: Option<u32>) -> u8 {
+    if let Some(l) = sum_left {
+        ((l + 2) >> 2) as u8
+    } else if let Some(t) = sum_top_fallback {
+        ((t + 2) >> 2) as u8
+    } else {
+        128
+    }
+}
+
+fn predict_chroma_plane(n: &ChromaIntra8x8Neighbours) -> [[u8; 8]; 8] {
+    let (top, left, tl) = match (n.top, n.left, n.top_left) {
+        (Some(t), Some(l), Some(p)) => (t, l, p),
+        _ => return [[128u8; 8]; 8],
+    };
+    let mut h_sum: i32 = 0;
+    for i in 0..4 {
+        let right = i32::from(top[4 + i]);
+        let leftward = if i == 3 {
+            i32::from(tl)
+        } else {
+            i32::from(top[2 - i])
+        };
+        h_sum += (i as i32 + 1) * (right - leftward);
+    }
+    let mut v_sum: i32 = 0;
+    for j in 0..4 {
+        let down = i32::from(left[4 + j]);
+        let upward = if j == 3 {
+            i32::from(tl)
+        } else {
+            i32::from(left[2 - j])
+        };
+        v_sum += (j as i32 + 1) * (down - upward);
+    }
+    let b = (34 * h_sum + 32) >> 6;
+    let c = (34 * v_sum + 32) >> 6;
+    let a = 16 * (i32::from(left[7]) + i32::from(top[7]));
+    let mut out = [[0u8; 8]; 8];
+    for y in 0..8 {
+        for x in 0..8 {
+            let v = (a + b * (x as i32 - 3) + c * (y as i32 - 3) + 16) >> 5;
+            out[y][x] = v.clamp(0, 255) as u8;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +784,204 @@ mod tests {
         let n = neighbours_with_all([0, 0, 0, 0], [9, 9, 9, 9], 0);
         let pred = predict_4x4(Intra4x4Mode::HorizontalUp, &n);
         assert_eq!(pred, [[9; 4]; 4]);
+    }
+
+    // -- 16×16 luma intra tests --
+
+    fn neighbours_16(top_val: u8, left_val: u8, tl: u8) -> Intra16x16Neighbours {
+        Intra16x16Neighbours {
+            top_left: Some(tl),
+            top: Some([top_val; 16]),
+            left: Some([left_val; 16]),
+        }
+    }
+
+    #[test]
+    fn intra_16x16_vertical_replicates_top_row() {
+        let mut top = [0u8; 16];
+        for (i, v) in top.iter_mut().enumerate() {
+            *v = i as u8 * 10;
+        }
+        let n = Intra16x16Neighbours {
+            top_left: Some(0),
+            top: Some(top),
+            left: Some([99u8; 16]),
+        };
+        let pred = predict_16x16(Intra16x16PredMode::Vertical, &n);
+        for y in 0..16 {
+            assert_eq!(pred[y], top, "row {y}");
+        }
+    }
+
+    #[test]
+    fn intra_16x16_horizontal_replicates_left_column() {
+        let mut left = [0u8; 16];
+        for (j, v) in left.iter_mut().enumerate() {
+            *v = (j as u8) * 5;
+        }
+        let n = Intra16x16Neighbours {
+            top_left: Some(0),
+            top: Some([99u8; 16]),
+            left: Some(left),
+        };
+        let pred = predict_16x16(Intra16x16PredMode::Horizontal, &n);
+        for y in 0..16 {
+            assert_eq!(pred[y], [left[y]; 16]);
+        }
+    }
+
+    #[test]
+    fn intra_16x16_dc_with_constant_neighbours() {
+        let n = neighbours_16(64, 64, 64);
+        let pred = predict_16x16(Intra16x16PredMode::Dc, &n);
+        assert_eq!(pred, [[64u8; 16]; 16]);
+    }
+
+    #[test]
+    fn intra_16x16_dc_fallbacks() {
+        let only_top = Intra16x16Neighbours {
+            top_left: None,
+            top: Some([16u8; 16]),
+            left: None,
+        };
+        assert_eq!(
+            predict_16x16(Intra16x16PredMode::Dc, &only_top),
+            [[16u8; 16]; 16],
+        );
+        let only_left = Intra16x16Neighbours {
+            top_left: None,
+            top: None,
+            left: Some([32u8; 16]),
+        };
+        assert_eq!(
+            predict_16x16(Intra16x16PredMode::Dc, &only_left),
+            [[32u8; 16]; 16],
+        );
+        let neither = Intra16x16Neighbours::default();
+        assert_eq!(
+            predict_16x16(Intra16x16PredMode::Dc, &neither),
+            [[128u8; 16]; 16],
+        );
+    }
+
+    #[test]
+    fn intra_16x16_plane_constant_input_is_identity() {
+        let n = neighbours_16(100, 100, 100);
+        let pred = predict_16x16(Intra16x16PredMode::Plane, &n);
+        assert_eq!(pred, [[100u8; 16]; 16]);
+    }
+
+    #[test]
+    fn intra_16x16_plane_falls_back_without_corner() {
+        let n = Intra16x16Neighbours {
+            top_left: None,
+            top: Some([100u8; 16]),
+            left: Some([100u8; 16]),
+        };
+        assert_eq!(
+            predict_16x16(Intra16x16PredMode::Plane, &n),
+            [[128u8; 16]; 16],
+        );
+    }
+
+    // -- Chroma 8×8 intra tests --
+
+    fn chroma_neighbours(top_val: u8, left_val: u8, tl: u8) -> ChromaIntra8x8Neighbours {
+        ChromaIntra8x8Neighbours {
+            top_left: Some(tl),
+            top: Some([top_val; 8]),
+            left: Some([left_val; 8]),
+        }
+    }
+
+    #[test]
+    fn chroma_vertical_replicates_top() {
+        let n = chroma_neighbours(70, 0, 0);
+        let pred = predict_chroma_8x8(IntraChromaPredMode::Vertical, &n);
+        for row in &pred {
+            assert_eq!(*row, [70u8; 8]);
+        }
+    }
+
+    #[test]
+    fn chroma_horizontal_replicates_left() {
+        let mut left = [0u8; 8];
+        for (j, v) in left.iter_mut().enumerate() {
+            *v = j as u8 * 8;
+        }
+        let n = ChromaIntra8x8Neighbours {
+            top_left: Some(0),
+            top: Some([99u8; 8]),
+            left: Some(left),
+        };
+        let pred = predict_chroma_8x8(IntraChromaPredMode::Horizontal, &n);
+        for y in 0..8 {
+            assert_eq!(pred[y], [left[y]; 8]);
+        }
+    }
+
+    #[test]
+    fn chroma_dc_with_all_neighbours_present() {
+        let n = chroma_neighbours(80, 80, 80);
+        let pred = predict_chroma_8x8(IntraChromaPredMode::Dc, &n);
+        for row in &pred {
+            assert_eq!(*row, [80u8; 8]);
+        }
+    }
+
+    #[test]
+    fn chroma_dc_top_right_prefers_top_then_left_then_default() {
+        // Top present only: TR quadrant uses top[4..7], all others
+        // fall back per spec.
+        let top_only = ChromaIntra8x8Neighbours {
+            top_left: None,
+            top: Some([40u8; 8]),
+            left: None,
+        };
+        let pred = predict_chroma_8x8(IntraChromaPredMode::Dc, &top_only);
+        // All quadrants should be 40 when top is uniform 40.
+        for row in &pred {
+            assert_eq!(*row, [40u8; 8]);
+        }
+
+        // Left present only: TR falls back to left[0..3].
+        let left_only = ChromaIntra8x8Neighbours {
+            top_left: None,
+            top: None,
+            left: Some([50u8; 8]),
+        };
+        let pred = predict_chroma_8x8(IntraChromaPredMode::Dc, &left_only);
+        for row in &pred {
+            assert_eq!(*row, [50u8; 8]);
+        }
+
+        // Neither: 128.
+        let neither = ChromaIntra8x8Neighbours::default();
+        let pred = predict_chroma_8x8(IntraChromaPredMode::Dc, &neither);
+        for row in &pred {
+            assert_eq!(*row, [128u8; 8]);
+        }
+    }
+
+    #[test]
+    fn chroma_plane_constant_input_is_identity() {
+        let n = chroma_neighbours(50, 50, 50);
+        let pred = predict_chroma_8x8(IntraChromaPredMode::Plane, &n);
+        for row in &pred {
+            assert_eq!(*row, [50u8; 8]);
+        }
+    }
+
+    #[test]
+    fn chroma_plane_falls_back_without_corner() {
+        let n = ChromaIntra8x8Neighbours {
+            top_left: None,
+            top: Some([90u8; 8]),
+            left: Some([90u8; 8]),
+        };
+        let pred = predict_chroma_8x8(IntraChromaPredMode::Plane, &n);
+        for row in &pred {
+            assert_eq!(*row, [128u8; 8]);
+        }
     }
 }
