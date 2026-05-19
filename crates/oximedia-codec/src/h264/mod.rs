@@ -78,8 +78,8 @@ pub use intra_mode::{
     most_probable_mode, resolve_intra4x4_mode, Intra4x4ModeContext,
 };
 pub use motion::{
-    chroma_bilinear, fetch_chroma_4x4_subpel, fetch_luma_4x4_integer, luma_6tap_unclipped,
-    luma_half_pel, rounded_average,
+    chroma_bilinear, fetch_chroma_4x4_subpel, fetch_luma_4x4_integer, fetch_luma_4x4_subpel,
+    luma_6tap_unclipped, luma_half_pel, rounded_average,
 };
 pub use mv_pred::{
     apply_mv_delta, median3, predict_mv_16x8_bottom, predict_mv_16x8_top, predict_mv_8x16_left,
