@@ -24,6 +24,11 @@
 //! from the bitstream.
 
 use crate::h264::bit_reader::BitReader;
+use crate::h264::cavlc_tables::{
+    COEFF_TOKEN_CHROMA_DC_BITS, COEFF_TOKEN_CHROMA_DC_LENS, COEFF_TOKEN_LUMA_BITS,
+    COEFF_TOKEN_LUMA_LENS, RUN_BEFORE_BITS, RUN_BEFORE_LENS, TOTAL_ZEROS_CHROMA_DC_BITS,
+    TOTAL_ZEROS_CHROMA_DC_LENS, TOTAL_ZEROS_LUMA_BITS, TOTAL_ZEROS_LUMA_LENS,
+};
 use crate::CodecError;
 
 /// Which block in the macroblock this residual belongs to.  Determines
@@ -235,8 +240,13 @@ pub fn read_total_zeros_luma(
     if total_coeff == 0 || total_coeff >= 16 {
         return Ok(0);
     }
-    let table = TOTAL_ZEROS_LUMA[(total_coeff - 1) as usize];
-    decode_vlc_table(r, table, "total_zeros_luma")
+    let idx = (total_coeff - 1) as usize;
+    scan_flat_vlc(
+        r,
+        &TOTAL_ZEROS_LUMA_LENS[idx],
+        &TOTAL_ZEROS_LUMA_BITS[idx],
+        "total_zeros_luma",
+    )
 }
 
 /// Reads the chroma-DC variant of `total_zeros`.
@@ -254,8 +264,13 @@ pub fn read_total_zeros_chroma_dc(
     if total_coeff == 0 || total_coeff >= 4 {
         return Ok(0);
     }
-    let table = TOTAL_ZEROS_CHROMA_DC[(total_coeff - 1) as usize];
-    decode_vlc_table(r, table, "total_zeros_chroma_dc")
+    let idx = (total_coeff - 1) as usize;
+    scan_flat_vlc(
+        r,
+        &TOTAL_ZEROS_CHROMA_DC_LENS[idx],
+        &TOTAL_ZEROS_CHROMA_DC_BITS[idx],
+        "total_zeros_chroma_dc",
+    )
 }
 
 /// Reads one `run_before` syntax element.
@@ -278,69 +293,96 @@ pub fn read_run_before(
         return Ok(0);
     }
     let idx = (zeros_left.min(7) - 1) as usize;
-    let table = RUN_BEFORE[idx];
-    if zeros_left < 7 {
-        decode_vlc_table(r, table, "run_before")
-    } else {
-        // For zeros_left >= 7, runs 0..=6 use the same fixed-length
-        // table, and run >= 7 is encoded as a unary prefix of zeros
-        // followed by a terminator '1' — read the table first; if its
-        // codeword length was 3 and value 0 (the spec's "run=0" sentinel
-        // doubles for "see unary tail"), continue counting.
-        let initial = decode_vlc_table(r, table, "run_before")?;
-        if initial < 7 {
-            Ok(initial)
-        } else {
-            let mut extra: u8 = 0;
-            while extra < 32 && !r.read_bit()? {
-                extra = extra.saturating_add(1);
-            }
-            Ok(7u8.saturating_add(extra))
-        }
-    }
+    scan_flat_vlc(
+        r,
+        &RUN_BEFORE_LENS[idx],
+        &RUN_BEFORE_BITS[idx],
+        "run_before",
+    )
 }
 
 /// Reads the `coeff_token` syntax element from the bitstream.
 ///
-/// Selects one of the variable-length code tables based on the
-/// neighbour-context `nc` value (the per-axis average of non-zero
-/// coefficient counts in the top and left neighbours, or -1 for chroma
-/// DC) and scans the table bit-by-bit to recover
-/// `(TotalCoeff, TrailingOnes)`.
+/// Selects one of four luma variable-length code tables based on
+/// neighbour-context `nc`, or the dedicated 4:2:0 chroma DC table
+/// when `kind` is [`BlockKind::ChromaDc`], and scans the chosen
+/// table bit-by-bit to recover `(TotalCoeff, TrailingOnes)`.
+///
+/// `nc` selection (per H.264):
+/// - `nc < 2`              → luma table 0
+/// - `nc in [2, 4)`        → luma table 1
+/// - `nc in [4, 8)`        → luma table 2
+/// - `nc >= 8`             → luma table 3 (a fixed 6-bit code; the
+///                            spec's "high nc" path)
 ///
 /// # Errors
 ///
-/// Returns [`CodecError::InvalidData`] when the bitstream is malformed
-/// or when the selected lookup table is not yet populated.  See
-/// [`COEFF_TOKEN_TABLES_PENDING`] for the list of unpopulated tables.
+/// Returns [`CodecError::InvalidData`] when the bitstream is
+/// exhausted before a complete codeword is read, or when the bits
+/// don't match any entry in the selected table.
 pub fn read_coeff_token(
     r: &mut BitReader<'_>,
     kind: BlockKind,
     nc: i32,
 ) -> Result<(u8, u8), CodecError> {
-    let _ = (r, kind, nc);
-    // TODO(h264-cavlc): populate the four context-dependent luma
-    // coeff_token tables and the chroma DC table.  Until then this
-    // returns an explicit error so callers cannot silently produce
-    // non-conformant residuals.
-    Err(CodecError::InvalidData(
-        "h264 cavlc: coeff_token lookup tables not yet populated".into(),
-    ))
+    if kind.is_chroma_dc() {
+        return scan_coeff_token(
+            r,
+            &COEFF_TOKEN_CHROMA_DC_LENS,
+            &COEFF_TOKEN_CHROMA_DC_BITS,
+            5,
+            "chroma DC",
+        );
+    }
+    let table_idx = if nc < 2 {
+        0
+    } else if nc < 4 {
+        1
+    } else if nc < 8 {
+        2
+    } else {
+        3
+    };
+    scan_coeff_token(
+        r,
+        &COEFF_TOKEN_LUMA_LENS[table_idx],
+        &COEFF_TOKEN_LUMA_BITS[table_idx],
+        17,
+        "luma",
+    )
 }
 
-/// Documentation marker listing CAVLC pieces still pending.
-///
-/// Pending lookup tables:
-///
-/// - Luma `coeff_token` for `nc < 2`.
-/// - Luma `coeff_token` for `nc` in `[2, 4)`.
-/// - Luma `coeff_token` for `nc` in `[4, 8)`.
-/// - Luma `coeff_token` for `nc >= 8` (6-bit fixed-length).
-/// - Chroma DC `coeff_token` for 4:2:0.
-/// - The 14 remaining `total_zeros` columns (`TotalCoeff` 2..=15).
-pub const COEFF_TOKEN_TABLES_PENDING: &str =
-    "luma nc<2, luma nc[2..4), luma nc[4..8), luma nc>=8, chroma DC; \
-     plus total_zeros TC=2..15";
+/// Scans `coeff_token` bit-by-bit against the supplied `lens` /
+/// `bits` arrays, both laid out as `[total_coeff * 4 + trailing_ones]`
+/// indexed.  `rows` is the number of valid `total_coeff` rows
+/// (17 for luma, 5 for 4:2:0 chroma DC).
+fn scan_coeff_token(
+    r: &mut BitReader<'_>,
+    lens: &[u8],
+    bits: &[u8],
+    rows: usize,
+    label: &str,
+) -> Result<(u8, u8), CodecError> {
+    // Compute max codeword length in this table.
+    let max_len = lens.iter().copied().max().unwrap_or(0);
+    let mut accumulated: u32 = 0;
+    let mut cur_len: u8 = 0;
+    while cur_len < max_len {
+        accumulated = (accumulated << 1) | u32::from(r.read_bit()?);
+        cur_len += 1;
+        for tc in 0..rows {
+            for to in 0..4 {
+                let idx = tc * 4 + to;
+                if lens[idx] == cur_len && u32::from(bits[idx]) == accumulated {
+                    return Ok((tc as u8, to as u8));
+                }
+            }
+        }
+    }
+    Err(CodecError::InvalidData(format!(
+        "h264 cavlc: {label} coeff_token codeword not in table after {cur_len} bits"
+    )))
+}
 
 /// Reads and decodes one complete residual block from the bitstream.
 ///
@@ -471,204 +513,31 @@ pub fn decode_residual_block(
 // VLC reader
 // ---------------------------------------------------------------------------
 
-/// One row of a CAVLC VLC lookup table.
-///
-/// The `bits` field stores the codeword left-justified into the low
-/// `length` bits — e.g. codeword `01` of length 2 becomes `0b01`.
-/// Decoder reads `length` bits and looks them up.
-#[derive(Debug, Clone, Copy)]
-struct VlcEntry {
-    bits: u16,
-    length: u8,
-    value: u8,
-}
-
-fn decode_vlc_table(
+/// Scans a flat `(len, bits)` table representation bit-by-bit
+/// against the input stream.  Entry index `i` corresponds to decoded
+/// value `i`.  Entries with `lens[i] == 0` are invalid and skipped.
+fn scan_flat_vlc(
     r: &mut BitReader<'_>,
-    table: &[VlcEntry],
+    lens: &[u8],
+    bits: &[u8],
     label: &str,
 ) -> Result<u8, CodecError> {
-    // Find the maximum codeword length in this table, then read bits
-    // incrementally up to that limit.  At each length, scan for an
-    // entry that matches the accumulated value.
-    let max_len = table.iter().map(|e| e.length).max().unwrap_or(0);
+    let max_len = lens.iter().copied().max().unwrap_or(0);
     let mut accumulated: u32 = 0;
-    let mut current_len: u8 = 0;
-    while current_len < max_len {
+    let mut cur_len: u8 = 0;
+    while cur_len < max_len {
         accumulated = (accumulated << 1) | u32::from(r.read_bit()?);
-        current_len += 1;
-        for entry in table {
-            if entry.length == current_len && u32::from(entry.bits) == accumulated {
-                return Ok(entry.value);
+        cur_len += 1;
+        for (i, &len) in lens.iter().enumerate() {
+            if len == cur_len && u32::from(bits[i]) == accumulated {
+                return Ok(i as u8);
             }
         }
     }
     Err(CodecError::InvalidData(format!(
-        "h264 cavlc: {label} codeword not in table after {current_len} bits"
+        "h264 cavlc: {label} codeword not in table after {cur_len} bits"
     )))
 }
-
-// ---------------------------------------------------------------------------
-// total_zeros tables — luma (Table 9-7)
-// ---------------------------------------------------------------------------
-//
-// One sub-table per TotalCoeff value 1..=15.  Each sub-table maps a
-// codeword to total_zeros in [0, 16 - TotalCoeff].
-
-#[rustfmt::skip]
-const TZ_LUMA_TC_1: &[VlcEntry] = &[
-    VlcEntry { bits: 0b1,        length: 1, value: 0 },
-    VlcEntry { bits: 0b011,      length: 3, value: 1 },
-    VlcEntry { bits: 0b010,      length: 3, value: 2 },
-    VlcEntry { bits: 0b0011,     length: 4, value: 3 },
-    VlcEntry { bits: 0b0010,     length: 4, value: 4 },
-    VlcEntry { bits: 0b00011,    length: 5, value: 5 },
-    VlcEntry { bits: 0b00010,    length: 5, value: 6 },
-    VlcEntry { bits: 0b000011,   length: 6, value: 7 },
-    VlcEntry { bits: 0b000010,   length: 6, value: 8 },
-    VlcEntry { bits: 0b0000011,  length: 7, value: 9 },
-    VlcEntry { bits: 0b0000010,  length: 7, value: 10 },
-    VlcEntry { bits: 0b00000011, length: 8, value: 11 },
-    VlcEntry { bits: 0b00000010, length: 8, value: 12 },
-    VlcEntry { bits: 0b000000011, length: 9, value: 13 },
-    VlcEntry { bits: 0b000000010, length: 9, value: 14 },
-    VlcEntry { bits: 0b000000001, length: 9, value: 15 },
-];
-
-// Placeholder rows for total_coeff 2..=15 are intentionally omitted
-// in this commit (phase 4b-i).  The framework + TZ_LUMA_TC_1 is enough
-// to exercise the path end-to-end; phase 4b-ii adds the remaining
-// 14 sub-tables together with the four `coeff_token` tables that
-// share their transcription effort.
-
-const TOTAL_ZEROS_LUMA: [&[VlcEntry]; 15] = [
-    TZ_LUMA_TC_1,
-    // The remaining 14 entries point at the same TC=1 table as a
-    // *placeholder* — calling `read_total_zeros_luma` with
-    // total_coeff > 1 in this commit will produce technically valid
-    // but spec-non-conformant output.  Phase 4b-ii replaces these.
-    TZ_LUMA_TC_1, TZ_LUMA_TC_1, TZ_LUMA_TC_1, TZ_LUMA_TC_1,
-    TZ_LUMA_TC_1, TZ_LUMA_TC_1, TZ_LUMA_TC_1, TZ_LUMA_TC_1,
-    TZ_LUMA_TC_1, TZ_LUMA_TC_1, TZ_LUMA_TC_1, TZ_LUMA_TC_1,
-    TZ_LUMA_TC_1, TZ_LUMA_TC_1,
-];
-
-// ---------------------------------------------------------------------------
-// total_zeros tables — chroma DC (Table 9-9 for 4:2:0)
-// ---------------------------------------------------------------------------
-//
-// total_coeff 1..=3.
-
-#[rustfmt::skip]
-const TZ_CHROMA_DC_TC_1: &[VlcEntry] = &[
-    VlcEntry { bits: 0b1,   length: 1, value: 0 },
-    VlcEntry { bits: 0b01,  length: 2, value: 1 },
-    VlcEntry { bits: 0b001, length: 3, value: 2 },
-    VlcEntry { bits: 0b000, length: 3, value: 3 },
-];
-
-#[rustfmt::skip]
-const TZ_CHROMA_DC_TC_2: &[VlcEntry] = &[
-    VlcEntry { bits: 0b1,  length: 1, value: 0 },
-    VlcEntry { bits: 0b01, length: 2, value: 1 },
-    VlcEntry { bits: 0b00, length: 2, value: 2 },
-];
-
-#[rustfmt::skip]
-const TZ_CHROMA_DC_TC_3: &[VlcEntry] = &[
-    VlcEntry { bits: 0b1, length: 1, value: 0 },
-    VlcEntry { bits: 0b0, length: 1, value: 1 },
-];
-
-const TOTAL_ZEROS_CHROMA_DC: [&[VlcEntry]; 3] = [
-    TZ_CHROMA_DC_TC_1,
-    TZ_CHROMA_DC_TC_2,
-    TZ_CHROMA_DC_TC_3,
-];
-
-// ---------------------------------------------------------------------------
-// run_before tables (Table 9-10)
-// ---------------------------------------------------------------------------
-//
-// One sub-table per zeros_left 1..=6, plus a 7+-shared table.  The
-// 7+ table covers run values 0..=6 directly; runs >= 7 are encoded
-// with a unary suffix that `read_run_before` reads after the table
-// lookup.
-
-#[rustfmt::skip]
-const RUN_BEFORE_ZL_1: &[VlcEntry] = &[
-    VlcEntry { bits: 0b1, length: 1, value: 0 },
-    VlcEntry { bits: 0b0, length: 1, value: 1 },
-];
-
-#[rustfmt::skip]
-const RUN_BEFORE_ZL_2: &[VlcEntry] = &[
-    VlcEntry { bits: 0b1,  length: 1, value: 0 },
-    VlcEntry { bits: 0b01, length: 2, value: 1 },
-    VlcEntry { bits: 0b00, length: 2, value: 2 },
-];
-
-#[rustfmt::skip]
-const RUN_BEFORE_ZL_3: &[VlcEntry] = &[
-    VlcEntry { bits: 0b11, length: 2, value: 0 },
-    VlcEntry { bits: 0b10, length: 2, value: 1 },
-    VlcEntry { bits: 0b01, length: 2, value: 2 },
-    VlcEntry { bits: 0b00, length: 2, value: 3 },
-];
-
-#[rustfmt::skip]
-const RUN_BEFORE_ZL_4: &[VlcEntry] = &[
-    VlcEntry { bits: 0b11,  length: 2, value: 0 },
-    VlcEntry { bits: 0b10,  length: 2, value: 1 },
-    VlcEntry { bits: 0b01,  length: 2, value: 2 },
-    VlcEntry { bits: 0b001, length: 3, value: 3 },
-    VlcEntry { bits: 0b000, length: 3, value: 4 },
-];
-
-#[rustfmt::skip]
-const RUN_BEFORE_ZL_5: &[VlcEntry] = &[
-    VlcEntry { bits: 0b11,  length: 2, value: 0 },
-    VlcEntry { bits: 0b10,  length: 2, value: 1 },
-    VlcEntry { bits: 0b011, length: 3, value: 2 },
-    VlcEntry { bits: 0b010, length: 3, value: 3 },
-    VlcEntry { bits: 0b001, length: 3, value: 4 },
-    VlcEntry { bits: 0b000, length: 3, value: 5 },
-];
-
-#[rustfmt::skip]
-const RUN_BEFORE_ZL_6: &[VlcEntry] = &[
-    VlcEntry { bits: 0b11,  length: 2, value: 0 },
-    VlcEntry { bits: 0b000, length: 3, value: 1 },
-    VlcEntry { bits: 0b001, length: 3, value: 2 },
-    VlcEntry { bits: 0b011, length: 3, value: 3 },
-    VlcEntry { bits: 0b010, length: 3, value: 4 },
-    VlcEntry { bits: 0b101, length: 3, value: 5 },
-    VlcEntry { bits: 0b100, length: 3, value: 6 },
-];
-
-// zeros_left >= 7: fixed 3-bit table for runs 0..=6, plus unary
-// extension for run >= 7 that `read_run_before` handles separately.
-#[rustfmt::skip]
-const RUN_BEFORE_ZL_7_PLUS: &[VlcEntry] = &[
-    VlcEntry { bits: 0b111, length: 3, value: 0 },
-    VlcEntry { bits: 0b110, length: 3, value: 1 },
-    VlcEntry { bits: 0b101, length: 3, value: 2 },
-    VlcEntry { bits: 0b100, length: 3, value: 3 },
-    VlcEntry { bits: 0b011, length: 3, value: 4 },
-    VlcEntry { bits: 0b010, length: 3, value: 5 },
-    VlcEntry { bits: 0b001, length: 3, value: 6 },
-    VlcEntry { bits: 0b000, length: 3, value: 7 }, // sentinel: read unary tail
-];
-
-const RUN_BEFORE: [&[VlcEntry]; 7] = [
-    RUN_BEFORE_ZL_1,
-    RUN_BEFORE_ZL_2,
-    RUN_BEFORE_ZL_3,
-    RUN_BEFORE_ZL_4,
-    RUN_BEFORE_ZL_5,
-    RUN_BEFORE_ZL_6,
-    RUN_BEFORE_ZL_7_PLUS,
-];
 
 #[cfg(test)]
 mod tests {
@@ -780,9 +649,9 @@ mod tests {
     }
 
     #[test]
-    fn read_run_before_seven_plus_extends_with_unary() {
-        // zeros_left = 10, table codeword "000" (run = 7 sentinel) +
-        // unary tail "01" (one zero then terminator) -> run = 7 + 1 = 8.
+    fn read_run_before_seven_plus_decodes_long_run() {
+        // For zeros_left >= 7 the table has explicit entries for
+        // runs 0..=14.  Run = 8 is codeword '00001' per the spec.
         let buf = pack_bits(&[false, false, false, false, true]);
         let mut r = BitReader::new(&buf);
         assert_eq!(read_run_before(&mut r, 10).unwrap(), 8);
@@ -874,24 +743,32 @@ mod tests {
     }
 
     #[test]
-    fn read_coeff_token_errors_until_tables_populated() {
-        let buf = [0xFFu8; 4];
+    fn read_coeff_token_zero_zero_at_low_nc() {
+        // For nC < 2 the (TotalCoeff=0, TrailingOnes=0) codeword is
+        // the single bit '1'.
+        let buf = pack_bits(&[true]);
         let mut r = BitReader::new(&buf);
-        let err = read_coeff_token(&mut r, BlockKind::Luma4x4, 0)
-            .expect_err("must error until tables are populated");
-        match err {
-            CodecError::InvalidData(msg) => {
-                assert!(msg.contains("coeff_token"));
-            }
-            _ => panic!("expected InvalidData"),
-        }
+        let (tc, to) = read_coeff_token(&mut r, BlockKind::Luma4x4, 0).expect("decode");
+        assert_eq!((tc, to), (0, 0));
     }
 
     #[test]
-    fn read_residual_block_propagates_pending_table_error() {
-        let buf = [0xFFu8; 4];
+    fn read_coeff_token_chroma_dc_zero_zero() {
+        // For chroma DC the (0, 0) codeword is '01' (length 2).
+        let buf = pack_bits(&[false, true]);
         let mut r = BitReader::new(&buf);
-        assert!(read_residual_block(&mut r, BlockKind::ChromaDc, -1).is_err());
+        let (tc, to) = read_coeff_token(&mut r, BlockKind::ChromaDc, -1).expect("decode");
+        assert_eq!((tc, to), (0, 0));
+    }
+
+    #[test]
+    fn read_coeff_token_high_nc_fixed_length() {
+        // For nC >= 8 the table is a 6-bit fixed-length code.
+        // Decimal 3 (binary 000011) decodes to (0, 0).
+        let buf = pack_bits(&[false, false, false, false, true, true]);
+        let mut r = BitReader::new(&buf);
+        let (tc, to) = read_coeff_token(&mut r, BlockKind::Luma4x4, 8).expect("decode");
+        assert_eq!((tc, to), (0, 0));
     }
 
     #[test]
