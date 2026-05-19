@@ -31,11 +31,16 @@ use std::collections::HashMap;
 use crate::h264::bit_reader::BitReader;
 use crate::h264::cabac::{init_contexts, CabacContext};
 use crate::h264::cabac_inter_mb::MbNeighbours;
-use crate::h264::decoder::decode_intra_slice_bitstream;
+use crate::h264::decoder::{
+    decode_intra_16x16_mb, decode_intra_4x4_mb, decode_intra_chroma_8x8,
+    decode_intra_slice_bitstream, Residual4x4Scan,
+};
 use crate::h264::dpb::{Dpb, DpbEntry};
 use crate::h264::frame::Frame;
 use crate::h264::inter_cache::{InterMbDecoded, InterSliceCache};
-use crate::h264::macroblock::MbType;
+use crate::h264::intra_mode::{most_probable_mode, resolve_intra4x4_mode, Intra4x4ModeContext};
+use crate::h264::intra_pred::Intra4x4Mode;
+use crate::h264::macroblock::{Intra16x16PredMode, IntraChromaPredMode, MacroblockLayer, MbType};
 use crate::h264::mv_pred::{predict_mv_median, MotionVector, MvPredictionContext};
 use crate::h264::pcm::{read_pcm_macroblock_420, write_pcm_macroblock_420};
 use crate::h264::pps::{parse_pps, PpsRbsp};
@@ -604,6 +609,7 @@ impl Decoder {
                 .unwrap_or(&placeholder);
 
             let mut cache = InterSliceCache::new(pic_width_mbs);
+            let mut intra_ctx = Intra4x4ModeContext::default();
 
             for mb in &mbs {
                 if mb.mb_x == 0 {
@@ -653,16 +659,20 @@ impl Decoder {
                         reconstruct_inter_p_mb(&mut frame, primary_ref, &inputs)?;
                         cache.record_inter_mb(mb.mb_x, &decoded, 0, 0);
                     }
-                    MbCavlcKind::Intra { layer, .. } => {
-                        // Intra macroblocks inside a P slice fall
-                        // through to the existing CAVLC intra
-                        // reconstruction path used by I-slices.
-                        // For now we render mid-grey to avoid
-                        // duplicating the residual-reformatting
-                        // plumbing; the proper hookup is task
-                        // "intra-in-P CAVLC".
-                        let _ = layer;
-                        fill_mid_grey(&mut frame, mb.mb_x, mb.mb_y);
+                    MbCavlcKind::Intra {
+                        layer,
+                        luma_blocks,
+                        chroma_dc: _,
+                        chroma_ac,
+                    } => {
+                        reconstruct_intra_in_p_cavlc(
+                            &mut frame,
+                            mb,
+                            layer,
+                            luma_blocks,
+                            chroma_ac,
+                            &mut intra_ctx,
+                        )?;
                         let intra = InterMbDecoded {
                             is_intra: true,
                             ..InterMbDecoded::default()
@@ -836,6 +846,111 @@ fn chroma_dc_from_residual(plane: &[i32; 8]) -> [i32; 4] {
 fn extract_chroma_ac_plane(all: &[[i32; 16]; 8], plane: usize) -> [[i32; 16]; 4] {
     let base = plane * 4;
     [all[base], all[base + 1], all[base + 2], all[base + 3]]
+}
+
+/// Reconstructs an intra macroblock that appeared inside a CAVLC
+/// P slice.  Mirrors the I-slice CAVLC dispatch
+/// ([`crate::h264::decoder::decode_intra_slice_bitstream`]) but
+/// operates on already-parsed `MbCavlcKind::Intra` data so the
+/// surrounding P-slice walker can dispatch per MB.
+///
+/// `intra_ctx` is the running MPM context — it captures the modes
+/// of previously decoded intra macroblocks in this slice so MPM
+/// derivation matches across intra blocks separated by inter
+/// macroblocks.
+fn reconstruct_intra_in_p_cavlc(
+    frame: &mut Frame,
+    mb: &crate::h264::slice_cavlc::MbCavlcDecoded,
+    layer: &MacroblockLayer,
+    luma_blocks: &[Option<crate::h264::cavlc::ResidualBlock>; 16],
+    chroma_ac: &[Option<crate::h264::cavlc::ResidualBlock>; 8],
+    intra_ctx: &mut Intra4x4ModeContext,
+) -> Result<(), CodecError> {
+    let mb_x = mb.mb_x;
+    let mb_y = mb.mb_y;
+    let qp_y = mb.qp_y;
+    let qp_chroma = mb.qp_chroma;
+    let chroma_mode = layer
+        .intra_chroma_pred_mode
+        .unwrap_or(IntraChromaPredMode::Dc);
+
+    let mut luma_residuals: [Residual4x4Scan; 16] = [None; 16];
+    for (i, blk) in luma_blocks.iter().enumerate() {
+        if let Some(b) = blk {
+            if b.total_coeff > 0 {
+                luma_residuals[i] = Some(b.to_scan_order_padded());
+            }
+        }
+    }
+    let mut chroma_cb: [Residual4x4Scan; 4] = [None; 4];
+    let mut chroma_cr: [Residual4x4Scan; 4] = [None; 4];
+    for i in 0..4 {
+        if let Some(b) = &chroma_ac[i] {
+            if b.total_coeff > 0 {
+                chroma_cb[i] = Some(b.to_scan_order_padded());
+            }
+        }
+        if let Some(b) = &chroma_ac[4 + i] {
+            if b.total_coeff > 0 {
+                chroma_cr[i] = Some(b.to_scan_order_padded());
+            }
+        }
+    }
+
+    match layer.mb_type {
+        MbType::INxN => {
+            let intra_nxn = layer.intra_nxn.as_ref().ok_or_else(|| {
+                CodecError::InvalidData("h264 decoder: I_NxN without intra_nxn".into())
+            })?;
+            let mut modes = [Intra4x4Mode::Dc; 16];
+            for (idx, mode) in modes.iter_mut().enumerate() {
+                let mpm =
+                    most_probable_mode(intra_ctx.top_of(idx), intra_ctx.left_of(idx));
+                let prev_flag = intra_nxn
+                    .prev_intra4x4_pred_mode_flag
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(false);
+                let rem = intra_nxn.rem_intra4x4_pred_mode.get(idx).copied().flatten();
+                *mode = resolve_intra4x4_mode(prev_flag, rem, mpm)?;
+                intra_ctx.set(idx, *mode);
+            }
+            decode_intra_4x4_mb(frame, mb_x, mb_y, &modes, &luma_residuals, qp_y)?;
+            decode_intra_chroma_8x8(frame, mb_x, mb_y, chroma_mode, &chroma_cb, qp_chroma, true)?;
+            decode_intra_chroma_8x8(
+                frame, mb_x, mb_y, chroma_mode, &chroma_cr, qp_chroma, false,
+            )?;
+        }
+        MbType::I16x16 { pred_mode, .. } => {
+            decode_intra_16x16_mb(
+                frame,
+                mb_x,
+                mb_y,
+                intra16x16_pred_mode_from_decoded(pred_mode),
+                &luma_residuals,
+                qp_y,
+            )?;
+            decode_intra_chroma_8x8(frame, mb_x, mb_y, chroma_mode, &chroma_cb, qp_chroma, true)?;
+            decode_intra_chroma_8x8(
+                frame, mb_x, mb_y, chroma_mode, &chroma_cr, qp_chroma, false,
+            )?;
+            // I_16x16 doesn't update the 4×4 MPM context — reset
+            // so subsequent I_NxN MBs don't carry stale state.
+            *intra_ctx = Intra4x4ModeContext::default();
+        }
+        MbType::IPcm => {
+            // I_PCM inside the CAVLC P-slice walker would have
+            // been routed through the PCM passthrough already.
+        }
+        _ => {
+            fill_mid_grey(frame, mb_x, mb_y);
+        }
+    }
+    Ok(())
+}
+
+fn intra16x16_pred_mode_from_decoded(pred_mode: Intra16x16PredMode) -> Intra16x16PredMode {
+    pred_mode
 }
 
 /// Resolves per-4×4 motion vectors for a CAVLC P-slice
