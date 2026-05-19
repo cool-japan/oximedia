@@ -43,6 +43,7 @@ pub mod bit_reader;
 pub mod cavlc;
 pub mod decoder;
 pub mod frame;
+pub mod intra_mode;
 pub mod intra_pred;
 pub mod macroblock;
 pub mod pps;
@@ -59,7 +60,12 @@ pub use cavlc::{
     read_total_zeros_chroma_dc, read_total_zeros_luma, update_suffix_length, BlockKind,
     ResidualBlock, COEFF_TOKEN_TABLES_PENDING,
 };
-pub use decoder::{decode_intra_16x16_mb, decode_intra_chroma_8x8, Residual4x4Scan};
+pub use decoder::{
+    decode_intra_16x16_mb, decode_intra_4x4_mb, decode_intra_chroma_8x8, Residual4x4Scan,
+};
+pub use intra_mode::{
+    most_probable_mode, resolve_intra4x4_mode, Intra4x4ModeContext,
+};
 pub use frame::{
     collect_chroma_8x8_neighbours, collect_intra16x16_neighbours, collect_intra4x4_neighbours,
     Frame,
