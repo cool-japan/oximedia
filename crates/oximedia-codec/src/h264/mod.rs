@@ -148,7 +148,8 @@ pub use macroblock::{
 pub use pps::{parse_pps, PpsRbsp};
 pub use rbsp::{strip_emulation_prevention, trailing_bits_len};
 pub use reconstruct_inter::{
-    reconstruct_inter_b_mb, reconstruct_inter_p_mb, InterBMbInputs, InterPMbInputs,
+    reconstruct_inter_b_mb, reconstruct_inter_p_mb, reconstruct_inter_p_mb_multiref,
+    InterBMbInputs, InterPMbInputs,
 };
 pub use scaling_list::{
     read_pic_scaling_matrix, read_seq_scaling_matrix, ScalingList4x4, ScalingList8x8,
