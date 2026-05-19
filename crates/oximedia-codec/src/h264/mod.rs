@@ -63,6 +63,7 @@ pub mod mv_pred;
 pub mod pps;
 pub mod rbsp;
 pub mod scaling_list;
+pub mod slice_cabac;
 pub mod slice_header;
 pub mod sps;
 pub mod transform;
@@ -135,6 +136,7 @@ pub use scaling_list::{
     read_pic_scaling_matrix, read_seq_scaling_matrix, ScalingList4x4, ScalingList8x8,
     ScalingListChoice, ScalingLists,
 };
+pub use slice_cabac::{parse_slice_cabac, MbCabacDecoded, MbKind, SliceCabacContext};
 pub use slice_header::{
     parse_slice_header, DecRefPicMarking, MmcoOp, NalContext, PredWeightTable, RefPicListModOp,
     RefPicListModification, SliceHeader, SliceType, WeightEntry,
