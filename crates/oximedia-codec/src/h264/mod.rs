@@ -69,8 +69,8 @@ pub use cavlc::{
     ResidualBlock, COEFF_TOKEN_TABLES_PENDING,
 };
 pub use decoder::{
-    decode_i_slice, decode_intra_16x16_mb, decode_intra_4x4_mb, decode_intra_chroma_8x8,
-    IntraLumaSpec, IntraMacroblock, Residual4x4Scan,
+    decode_i_slice, decode_inter_p_l0_16x16_mb, decode_intra_16x16_mb, decode_intra_4x4_mb,
+    decode_intra_chroma_8x8, IntraLumaSpec, IntraMacroblock, Residual4x4Scan,
 };
 pub use dpb::{Dpb, DpbEntry, DpbError};
 pub use intra_mode::{
