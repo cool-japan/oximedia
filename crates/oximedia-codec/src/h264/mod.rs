@@ -40,6 +40,7 @@
 //! management) extends the workspace; this module stays parsing-only.
 
 pub mod bit_reader;
+pub mod macroblock;
 pub mod pps;
 pub mod rbsp;
 pub mod scaling_list;
@@ -48,6 +49,10 @@ pub mod sps;
 pub mod vui;
 
 pub use bit_reader::BitReader;
+pub use macroblock::{
+    parse_macroblock_layer, InterMotionInfo, Intra16x16PredMode, IntraChromaPredMode,
+    IntraNxNPredInfo, MacroblockLayer, MbType, MotionVectorDelta, SubMbType,
+};
 pub use pps::{parse_pps, PpsRbsp};
 pub use rbsp::{strip_emulation_prevention, trailing_bits_len};
 pub use scaling_list::{
