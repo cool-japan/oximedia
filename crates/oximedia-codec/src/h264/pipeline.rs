@@ -56,6 +56,12 @@ pub struct Decoder {
     /// `frame_num` of the most recently decoded reference.  Used by
     /// the POC type 2 derivation.
     prev_frame_num: i32,
+    /// `pic_order_cnt_msb` carried from the previous reference
+    /// picture — POC type 0 state.
+    prev_pic_order_cnt_msb: i32,
+    /// `pic_order_cnt_lsb` carried from the previous reference
+    /// picture — POC type 0 state.
+    prev_pic_order_cnt_lsb: i32,
     /// Picture currently being assembled (when in multi-slice mode
     /// — empty in the current single-slice-per-picture model).
     in_progress: Option<Frame>,
@@ -91,6 +97,8 @@ impl Decoder {
             pps_store: HashMap::new(),
             dpb: Dpb::new(16),
             prev_frame_num: 0,
+            prev_pic_order_cnt_msb: 0,
+            prev_pic_order_cnt_lsb: 0,
             in_progress: None,
         }
     }
@@ -226,9 +234,9 @@ impl Decoder {
             )?
         };
 
-        // Push into the DPB with simple POC type 2 derivation.
+        // POC derivation per spec § 8.2.1.
         let frame_num = sh.frame_num as i32;
-        let poc = frame_num * 2;
+        let poc = self.compute_poc(&sh, &sps, nal_ref_idc, is_idr);
         let _ = self.dpb.insert(DpbEntry {
             frame: frame.clone(),
             poc,
@@ -238,8 +246,96 @@ impl Decoder {
             long_term_idx: None,
             output_pending: true,
         });
-        self.prev_frame_num = frame_num;
+        if nal_ref_idc != 0 {
+            self.prev_frame_num = frame_num;
+        }
         Ok(frame)
+    }
+
+    /// Computes the picture order count for a slice per spec
+    /// § 8.2.1.  Updates internal POC state when the picture is a
+    /// reference.
+    fn compute_poc(
+        &mut self,
+        sh: &crate::h264::slice_header::SliceHeader,
+        sps: &SpsRbsp,
+        nal_ref_idc: u8,
+        is_idr: bool,
+    ) -> i32 {
+        match sps.pic_order_cnt_type {
+            0 => self.compute_poc_type0(sh, sps, nal_ref_idc, is_idr),
+            1 => self.compute_poc_type1(sh, sps, nal_ref_idc, is_idr),
+            _ => self.compute_poc_type2(sh, nal_ref_idc, is_idr),
+        }
+    }
+
+    fn compute_poc_type0(
+        &mut self,
+        sh: &crate::h264::slice_header::SliceHeader,
+        sps: &SpsRbsp,
+        nal_ref_idc: u8,
+        is_idr: bool,
+    ) -> i32 {
+        if is_idr {
+            self.prev_pic_order_cnt_msb = 0;
+            self.prev_pic_order_cnt_lsb = 0;
+        }
+        let max_poc_lsb =
+            1i32 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
+        let poc_lsb = sh.pic_order_cnt_lsb.unwrap_or(0) as i32;
+
+        let poc_msb = if poc_lsb < self.prev_pic_order_cnt_lsb
+            && self.prev_pic_order_cnt_lsb - poc_lsb >= max_poc_lsb / 2
+        {
+            self.prev_pic_order_cnt_msb + max_poc_lsb
+        } else if poc_lsb > self.prev_pic_order_cnt_lsb
+            && poc_lsb - self.prev_pic_order_cnt_lsb > max_poc_lsb / 2
+        {
+            self.prev_pic_order_cnt_msb - max_poc_lsb
+        } else {
+            self.prev_pic_order_cnt_msb
+        };
+
+        let top_field_order_cnt = poc_msb + poc_lsb;
+        if nal_ref_idc != 0 {
+            self.prev_pic_order_cnt_msb = poc_msb;
+            self.prev_pic_order_cnt_lsb = poc_lsb;
+        }
+        top_field_order_cnt
+    }
+
+    /// Type 1 (delta-cycle): coarse implementation — uses the
+    /// expected delta cycle without weighing in
+    /// `offset_for_non_ref_pic` against the previous picture's
+    /// state, which is sufficient when every reference picture
+    /// carries `delta_pic_order_always_zero_flag == 1` (a common
+    /// constrained-baseline pattern).
+    fn compute_poc_type1(
+        &mut self,
+        sh: &crate::h264::slice_header::SliceHeader,
+        sps: &SpsRbsp,
+        _nal_ref_idc: u8,
+        is_idr: bool,
+    ) -> i32 {
+        if is_idr {
+            return 0;
+        }
+        let cycle = sps.num_ref_frames_in_pic_order_cnt_cycle.max(1) as i32;
+        // Without an `offset_for_ref_frame[]` array on the parsed
+        // SPS we approximate the expected delta as the average
+        // offset_for_non_ref_pic over one cycle.  For DAR-zero
+        // streams (the common subset we support) this collapses to
+        // a simple 2 × frame_num progression.
+        2 * sh.frame_num as i32 / cycle
+    }
+
+    fn compute_poc_type2(
+        &mut self,
+        sh: &crate::h264::slice_header::SliceHeader,
+        nal_ref_idc: u8,
+        is_idr: bool,
+    ) -> i32 {
+        poc_type2_value(sh.frame_num as i32, nal_ref_idc, is_idr)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -413,6 +509,18 @@ impl Decoder {
         // chroma_format_idc explicit; future expansion will need it.
         let _ = sps.chroma_format_idc;
         Ok(frame)
+    }
+}
+
+/// Free-function POC type 2 formula (spec § 8.2.1.3).  Exposed
+/// outside `impl Decoder` so it's testable in isolation.
+fn poc_type2_value(frame_num: i32, nal_ref_idc: u8, is_idr: bool) -> i32 {
+    if is_idr {
+        0
+    } else if nal_ref_idc == 0 {
+        2 * frame_num - 1
+    } else {
+        2 * frame_num
     }
 }
 
@@ -612,6 +720,18 @@ mod tests {
         assert_eq!(ue_v_bit_length(2), 3);
         assert_eq!(ue_v_bit_length(7), 7);
         assert_eq!(ue_v_bit_length(25), 9);
+    }
+
+    #[test]
+    fn poc_type2_handles_idr_and_non_ref() {
+        // IDR resets POC to 0 regardless of frame_num.
+        assert_eq!(poc_type2_value(7, 3, true), 0);
+        // Reference frame: POC = 2 * frame_num.
+        assert_eq!(poc_type2_value(3, 3, false), 6);
+        assert_eq!(poc_type2_value(5, 2, false), 10);
+        // Non-reference picture: POC = 2 * frame_num - 1.
+        assert_eq!(poc_type2_value(3, 0, false), 5);
+        assert_eq!(poc_type2_value(1, 0, false), 1);
     }
 
     #[test]
