@@ -41,6 +41,7 @@
 
 pub mod bit_reader;
 pub mod cavlc;
+pub mod deblock;
 pub mod decoder;
 pub mod frame;
 pub mod intra_mode;
@@ -57,6 +58,10 @@ pub mod transform;
 pub mod vui;
 
 pub use bit_reader::BitReader;
+pub use deblock::{
+    alpha_threshold, beta_threshold, boundary_strength, normal_filter_line, should_filter_line,
+    strong_filter_line, DeblockBlockInfo,
+};
 pub use cavlc::{
     decode_residual_block, read_coeff_token, read_level, read_residual_block, read_run_before,
     read_total_zeros_chroma_dc, read_total_zeros_luma, update_suffix_length, BlockKind,
