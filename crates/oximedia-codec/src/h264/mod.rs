@@ -58,6 +58,8 @@ pub mod decoder;
 pub mod dpb;
 pub mod frame;
 pub mod inter_cache;
+#[cfg(test)]
+mod integration;
 pub mod intra_mode;
 pub mod intra_pred;
 pub mod macroblock;
