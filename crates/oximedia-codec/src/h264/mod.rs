@@ -53,6 +53,7 @@ pub mod deblock;
 pub mod decoder;
 pub mod dpb;
 pub mod frame;
+pub mod inter_cache;
 pub mod intra_mode;
 pub mod intra_pred;
 pub mod macroblock;
@@ -102,6 +103,7 @@ pub use decoder::{
     Residual4x4Scan,
 };
 pub use dpb::{Dpb, DpbEntry, DpbError};
+pub use inter_cache::{InterMbDecoded, InterSliceCache, LeftColSlot, TopRowSlot};
 pub use intra_mode::{
     most_probable_mode, resolve_intra4x4_mode, Intra4x4ModeContext,
 };
