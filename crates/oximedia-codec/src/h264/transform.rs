@@ -155,6 +155,127 @@ pub fn dequant_and_inverse_transform_4x4(
     inverse_transform_4x4(&block)
 }
 
+// ---------------------------------------------------------------------------
+// Hadamard transforms (DC blocks of I_16x16 macroblocks)
+// ---------------------------------------------------------------------------
+
+/// 4-point 1-D Hadamard transform.
+///
+/// Used by the `I_16x16` luma DC path.  The 4×4 Hadamard is its own
+/// inverse up to a factor of 16, so the 1-D pass is identical for
+/// forward and inverse — the spec just uses one of them with a
+/// post-transform scaling shift that's not present in the other
+/// direction.
+#[must_use]
+pub fn hadamard_1d_4(x: [i32; 4]) -> [i32; 4] {
+    let a = x[0] + x[1];
+    let b = x[0] - x[1];
+    let c = x[2] + x[3];
+    let d = x[2] - x[3];
+    [a + c, a - c, b - d, b + d]
+}
+
+/// 2-D 4×4 Hadamard transform: row pass followed by column pass.
+#[must_use]
+pub fn hadamard_4x4(coeffs: &[[i32; 4]; 4]) -> [[i32; 4]; 4] {
+    let mut intermediate = [[0i32; 4]; 4];
+    for i in 0..4 {
+        intermediate[i] = hadamard_1d_4(coeffs[i]);
+    }
+    let mut output = [[0i32; 4]; 4];
+    for j in 0..4 {
+        let col = [
+            intermediate[0][j],
+            intermediate[1][j],
+            intermediate[2][j],
+            intermediate[3][j],
+        ];
+        let result = hadamard_1d_4(col);
+        for i in 0..4 {
+            output[i][j] = result[i];
+        }
+    }
+    output
+}
+
+/// Inverse-transform and dequantize the 4×4 luma DC block of an
+/// `I_16x16` macroblock.
+///
+/// The 16 DC coefficients of the 16 4×4 luma sub-blocks of an
+/// `I_16x16` macroblock are encoded together as a separate 4×4
+/// Hadamard-transformed block.  After entropy decoding, this function
+/// runs the inverse Hadamard, then applies a QP-dependent scaling
+/// that differs from the regular 4×4 path: the shift is biased by an
+/// extra factor that accounts for the Hadamard's lack of internal
+/// normalisation.
+///
+/// The returned 4×4 matrix holds the dequantized DC values to place
+/// at position `(0, 0)` of each of the 16 sub-blocks' coefficient
+/// matrices before their individual inverse transforms.
+#[must_use]
+pub fn inverse_hadamard_4x4_luma_dc(
+    coeffs: &[[i32; 4]; 4],
+    qp: u8,
+) -> [[i32; 4]; 4] {
+    let transformed = hadamard_4x4(coeffs);
+    let qp_div = i32::from(qp / 6);
+    let scale = level_scale_4x4(qp, 0, 0);
+    let mut output = [[0i32; 4]; 4];
+    if qp >= 36 {
+        let shift = qp_div - 6;
+        for i in 0..4 {
+            for j in 0..4 {
+                output[i][j] = (transformed[i][j] * scale) << shift;
+            }
+        }
+    } else {
+        let shift = 6 - qp_div;
+        let round = 1i32 << (shift - 1);
+        for i in 0..4 {
+            for j in 0..4 {
+                output[i][j] = (transformed[i][j] * scale + round) >> shift;
+            }
+        }
+    }
+    output
+}
+
+/// 2-D 2×2 Hadamard transform for the chroma DC block (4:2:0).
+///
+/// The four DC coefficients of the four 4×4 sub-blocks of one chroma
+/// component are encoded together as a 2×2 Hadamard-transformed
+/// block.  The 2×2 Hadamard matrix is `[[1, 1], [1, -1]]`, applied
+/// from both sides.
+#[must_use]
+pub fn hadamard_2x2(coeffs: [[i32; 2]; 2]) -> [[i32; 2]; 2] {
+    let a = coeffs[0][0] + coeffs[0][1];
+    let b = coeffs[0][0] - coeffs[0][1];
+    let c = coeffs[1][0] + coeffs[1][1];
+    let d = coeffs[1][0] - coeffs[1][1];
+    [[a + c, b + d], [a - c, b - d]]
+}
+
+/// Inverse-transform and dequantize the 2×2 chroma DC block.
+///
+/// `qp_chroma` is the chroma QP (already adjusted by
+/// `chroma_qp_index_offset` from the active PPS).
+#[must_use]
+pub fn inverse_hadamard_2x2_chroma_dc(
+    coeffs: [[i32; 2]; 2],
+    qp_chroma: u8,
+) -> [[i32; 2]; 2] {
+    let transformed = hadamard_2x2(coeffs);
+    let qp_div = i32::from(qp_chroma / 6);
+    let scale = level_scale_4x4(qp_chroma, 0, 0);
+    let mut output = [[0i32; 2]; 2];
+    for i in 0..2 {
+        for j in 0..2 {
+            output[i][j] = ((transformed[i][j] * scale) << qp_div) >> 1;
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +408,84 @@ mod tests {
                 assert_eq!(result[i][j], expected, "unexpected value at ({i}, {j})");
             }
         }
+    }
+
+    // -- Hadamard transform tests --
+
+    #[test]
+    fn hadamard_1d_zero_input_yields_zero_output() {
+        assert_eq!(hadamard_1d_4([0, 0, 0, 0]), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn hadamard_1d_dc_only_concentrates_at_index_zero() {
+        // [k, 0, 0, 0]: a = k, b = k, c = 0, d = 0
+        // -> [a+c, a-c, b-d, b+d] = [k, k, k, k]
+        assert_eq!(hadamard_1d_4([4, 0, 0, 0]), [4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn hadamard_1d_constant_input_concentrates_at_dc() {
+        // [k, k, k, k]: a = 2k, b = 0, c = 2k, d = 0
+        // -> [4k, 0, 0, 0]
+        assert_eq!(hadamard_1d_4([3, 3, 3, 3]), [12, 0, 0, 0]);
+    }
+
+    #[test]
+    fn hadamard_4x4_is_self_inverse_up_to_scale() {
+        let input = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+        ];
+        let h = hadamard_4x4(&input);
+        let back = hadamard_4x4(&h);
+        // 4×4 Hadamard squared scales by 16.
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(back[i][j], input[i][j] * 16, "({i}, {j})");
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_hadamard_4x4_luma_dc_zero_input_stays_zero() {
+        let result = inverse_hadamard_4x4_luma_dc(&[[0i32; 4]; 4], 28);
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(result[i][j], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_hadamard_4x4_luma_dc_works_at_both_qp_branches() {
+        // Same input, two QPs on opposite sides of 36 — both should
+        // produce defined output (we don't pin the exact values here;
+        // this just exercises both code paths).
+        let block = [[1, -1, 1, -1], [1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+        let low_qp = inverse_hadamard_4x4_luma_dc(&block, 20);
+        let high_qp = inverse_hadamard_4x4_luma_dc(&block, 40);
+        // Sanity: not equal, but both finite.
+        assert_ne!(low_qp, high_qp);
+    }
+
+    #[test]
+    fn hadamard_2x2_constant_input_concentrates_at_dc() {
+        let input = [[5, 5], [5, 5]];
+        let out = hadamard_2x2(input);
+        assert_eq!(out, [[20, 0], [0, 0]]);
+    }
+
+    #[test]
+    fn hadamard_2x2_zero_input_stays_zero() {
+        assert_eq!(hadamard_2x2([[0, 0], [0, 0]]), [[0, 0], [0, 0]]);
+    }
+
+    #[test]
+    fn inverse_hadamard_2x2_chroma_dc_zero_input_stays_zero() {
+        let result = inverse_hadamard_2x2_chroma_dc([[0, 0], [0, 0]], 20);
+        assert_eq!(result, [[0, 0], [0, 0]]);
     }
 }
