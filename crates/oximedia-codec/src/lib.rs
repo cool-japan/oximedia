@@ -277,6 +277,7 @@ pub mod frame;
 pub mod frame_queue;
 pub mod frame_types;
 pub mod gop_structure;
+pub mod h264;
 pub mod hdr;
 pub mod intra;
 pub mod motion;
