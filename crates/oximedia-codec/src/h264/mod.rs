@@ -47,6 +47,7 @@ pub mod rbsp;
 pub mod scaling_list;
 pub mod slice_header;
 pub mod sps;
+pub mod transform;
 pub mod vui;
 
 pub use bit_reader::BitReader;
@@ -70,6 +71,10 @@ pub use slice_header::{
     RefPicListModification, SliceHeader, SliceType, WeightEntry,
 };
 pub use sps::{parse_sps, SpsRbsp};
+pub use transform::{
+    dequant_and_inverse_transform_4x4, dequantize_4x4, inverse_scan_4x4, inverse_transform_1d_4,
+    inverse_transform_4x4, level_scale_4x4,
+};
 pub use vui::{
     parse_vui, AspectRatioInfo, BitstreamRestriction, ChromaLocInfo, ColourDescription,
     CpbSchedule, ExtendedSar, HrdParameters, TimingInfo, VideoSignalType, VuiParameters,
