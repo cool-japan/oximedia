@@ -136,21 +136,52 @@ fn build_test_pattern() -> TestPattern {
 /// PPS, and one IDR slice with a single `I_PCM` macroblock.
 fn encode_minimal_idr_i_pcm(pattern: &TestPattern) -> Vec<u8> {
     let mut out = Vec::new();
-    // SPS NAL: forbidden_zero_bit = 0, nal_ref_idc = 3, type = 7.
     out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     out.push(0x67);
     out.extend(encode_sps_rbsp());
 
-    // PPS NAL: type = 8.
     out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     out.push(0x68);
     out.extend(encode_pps_rbsp());
 
-    // IDR slice NAL: type = 5, nal_ref_idc = 3.
     out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     out.push(0x65);
     out.extend(encode_idr_i_pcm_slice_rbsp(pattern));
 
+    out
+}
+
+/// Encodes a bare IDR slice NAL with explicit frame_num /
+/// idr_pic_id — used to build multi-frame streams.
+fn encode_idr_nal_only(pattern: &TestPattern, frame_num: u32, idr_pic_id: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    out.push(0x65);
+    let rbsp = encode_idr_i_pcm_slice_rbsp_at(pattern, frame_num, idr_pic_id);
+    out.extend(escape_emulation_prevention(&rbsp));
+    out
+}
+
+/// Inserts H.264 emulation-prevention bytes into a raw RBSP byte
+/// stream: any `0x00 0x00 ≤0x03` triplet gets a `0x03` byte
+/// spliced between the two zeros and the trailing byte so the
+/// downstream Annex-B parser correctly recovers the original data
+/// via `strip_emulation_prevention`.
+fn escape_emulation_prevention(rbsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rbsp.len() + rbsp.len() / 16);
+    let mut zeros = 0usize;
+    for &b in rbsp {
+        if zeros >= 2 && b <= 0x03 {
+            out.push(0x03);
+            zeros = 0;
+        }
+        out.push(b);
+        if b == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+    }
     out
 }
 
@@ -201,27 +232,30 @@ fn encode_pps_rbsp() -> Vec<u8> {
 
 /// IDR slice header + slice data: one I_PCM macroblock.
 fn encode_idr_i_pcm_slice_rbsp(pattern: &TestPattern) -> Vec<u8> {
+    encode_idr_i_pcm_slice_rbsp_at(pattern, 0, 0)
+}
+
+/// Same as [`encode_idr_i_pcm_slice_rbsp`] but takes an explicit
+/// `frame_num` and `idr_pic_id` so the caller can build a
+/// multi-frame Annex-B stream where each IDR distinguishes
+/// itself.
+fn encode_idr_i_pcm_slice_rbsp_at(
+    pattern: &TestPattern,
+    frame_num: u32,
+    idr_pic_id: u32,
+) -> Vec<u8> {
     let mut bits = BitWriter::new();
-    // Slice header.
     bits.ue(0); // first_mb_in_slice = 0
     bits.ue(7); // slice_type = 7 (I, all-I slices)
     bits.ue(0); // pic_parameter_set_id = 0
-    bits.write(4, 0); // frame_num (log2_max_frame_num_minus4 = 0)
-    bits.ue(0); // idr_pic_id = 0
-    // No pic_order_cnt fields: pic_order_cnt_type == 2 + frame_mbs_only,
-    // so pic_order_cnt_lsb is absent and the parser infers POC.
-    // dec_ref_pic_marking (IDR variant): 2 flags.
+    bits.write(4, frame_num); // log2_max_frame_num_minus4 = 0 → 4 bits
+    bits.ue(idr_pic_id);
     bits.write(1, 0); // no_output_of_prior_pics_flag
     bits.write(1, 0); // long_term_reference_flag
     bits.se(0); // slice_qp_delta = 0
 
-    // Slice data: one I_PCM macroblock.
-    // mb_type ue(v) = 25 → exp-Golomb codeword length 9 bits
-    // (prefix `0000` + 1-bit + 4-bit suffix `1001`):
-    bits.ue(25);
-    // PCM alignment: pcm_alignment_zero_bit until byte aligned.
+    bits.ue(25); // I_PCM mb_type
     bits.align_byte_with(false);
-    // Raw PCM samples.
     for &b in pattern.luma.iter() {
         bits.write(8, b as u32);
     }
@@ -231,9 +265,6 @@ fn encode_idr_i_pcm_slice_rbsp(pattern: &TestPattern) -> Vec<u8> {
     for &b in pattern.cr.iter() {
         bits.write(8, b as u32);
     }
-    // After PCM the slice ends — no further RBSP trailing bits;
-    // spec § 7.3.5.1 ends the slice loop after PCM.  Add a final
-    // stop bit + alignment so the parser sees a well-formed RBSP.
     bits.rbsp_trailing();
     bits.into_bytes()
 }
@@ -457,4 +488,133 @@ fn decoder_handles_sps_pps_only_without_frame_output() {
     let mut decoder = Decoder::new();
     let frames = decoder.feed_annex_b(&trimmed).expect("feed");
     assert!(frames.is_empty(), "SPS+PPS only must not emit a frame");
+}
+
+#[test]
+fn decoder_handles_multi_frame_idr_sequence() {
+    // Build three IDR pictures each with a distinct I_PCM pattern,
+    // streamed back-to-back through Decoder::feed_annex_b.  The
+    // SPS + PPS appear once; subsequent IDRs reuse them.  Verifies:
+    //
+    // - NAL extraction across multiple frames (start-code scan).
+    // - SPS / PPS persistence across slices.
+    // - DPB grows by one short-term reference per emitted frame.
+    // - Each decoded frame contains the pattern its IDR carried.
+    let pattern_a = build_test_pattern();
+    let pattern_b = TestPattern {
+        luma: core::array::from_fn(|i| (255 - i) as u8),
+        cb: core::array::from_fn(|i| (i * 3) as u8),
+        cr: core::array::from_fn(|i| (200 - i) as u8),
+    };
+    let pattern_c = TestPattern {
+        luma: [42u8; 256],
+        cb: [80u8; 64],
+        cr: [180u8; 64],
+    };
+
+    let mut bitstream = Vec::new();
+    // SPS + PPS (once).
+    bitstream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    bitstream.push(0x67);
+    bitstream.extend(encode_sps_rbsp());
+    bitstream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    bitstream.push(0x68);
+    bitstream.extend(encode_pps_rbsp());
+    // Three IDR NALs.  Each IDR resets frame_num to 0 (spec), so
+    // we pass 0 for every one.  idr_pic_id is the only field that
+    // distinguishes them on the bitstream side.
+    bitstream.extend(encode_idr_nal_only(&pattern_a, 0, 0));
+    bitstream.extend(encode_idr_nal_only(&pattern_b, 0, 1));
+    bitstream.extend(encode_idr_nal_only(&pattern_c, 0, 2));
+
+    let mut decoder = Decoder::new();
+    let frames = decoder.feed_annex_b(&bitstream).expect("feed");
+    assert_eq!(frames.len(), 3, "three IDR pictures should produce three frames");
+
+    // Each frame must carry its IDR's pattern, byte-for-byte.
+    for (frame, pattern) in frames.iter().zip([&pattern_a, &pattern_b, &pattern_c]) {
+        for j in 0..16 {
+            for i in 0..16 {
+                assert_eq!(
+                    frame.get_luma(i, j),
+                    Some(pattern.luma[j * 16 + i]),
+                    "luma mismatch in multi-frame at ({i}, {j})"
+                );
+            }
+        }
+        for j in 0..8 {
+            for i in 0..8 {
+                assert_eq!(frame.get_cb(i, j), Some(pattern.cb[j * 8 + i]));
+                assert_eq!(frame.get_cr(i, j), Some(pattern.cr[j * 8 + i]));
+            }
+        }
+    }
+
+    // DPB now holds three short-term references.
+    assert_eq!(decoder.dpb().entries.len(), 3);
+    for entry in &decoder.dpb().entries {
+        assert!(entry.is_short_term_reference);
+    }
+}
+
+#[test]
+fn decoder_skips_aud_and_sei_nals() {
+    // Insert an AUD before the IDR and an SEI between the PPS and
+    // IDR.  Decoder must skip them silently and still produce the
+    // exact same frame as the no-AUD/SEI baseline.
+    let pattern = build_test_pattern();
+    let mut bitstream = Vec::new();
+    // AUD NAL: nal_unit_type = 9.  Body is "primary_pic_type" u(3)
+    // + rbsp_trailing — `0xF0` covers it.
+    bitstream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0xF0]);
+
+    bitstream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    bitstream.push(0x67);
+    bitstream.extend(encode_sps_rbsp());
+
+    bitstream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    bitstream.push(0x68);
+    bitstream.extend(encode_pps_rbsp());
+
+    // SEI NAL: nal_unit_type = 6.  Two-byte payload (filler
+    // payload type) + trailing bits.
+    bitstream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x06, 0x00, 0x80]);
+
+    bitstream.extend(encode_idr_nal_only(&pattern, 0, 0));
+
+    let mut decoder = Decoder::new();
+    let frames = decoder.feed_annex_b(&bitstream).expect("feed");
+    assert_eq!(frames.len(), 1, "AUD + SEI shouldn't add or drop frames");
+    for j in 0..16 {
+        for i in 0..16 {
+            assert_eq!(
+                frames[0].get_luma(i, j),
+                Some(pattern.luma[j * 16 + i])
+            );
+        }
+    }
+}
+
+#[test]
+fn decoder_poc_advances_across_idrs() {
+    // Each IDR resets POC to 0 (spec § 8.2.1).  Three IDRs in a
+    // row should leave every DPB entry at POC 0 — this catches a
+    // regression where prev_pic_order_cnt_msb / _lsb might leak
+    // across IDR resets.
+    let pattern = build_test_pattern();
+    let mut bitstream = Vec::new();
+    bitstream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    bitstream.push(0x67);
+    bitstream.extend(encode_sps_rbsp());
+    bitstream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    bitstream.push(0x68);
+    bitstream.extend(encode_pps_rbsp());
+    bitstream.extend(encode_idr_nal_only(&pattern, 0, 0));
+    bitstream.extend(encode_idr_nal_only(&pattern, 0, 1));
+
+    let mut decoder = Decoder::new();
+    decoder.feed_annex_b(&bitstream).expect("feed");
+    for entry in &decoder.dpb().entries {
+        assert_eq!(entry.poc, 0, "IDR POC must always be 0");
+    }
 }
