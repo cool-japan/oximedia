@@ -433,11 +433,15 @@ fn decode_chroma_residual_inline(
         coded_block_flag_ctx(3, cb_nz_a, cb_nz_b),
         coded_block_flag_ctx(3, cr_nz_a, cr_nz_b),
     ];
+    // Chroma DC for 4:2:0 is a 2×2 block of DC coefficients
+    // decoded in raster order — the scan is the identity map
+    // [0, 1, 2, 3], not the 4×4 zig-zag.
+    let chroma_dc_scan: [u8; 4] = [0, 1, 2, 3];
     for plane in 0..2 {
         let params = ResidualParams {
             cat: 3,
             cbf_ctx: dc_ctxs[plane],
-            scantable: ctx.scan_4x4,
+            scantable: &chroma_dc_scan,
             qmul: None,
             max_coeff: 4,
             is_dc: true,
