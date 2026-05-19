@@ -167,6 +167,196 @@ pub fn normal_filter_line(samples: [u8; 4], tc0: u8) -> [u8; 4] {
     [samples[0], p0_new, q0_new, samples[3]]
 }
 
+/// Applies the in-loop deblocking filter to one 16×16 luma
+/// macroblock in place.
+///
+/// `block_info[idx]` is the [`DeblockBlockInfo`] for the 4×4 sub-
+/// block at raster index `idx` (0..=15) of the macroblock.  The
+/// caller also supplies `is_left_neighbour_intra` and
+/// `is_above_neighbour_intra` so the edge between this MB and its
+/// already-decoded neighbours can be filtered at the correct
+/// boundary strength.
+///
+/// Internal block-edge boundary strengths are computed pairwise
+/// from `block_info`; external edge strengths are computed against
+/// the neighbour-side flags the caller supplied.
+///
+/// The filter is the normal short-tap variant; the wider strong-
+/// filter variant (boundary strength 4) is reserved for slice-
+/// internal macroblock edges where either side is intra, and the
+/// MB-level pass calls `strong_filter_line` for those.
+///
+/// `qp` is the macroblock's luma QP (which the alpha / beta
+/// thresholds are derived from).
+///
+/// `tc0_table` is a small lookup that selects per-(bS, qp) clipping
+/// values for the normal filter; supply the four-entry array
+/// `[tc0_for_bs_1, tc0_for_bs_2, tc0_for_bs_3]` indexed by
+/// `bs - 1`.
+pub fn deblock_mb_luma(
+    mb: &mut [[u8; 16]; 16],
+    block_info: &[DeblockBlockInfo; 16],
+    is_left_neighbour_intra: bool,
+    is_above_neighbour_intra: bool,
+    qp: u8,
+    tc0_table: [u8; 3],
+) {
+    let alpha = alpha_threshold(qp);
+    let beta = beta_threshold(qp);
+
+    // Vertical edges (one per 4-pixel column of 4×4 boundaries).
+    for vert_idx in 0..4 {
+        let edge_x = vert_idx * 4;
+        let is_external = vert_idx == 0;
+        for row in 0..16 {
+            let block_idx_right = (row / 4) * 4 + vert_idx;
+            let bs = if is_external {
+                if is_left_neighbour_intra || block_info[block_idx_right].is_intra {
+                    4
+                } else {
+                    boundary_strength(
+                        DeblockBlockInfo {
+                            is_intra: is_left_neighbour_intra,
+                            ..Default::default()
+                        },
+                        block_info[block_idx_right],
+                        true,
+                    )
+                }
+            } else {
+                let block_idx_left = (row / 4) * 4 + (vert_idx - 1);
+                boundary_strength(block_info[block_idx_left], block_info[block_idx_right], false)
+            };
+            if bs == 0 {
+                continue;
+            }
+            apply_edge_filter_vertical(
+                mb,
+                edge_x,
+                row,
+                bs,
+                alpha,
+                beta,
+                tc0_table,
+            );
+        }
+    }
+
+    // Horizontal edges (same structure, transposed).
+    for horiz_idx in 0..4 {
+        let edge_y = horiz_idx * 4;
+        let is_external = horiz_idx == 0;
+        for col in 0..16 {
+            let block_idx_below = horiz_idx * 4 + (col / 4);
+            let bs = if is_external {
+                if is_above_neighbour_intra || block_info[block_idx_below].is_intra {
+                    4
+                } else {
+                    boundary_strength(
+                        DeblockBlockInfo {
+                            is_intra: is_above_neighbour_intra,
+                            ..Default::default()
+                        },
+                        block_info[block_idx_below],
+                        true,
+                    )
+                }
+            } else {
+                let block_idx_above = (horiz_idx - 1) * 4 + (col / 4);
+                boundary_strength(block_info[block_idx_above], block_info[block_idx_below], false)
+            };
+            if bs == 0 {
+                continue;
+            }
+            apply_edge_filter_horizontal(
+                mb,
+                col,
+                edge_y,
+                bs,
+                alpha,
+                beta,
+                tc0_table,
+            );
+        }
+    }
+}
+
+fn apply_edge_filter_vertical(
+    mb: &mut [[u8; 16]; 16],
+    edge_x: usize,
+    row: usize,
+    bs: u8,
+    alpha: u8,
+    beta: u8,
+    tc0_table: [u8; 3],
+) {
+    if edge_x < 2 || edge_x + 1 >= 16 {
+        return;
+    }
+    let p1 = mb[row][edge_x - 2];
+    let p0 = mb[row][edge_x - 1];
+    let q0 = mb[row][edge_x];
+    let q1 = mb[row][edge_x + 1];
+    if !should_filter_line(p1, p0, q0, q1, alpha, beta) {
+        return;
+    }
+    if bs == 4 {
+        if edge_x < 3 || edge_x + 2 >= 16 {
+            return;
+        }
+        let p2 = mb[row][edge_x - 3];
+        let q2 = mb[row][edge_x + 2];
+        let out = strong_filter_line([p2, p1, p0, q0, q1, q2]);
+        mb[row][edge_x - 2] = out[1];
+        mb[row][edge_x - 1] = out[2];
+        mb[row][edge_x] = out[3];
+        mb[row][edge_x + 1] = out[4];
+    } else {
+        let tc0 = tc0_table[(bs - 1) as usize];
+        let out = normal_filter_line([p1, p0, q0, q1], tc0);
+        mb[row][edge_x - 1] = out[1];
+        mb[row][edge_x] = out[2];
+    }
+}
+
+fn apply_edge_filter_horizontal(
+    mb: &mut [[u8; 16]; 16],
+    col: usize,
+    edge_y: usize,
+    bs: u8,
+    alpha: u8,
+    beta: u8,
+    tc0_table: [u8; 3],
+) {
+    if edge_y < 2 || edge_y + 1 >= 16 {
+        return;
+    }
+    let p1 = mb[edge_y - 2][col];
+    let p0 = mb[edge_y - 1][col];
+    let q0 = mb[edge_y][col];
+    let q1 = mb[edge_y + 1][col];
+    if !should_filter_line(p1, p0, q0, q1, alpha, beta) {
+        return;
+    }
+    if bs == 4 {
+        if edge_y < 3 || edge_y + 2 >= 16 {
+            return;
+        }
+        let p2 = mb[edge_y - 3][col];
+        let q2 = mb[edge_y + 2][col];
+        let out = strong_filter_line([p2, p1, p0, q0, q1, q2]);
+        mb[edge_y - 2][col] = out[1];
+        mb[edge_y - 1][col] = out[2];
+        mb[edge_y][col] = out[3];
+        mb[edge_y + 1][col] = out[4];
+    } else {
+        let tc0 = tc0_table[(bs - 1) as usize];
+        let out = normal_filter_line([p1, p0, q0, q1], tc0);
+        mb[edge_y - 1][col] = out[1];
+        mb[edge_y][col] = out[2];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +485,57 @@ mod tests {
         let out = normal_filter_line([50, 60, 100, 110], 1);
         // Delta is clamped to ±1, so p0 += 1, q0 -= 1.
         assert_eq!(out, [50, 61, 99, 110]);
+    }
+
+    // -- MB-level deblock pass tests --
+
+    fn smooth_mb() -> [[u8; 16]; 16] {
+        // All-128 block: no gradients across any edge, filter should
+        // not change anything.
+        [[128u8; 16]; 16]
+    }
+
+    fn smooth_block_info() -> [DeblockBlockInfo; 16] {
+        let inter = DeblockBlockInfo {
+            is_intra: false,
+            has_residual: false,
+            ref_idx_l0: Some(0),
+            mv_l0: Some((0, 0)),
+        };
+        [inter; 16]
+    }
+
+    #[test]
+    fn deblock_mb_luma_constant_input_unchanged() {
+        let mut mb = smooth_mb();
+        let info = smooth_block_info();
+        deblock_mb_luma(&mut mb, &info, false, false, 28, [4, 4, 4]);
+        for row in &mb {
+            for &v in row {
+                assert_eq!(v, 128);
+            }
+        }
+    }
+
+    #[test]
+    fn deblock_mb_luma_skips_external_edge_at_picture_top_left() {
+        // At MB (0, 0) neighbours don't exist; the function should
+        // still complete without panicking.  Use intra blocks to
+        // force bS = 4 internally.
+        let mut mb = smooth_mb();
+        let intra = DeblockBlockInfo {
+            is_intra: true,
+            has_residual: true,
+            ..Default::default()
+        };
+        let info = [intra; 16];
+        deblock_mb_luma(&mut mb, &info, false, false, 28, [4, 4, 4]);
+        // Constant 128 should still be unchanged because gradients
+        // are zero everywhere.
+        for row in &mb {
+            for &v in row {
+                assert_eq!(v, 128);
+            }
+        }
     }
 }
