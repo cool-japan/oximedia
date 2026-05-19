@@ -72,6 +72,7 @@ pub mod pipeline;
 pub mod pps;
 pub mod rbsp;
 pub mod reconstruct_inter;
+pub mod reconstruct_intra_cabac;
 pub mod scaling_list;
 pub mod slice_cabac;
 pub mod slice_cavlc;

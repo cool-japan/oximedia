@@ -40,6 +40,10 @@ use crate::h264::rbsp::strip_emulation_prevention;
 use crate::h264::reconstruct_inter::{
     reconstruct_inter_p_mb, reconstruct_inter_p_mb_multiref, InterPMbInputs,
 };
+use crate::h264::reconstruct_intra_cabac::{
+    reconstruct_intra_16x16_mb_cabac, reconstruct_intra_4x4_mb_cabac,
+    reconstruct_intra_chroma_8x8_cabac,
+};
 use crate::h264::slice_cabac::{parse_slice_cabac, MbKind, SliceCabacContext};
 use crate::h264::slice_cavlc::{
     cavlc_block_to_position_4x4, cavlc_chroma_ac_to_position, cavlc_chroma_dc_to_position,
@@ -478,14 +482,8 @@ impl Decoder {
                         )?;
                     }
                 }
-                MbKind::Intra(_intra) => {
-                    // Intra reconstruction inside the CABAC slice
-                    // loop needs the per-block intra prediction
-                    // wiring already exposed in the CAVLC orchestrator;
-                    // wiring it through MbCabacDecoded is the next
-                    // task on the roadmap.  Fall back to mid-grey
-                    // so the picture has valid samples.
-                    fill_mid_grey(&mut frame, mb.mb_x, mb.mb_y);
+                MbKind::Intra(intra) => {
+                    reconstruct_intra_mb_cabac(&mut frame, mb, intra)?;
                 }
             }
         }
@@ -643,6 +641,148 @@ impl Decoder {
         let _ = sps.chroma_format_idc;
         Ok(frame)
     }
+}
+
+/// Dispatches a CABAC-decoded intra macroblock to the right
+/// reconstruction path: I_PCM is a no-op (the parser bypasses
+/// CABAC for PCM bytes — see [`crate::h264::pcm`]); I_NxN and
+/// I_16x16 walk through the per-block intra prediction + IDCT
+/// pipeline.  Chroma 8×8 reconstruction always runs (for non-PCM).
+fn reconstruct_intra_mb_cabac(
+    frame: &mut Frame,
+    mb: &crate::h264::slice_cabac::MbCabacDecoded,
+    intra: &crate::h264::cabac_mb::IntraMbCabac,
+) -> Result<(), CodecError> {
+    use crate::h264::cabac_syntax::IntraMbType;
+
+    let chroma_pred_mode =
+        chroma_pred_mode_from_raw(intra.chroma_pred_mode);
+    let chroma_dc_cb = chroma_dc_from_residual(&mb.residual.chroma_dc[0]);
+    let chroma_dc_cr = chroma_dc_from_residual(&mb.residual.chroma_dc[1]);
+    let chroma_ac_cb = extract_chroma_ac_plane(&mb.residual.chroma_ac, 0);
+    let chroma_ac_cr = extract_chroma_ac_plane(&mb.residual.chroma_ac, 1);
+
+    match intra.mb_type {
+        IntraMbType::IPCM => {
+            // I_PCM never reaches the slice_cabac orchestrator
+            // because CABAC bypasses the entropy coder for PCM
+            // bytes; the pipeline's CAVLC PCM passthrough handles
+            // it instead.  Leave the macroblock as-is.
+        }
+        IntraMbType::I4x4 => {
+            let modes = intra4x4_modes_from_raw(&intra.intra4x4_modes);
+            reconstruct_intra_4x4_mb_cabac(
+                frame,
+                mb.mb_x,
+                mb.mb_y,
+                &modes,
+                &mb.residual.luma_4x4,
+                mb.qp_y,
+            )?;
+            reconstruct_intra_chroma_8x8_cabac(
+                frame,
+                mb.mb_x,
+                mb.mb_y,
+                chroma_pred_mode,
+                &chroma_dc_cb,
+                &chroma_ac_cb,
+                mb.qp_chroma,
+                true,
+            )?;
+            reconstruct_intra_chroma_8x8_cabac(
+                frame,
+                mb.mb_x,
+                mb.mb_y,
+                chroma_pred_mode,
+                &chroma_dc_cr,
+                &chroma_ac_cr,
+                mb.qp_chroma,
+                false,
+            )?;
+        }
+        IntraMbType::I16x16 { pred_mode, .. } => {
+            let pred = intra16x16_pred_mode_from_raw(pred_mode);
+            reconstruct_intra_16x16_mb_cabac(
+                frame,
+                mb.mb_x,
+                mb.mb_y,
+                pred,
+                &mb.residual.luma_dc,
+                &mb.residual.luma_4x4,
+                mb.qp_y,
+            )?;
+            reconstruct_intra_chroma_8x8_cabac(
+                frame,
+                mb.mb_x,
+                mb.mb_y,
+                chroma_pred_mode,
+                &chroma_dc_cb,
+                &chroma_ac_cb,
+                mb.qp_chroma,
+                true,
+            )?;
+            reconstruct_intra_chroma_8x8_cabac(
+                frame,
+                mb.mb_x,
+                mb.mb_y,
+                chroma_pred_mode,
+                &chroma_dc_cr,
+                &chroma_ac_cr,
+                mb.qp_chroma,
+                false,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn chroma_pred_mode_from_raw(raw: u8) -> crate::h264::macroblock::IntraChromaPredMode {
+    use crate::h264::macroblock::IntraChromaPredMode;
+    match raw {
+        0 => IntraChromaPredMode::Dc,
+        1 => IntraChromaPredMode::Horizontal,
+        2 => IntraChromaPredMode::Vertical,
+        _ => IntraChromaPredMode::Plane,
+    }
+}
+
+fn intra16x16_pred_mode_from_raw(raw: u8) -> crate::h264::macroblock::Intra16x16PredMode {
+    use crate::h264::macroblock::Intra16x16PredMode;
+    match raw {
+        0 => Intra16x16PredMode::Vertical,
+        1 => Intra16x16PredMode::Horizontal,
+        2 => Intra16x16PredMode::Dc,
+        _ => Intra16x16PredMode::Plane,
+    }
+}
+
+fn intra4x4_modes_from_raw(raw: &[u8; 16]) -> [crate::h264::intra_pred::Intra4x4Mode; 16] {
+    use crate::h264::intra_pred::Intra4x4Mode;
+    let map = |r: u8| match r {
+        0 => Intra4x4Mode::Vertical,
+        1 => Intra4x4Mode::Horizontal,
+        2 => Intra4x4Mode::Dc,
+        3 => Intra4x4Mode::DiagonalDownLeft,
+        4 => Intra4x4Mode::DiagonalDownRight,
+        5 => Intra4x4Mode::VerticalRight,
+        6 => Intra4x4Mode::HorizontalDown,
+        7 => Intra4x4Mode::VerticalLeft,
+        _ => Intra4x4Mode::HorizontalUp,
+    };
+    let mut out = [Intra4x4Mode::Dc; 16];
+    for i in 0..16 {
+        out[i] = map(raw[i]);
+    }
+    out
+}
+
+fn chroma_dc_from_residual(plane: &[i32; 8]) -> [i32; 4] {
+    [plane[0], plane[1], plane[2], plane[3]]
+}
+
+fn extract_chroma_ac_plane(all: &[[i32; 16]; 8], plane: usize) -> [[i32; 16]; 4] {
+    let base = plane * 4;
+    [all[base], all[base + 1], all[base + 2], all[base + 3]]
 }
 
 fn build_luma_4x4(
