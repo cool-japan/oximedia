@@ -515,7 +515,8 @@ Progress tracking for 0.1.6 items. `[~]` = in progress, `[x]` = complete.
 | **AVX-512 SIMD paths** | **Implemented in 0.1.2 (foundation)** | `oximedia-simd`; `CpuFeatures` runtime detection; runtime dispatch via `multiversion` |
 | Python pip-installable package | 0.2.0 | PyO3 bindings complete; maturin packaging and PyPI publish remaining |
 | WASM/WebAssembly build support | 0.3.0 | Pure-Rust stack makes this feasible; needs `wasm32-unknown-unknown` CI |
-| Hardware H.264 encoding | 2027+ | Blocked on patent expiry (est. September 2027); feature-gated, separate repo `oximedia-avc` |
+| H.264 software decoder | **Landing in 0.1.7** | MPEG-LA AVC pool wound down Dec 2024; bulk of essential patents at or past 20-year terms. Full pipeline behind `oximedia_codec::h264::Decoder`. See `docs/codec_status.md` and `docs/h264_decoder_walkthrough.md`. |
+| Hardware H.264 encoding | 0.2.x | Encoder counterpart for the software decoder; will reuse the same `h264` module for bitstream syntax. |
 | ~~Full ONNX Runtime integration~~ | ~~0.3.0~~ | **Promoted to 0.1.5** — see 0.1.5 Planned section below. Delivered via Pure-Rust OxiONNX, not C++ `ort`. |
 
 ---
@@ -527,7 +528,7 @@ Progress tracking for 0.1.6 items. `[~]` = in progress, `[x]` = complete.
 | No unsafe code (`#![forbid(unsafe_code)]`) | Enforced across all stable/alpha crates |
 | Zero clippy warnings | Enforced; CI gate |
 | Apache 2.0 license | Enforced |
-| Patent-free codecs only (Green List) | Enforced; H.264/HEVC/AAC rejected at compile time |
+| Patent-free codecs only (Green List) | Enforced; HEVC/AAC rejected at compile time. H.264 moved off the Red List in 0.1.7 — see `docs/codec_status.md`. |
 | Async-first design | Complete |
 | Zero-copy buffer pool | Implemented (`oximedia-core`, `oximedia-io`) |
 | Pure Rust default build | Enforced; C/Fortran deps feature-gated only |

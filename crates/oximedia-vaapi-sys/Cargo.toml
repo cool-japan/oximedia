@@ -1,0 +1,31 @@
+[package]
+name = "oximedia-vaapi-sys"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "FFI bindings to libva (Video Acceleration API). Linux only."
+keywords = ["vaapi", "ffi", "intel", "amd", "linux"]
+categories = ["external-ffi-bindings", "multimedia"]
+links = "va-vaapi-sys"
+
+[lib]
+name = "oximedia_vaapi_sys"
+
+[build-dependencies]
+bindgen = { workspace = true }
+pkg-config = { workspace = true }
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+non_camel_case_types = "allow"
+non_snake_case = "allow"
+non_upper_case_globals = "allow"
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }

@@ -1,0 +1,32 @@
+[package]
+name = "oximedia-vtb-sys"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "FFI bindings to Apple VideoToolbox + AudioToolbox for hardware video/audio encode and decode (macOS/iOS only)"
+keywords = ["videotoolbox", "ffi", "h264", "hevc", "aac"]
+categories = ["external-ffi-bindings", "multimedia"]
+links = "VideoToolbox-vtb-sys"
+
+[lib]
+name = "oximedia_vtb_sys"
+
+[build-dependencies]
+bindgen = { workspace = true }
+
+[lints.rust]
+# bindgen output is unsafe extern "C" by definition; the workspace default
+# is `deny`, which would block compilation of every -sys crate.
+unsafe_code = "allow"
+missing_docs = "allow"
+non_camel_case_types = "allow"
+non_snake_case = "allow"
+non_upper_case_globals = "allow"
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
