@@ -373,6 +373,7 @@ impl<E: AudioEffect> AudioEffect for WetDryWrapper<E> {
     }
 }
 
+/// Adapter for FunDSP. Allows effects to be integrated into FunDSPs graph system.
 #[cfg(feature = "fundsp")]
 pub struct FunDspAdapter<E: AudioEffect> { inner: E }
 
