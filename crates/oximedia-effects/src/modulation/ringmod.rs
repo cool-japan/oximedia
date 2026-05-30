@@ -87,6 +87,8 @@ impl RingModulator {
 }
 
 impl AudioEffect for RingModulator {
+    const EFFECT_ID: u64 = 6018;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         let carrier = self.get_carrier();
         let modulated = input * carrier * self.config.depth;

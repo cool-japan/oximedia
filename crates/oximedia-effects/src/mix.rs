@@ -75,6 +75,8 @@ impl<E: AudioEffect> MixEffect<E> {
 }
 
 impl<E: AudioEffect> AudioEffect for MixEffect<E> {
+    const EFFECT_ID: u64 = Self.inner.EFFECT_ID;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         let processed = self.inner.process_sample(input);
         input * (1.0 - self.mix) + processed * self.mix
@@ -141,6 +143,7 @@ mod tests {
     struct DoubleEffect;
 
     impl AudioEffect for DoubleEffect {
+        const EFFECT_ID: u64 = 6003;
         fn process_sample(&mut self, input: f32) -> f32 {
             input * 2.0
         }

@@ -299,6 +299,7 @@ impl SpringReverb {
 }
 
 impl AudioEffect for SpringReverb {
+    const EFFECT_ID: u64 = 6031;
     fn process_sample(&mut self, input: f32) -> f32 {
         // 1. Apply input pre-diffusion.
         let mut diffused = input;

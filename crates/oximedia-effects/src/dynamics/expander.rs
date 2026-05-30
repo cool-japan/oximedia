@@ -94,6 +94,9 @@ impl Expander {
 }
 
 impl AudioEffect for Expander {
+
+    const EFFECT_ID: u64 = 6011;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         let envelope = self.envelope.process(input);
         let input_db = Self::linear_to_db(envelope);

@@ -365,6 +365,7 @@ impl RingModEffect {
 }
 
 impl AudioEffect for RingModEffect {
+
     /// Process a single mono sample.
     ///
     /// ```text

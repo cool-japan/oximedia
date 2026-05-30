@@ -50,6 +50,8 @@ impl BitCrusher {
 }
 
 impl AudioEffect for BitCrusher {
+    const EFFECT_ID: u64 = 6008;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         // Sample rate reduction
         self.sample_counter += 1;

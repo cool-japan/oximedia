@@ -271,6 +271,8 @@ impl BlockFftShifter {
 }
 
 impl AudioEffect for BlockFftShifter {
+
+    const EFFECT_ID: u64 = 6022;
     fn process_sample(&mut self, input: f32) -> f32 {
         let fft_size = self.config.fft_size;
         let hop_size = self.config.hop_size;

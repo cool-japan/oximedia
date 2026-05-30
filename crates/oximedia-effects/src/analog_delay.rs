@@ -305,6 +305,8 @@ impl AnalogDelay {
 }
 
 impl AudioEffect for AnalogDelay {
+    const EFFECT_ID: u64 = 6000;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         // We need to split borrows manually
         let delay = self.delay_samples.min(self.ring_l.capacity - 1);

@@ -50,6 +50,8 @@ impl DelayEffect {
 }
 
 impl AudioEffect for DelayEffect {
+
+    const EFFECT_ID: u64 = 6034;
     fn process(&mut self, samples: &mut [f32]) {
         let buf_len = self.buffer.len();
         for sample in samples.iter_mut() {
@@ -125,6 +127,8 @@ impl ChorusEffect {
 }
 
 impl AudioEffect for ChorusEffect {
+
+    const EFFECT_ID: u64 = 6035;
     /// Process samples with LFO-modulated delay-line chorus.
     ///
     /// For each input sample:
@@ -276,6 +280,8 @@ impl ReverbEffect {
 }
 
 impl AudioEffect for ReverbEffect {
+    const EFFECT_ID: u64 = 6036;
+
     /// Process samples through the Schroeder reverb network.
     fn process(&mut self, samples: &mut [f32]) {
         // Feedback coefficient: scales with room size, capped well below 1.0

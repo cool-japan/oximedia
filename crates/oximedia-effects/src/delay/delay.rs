@@ -261,6 +261,8 @@ impl MonoDelay {
 }
 
 impl AudioEffect for MonoDelay {
+    const EFFECT_ID: u64 = 6005;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         // Read delayed sample.
         let delayed = self.delay_line.read(self.delay_samples);

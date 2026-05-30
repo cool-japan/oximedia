@@ -454,6 +454,8 @@ impl MultibandCompressor {
 }
 
 impl AudioEffect for MultibandCompressor {
+    const EFFECT_ID: u64 = 6014;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         let processed = self.process_one(input);
         let wet = self.wet_mix;

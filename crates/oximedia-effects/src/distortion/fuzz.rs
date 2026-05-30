@@ -44,6 +44,8 @@ impl Fuzz {
 }
 
 impl AudioEffect for Fuzz {
+    const EFFECT_ID: u64 = 6009;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         let wet_out = Self::hard_clip(input * self.config.fuzz) * self.config.level;
         wet_out * self.wet_mix + input * (1.0 - self.wet_mix)

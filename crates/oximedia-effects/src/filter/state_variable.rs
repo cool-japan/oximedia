@@ -98,6 +98,7 @@ impl StateVariableFilter {
 }
 
 impl AudioEffect for StateVariableFilter {
+    const EFFECT_ID: u64 = 6016;
     fn process_sample(&mut self, input: f32) -> f32 {
         // Guard against NaN/inf in state from prior instability.
         if !self.low.is_finite() || !self.band.is_finite() {

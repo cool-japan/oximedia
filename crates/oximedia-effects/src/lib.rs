@@ -190,6 +190,10 @@ pub type Result<T> = std::result::Result<T, EffectError>;
 /// their own wet/dry internally (e.g. `MonoDelay`) are encouraged to
 /// override these methods so callers can use a uniform API.
 pub trait AudioEffect {
+
+    /// Unique ID for hashing in FunDSP.
+    const EFFECT_ID: u64;
+
     /// Process a single mono sample.
     fn process_sample(&mut self, input: f32) -> f32;
 
@@ -333,6 +337,7 @@ impl<E: AudioEffect> WetDryWrapper<E> {
 }
 
 impl<E: AudioEffect> AudioEffect for WetDryWrapper<E> {
+    const EFFECT_ID: u64 = Self.inner.EFFECT_ID;
     fn process_sample(&mut self, input: f32) -> f32 {
         let wet_out = self.inner.process_sample(input);
         wet_out * self.wet + input * self.dry
@@ -366,6 +371,26 @@ impl<E: AudioEffect> AudioEffect for WetDryWrapper<E> {
     fn wet_dry(&self) -> f32 {
         self.wet
     }
+}
+
+#[cfg(feature = "fundsp")]
+pub struct FunDspAdapter<E: AudioEffect> { inner: E }
+
+#[cfg(feature = "fundsp")]
+impl<E> AudioNode for FunDspAdapter<E>
+where E: Impl{
+    const ID: u64 = E::EFFECT_ID;
+    type Inputs = U2;
+    type Outputs = U2;
+
+    #[inline]
+    fn tick(&mut self, input: &Frame<f32, Self::Inputs>) -> Frame<f32, Self::Outputs> {
+        let (l, r) = self.inner.process_sample_stereo(input[0], input[1]);
+        [l, r].into()
+    }
+
+    fn set_sample_rate(&mut self, sr: f64) { self.inner.set_sample_rate(sr as f32); }
+    fn reset(&mut self) { self.inner.reset(); }
 }
 
 /// Configuration for reverb effects.

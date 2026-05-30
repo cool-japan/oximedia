@@ -199,6 +199,9 @@ impl Bitcrusher {
 // ─── AudioEffect implementation ───────────────────────────────────────────────
 
 impl AudioEffect for Bitcrusher {
+
+    const EFFECT_ID: u64 = 6001;
+
     /// Process a single mono sample through the bitcrusher.
     ///
     /// ## Algorithm

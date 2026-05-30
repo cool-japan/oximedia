@@ -244,6 +244,7 @@ impl OverlapAddConvolver {
 }
 
 impl AudioEffect for OverlapAddConvolver {
+    const EFFECT_ID: u64 = 6029;
     fn process_sample(&mut self, input: f32) -> f32 {
         // Accumulate input.
         self.input_block[self.input_fill] = input;

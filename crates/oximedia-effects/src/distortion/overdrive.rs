@@ -55,6 +55,9 @@ impl Overdrive {
 }
 
 impl AudioEffect for Overdrive {
+
+    const EFFECT_ID: u64 = 6010;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         // Apply drive
         let driven = input * self.config.drive;

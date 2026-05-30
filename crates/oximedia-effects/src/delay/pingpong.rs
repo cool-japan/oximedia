@@ -155,6 +155,8 @@ impl PingPongDelay {
 }
 
 impl AudioEffect for PingPongDelay {
+
+    const EFFECT_ID: u64 = 6007;
     fn process_sample(&mut self, input: f32) -> f32 {
         let (left, _right) = self.process_sample_internal(input, input);
         left

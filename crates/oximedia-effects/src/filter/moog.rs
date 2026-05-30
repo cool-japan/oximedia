@@ -82,6 +82,8 @@ impl MoogFilter {
 }
 
 impl AudioEffect for MoogFilter {
+    const EFFECT_ID: u64 = 6015;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         // Add resonance feedback
         let input_with_fb = input - self.resonance * self.stage[3];

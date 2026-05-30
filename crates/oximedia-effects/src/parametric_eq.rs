@@ -467,6 +467,8 @@ impl ParametricEq {
 // ═══════════════════════════════════════════════════ AudioEffect impl ═════
 
 impl AudioEffect for ParametricEq {
+
+    const EFFECT_ID: u64 = 6004;
     fn process_sample(&mut self, input: f32) -> f32 {
         let mut s = f64::from(input);
         for (i, band) in self.bands.iter().enumerate() {

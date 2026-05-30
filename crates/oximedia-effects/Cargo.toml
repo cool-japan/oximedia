@@ -15,6 +15,9 @@ readme = "README.md"
 [lints]
 workspace = true
 
+[features]
+fundsp = ["dep:fundsp"]
+
 [dependencies]
 oximedia-core.workspace = true
 oximedia-audio.workspace = true
@@ -22,5 +25,6 @@ thiserror.workspace = true
 oxifft = { workspace = true }
 rubato = "2.0"
 scirs2-core = { workspace = true }
+fundsp = { version = "0.23", optional = true}
 
 [dev-dependencies]

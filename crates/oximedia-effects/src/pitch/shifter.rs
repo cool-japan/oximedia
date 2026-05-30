@@ -74,6 +74,8 @@ impl PitchShifter {
 }
 
 impl AudioEffect for PitchShifter {
+    const EFFECT_ID: u64 = 6024;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         let ratio = self.pitch_ratio();
 

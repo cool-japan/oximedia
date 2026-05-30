@@ -255,6 +255,8 @@ impl GranularStretcher {
 }
 
 impl AudioEffect for GranularStretcher {
+
+    const EFFECT_ID: u64 = 6023;
     fn process_sample(&mut self, input: f32) -> f32 {
         let input_len = self.input_buf.len();
         let output_len = self.output_buf.len();

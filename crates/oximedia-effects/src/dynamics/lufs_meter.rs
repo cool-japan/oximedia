@@ -416,6 +416,8 @@ impl LufsMeter {
 }
 
 impl AudioEffect for LufsMeter {
+    const EFFECT_ID: u64 = 6013;
+
     /// Passthrough: returns `input` unchanged while measuring loudness internally.
     fn process_sample(&mut self, input: f32) -> f32 {
         self.process_sample_mono(input)

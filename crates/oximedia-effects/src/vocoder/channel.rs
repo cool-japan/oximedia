@@ -172,6 +172,8 @@ impl Vocoder {
 }
 
 impl AudioEffect for Vocoder {
+
+    const EFFECT_ID: u64 = 6033;
     /// Process a single mono sample using input as both modulator and carrier.
     fn process_sample(&mut self, input: f32) -> f32 {
         self.process(input, input)

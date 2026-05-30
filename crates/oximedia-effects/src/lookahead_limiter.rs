@@ -214,6 +214,8 @@ impl LookaheadLimiter {
 // ---------------------------------------------------------------------------
 
 impl AudioEffect for LookaheadLimiter {
+    const EFFECT_ID: u64 = 6002;
+
     fn process_sample(&mut self, input: f32) -> f32 {
         self.process_one(input)
     }

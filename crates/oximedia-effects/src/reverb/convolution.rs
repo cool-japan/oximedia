@@ -147,6 +147,7 @@ impl ConvolutionReverb {
 }
 
 impl AudioEffect for ConvolutionReverb {
+    const EFFECT_ID: u64 = 6027;
     fn process_sample(&mut self, input: f32) -> f32 {
         // Store input
         self.input_buffer[self.input_pos] = input;
