@@ -366,6 +366,8 @@ impl RingModEffect {
 
 impl AudioEffect for RingModEffect {
 
+    const EFFECT_ID: u64 = 6037;
+
     /// Process a single mono sample.
     ///
     /// ```text
