@@ -26,7 +26,7 @@ Version: 0.2.0 — 2026-07-15 — extensively tested
 
 ```toml
 [dependencies]
-oximedia-360 = "0.1.9"
+oximedia-360 = "0.2.0"
 ```
 
 ### Equirectangular to Cubemap

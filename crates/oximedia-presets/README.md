@@ -39,7 +39,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-presets = "0.1.9"
+oximedia-presets = "0.2.0"
 ```
 
 ```rust

@@ -4,8 +4,8 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.87+-orange.svg)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-v0.2.0-green.svg)](https://github.com/cool-japan/oximedia)
-[![Released](https://img.shields.io/badge/last%20release-0.1.9%20(2026--07--14)-brightgreen.svg)](https://github.com/cool-japan/oximedia)
+[![Version](https://img.shields.io/badge/version-v0.2.1-green.svg)](https://github.com/cool-japan/oximedia)
+[![Released](https://img.shields.io/badge/last%20release-0.2.0%20(2026--07--15)-brightgreen.svg)](https://github.com/cool-japan/oximedia)
 [![Crates](https://img.shields.io/badge/crates-114-blue.svg)](https://github.com/cool-japan/oximedia)
 [![SLOC](https://img.shields.io/badge/SLOC-~2.95M-blueviolet.svg)](https://github.com/cool-japan/oximedia)
 
@@ -67,7 +67,7 @@ Computer vision (object detection, motion tracking, video enhancement, quality a
 
 ## Project Scale
 
-OxiMedia is a **production-grade** framework at **v0.2.0** (active cycle):
+OxiMedia is a **production-grade** framework at **v0.2.1** (active cycle):
 
 | Metric | Value |
 |--------|-------|
@@ -102,7 +102,7 @@ pulls in **zero** ONNX symbols and stays C/Fortran-free.
 
 ```toml
 [dependencies]
-oximedia = { version = "0.1.9", features = ["ml", "ml-scene-classifier", "ml-onnx"] }
+oximedia = { version = "0.2.0", features = ["ml", "ml-scene-classifier", "ml-onnx"] }
 ```
 
 ```rust,ignore
@@ -152,19 +152,18 @@ See [`docs/ml_guide.md`](docs/ml_guide.md) for the full feature matrix,
 per-pipeline I/O contracts, device selection details, WASM support
 matrix, and roadmap.
 
-## What's New in v0.1.9
+## What's New in v0.2.0
 
-Released 2026-07-14. Theme: **Sovereign default build, Pure-Rust infrastructure migrations, and deep correctness hardening (Waves 21–30)**.
+Released 2026-07-15. Theme: **A real frame-level transcode engine, bit-exact AV1/VP9/VP8 key-frame video decoding, and a broad "real or honest error" sweep across the packager, network, workflow, Python bindings, and CLI layers**.
 
-- **100% Pure Rust default build**: `cargo check --workspace` now compiles zero C/C++/Fortran. All C-backed integrations moved behind opt-in, non-default Cargo features: `aws-sdk` (oximedia-cloud), `vulkan-backend` (oximedia-accel), `lua-scripting` (oximedia-automation), `quic-quinn` (oximedia-videoip).
-- **SQLite via Pure-Rust oxisql**: every SQLite-backed persistence path migrated from `rusqlite`/`libsqlite3-sys` to [`oxisql-sqlite-compat`](https://crates.io/crates/oxisql-sqlite-compat) — the `sqlite` features are now Pure Rust too.
-- **No external `protoc` required**: gRPC schema compilation in `oximedia-farm` and `oximedia-distributed` migrated to the pure-Rust [`protox`](https://crates.io/crates/protox) parser; the system Protocol Buffers compiler is no longer a build prerequisite.
-- **Real least-squares color calibration** (`oximedia-calibrate`): 3×3 color-matching matrix solved via least squares (B·A⁻¹ with adjugate inverse, conditioning, and rank-deficiency guards), replacing the previous identity stub; ΔE2000 < 2.0 on known-answer tests.
-- **Polymorphic `.cube` LUT loader** (`oximedia-lut`): 1D and 3D `.cube` files load through a single detection path.
-- **Broadcast-audio correctness fixes**: EBU R128 gating power-normalization underread (~42.8 dB) fixed in `oximedia-audio`; STFT gain (~14 dB) and wow/flutter fixes in `oximedia-restore`; Hann-window and synthesis attenuation fixes in `oximedia-audio-analysis`; sub-frame f64 timecode drift eliminated in `oximedia-timecode`.
-- **New pro features across Waves 21–30**: DTW forced lyric alignment (`oximedia-mir`), hand-emitted PDF QC reports (`oximedia-qc`), CEA-608 odd-parity encode/decode (`oximedia-captions`), mmap-backed HLS/DASH segment store (`oximedia-server`), BS.1770-4 golden-reference metering tests, anycast/BGP-style CDN routing, ORB/BRIEF cross-frame descriptor caching (`oximedia-align`), and JWT/webhook fixes in `oximedia-server`.
-- **101,814 tests passing** with `--all-features` (100,160 with default features), 0 failures, 0 clippy warnings, 0 rustfmt diffs, all doctests green — verified 2026-07-13.
-- **`oxiarc-archive` 0.3.6 sibling-version mismatch (fixed 2026-07-14):** a same-day bump on 2026-07-13 briefly left `oxiarc-archive` calling APIs not yet present in sibling crates `oxiarc-brotli`/`oxiarc-bzip2`/`oxiarc-lzma`/`oxiarc-snappy` (then still 0.3.5). Those siblings have since published matching 0.3.6 releases, and `cargo check --workspace --all-features` now passes clean.
+- **Real frame-level transcode engine** (`oximedia-transcode`): a genuine decode → filter → encode pipeline behind `TranscodePipeline`'s `requires_frame_level()` gate, replacing the previous stream-copy-only path for jobs that actually need re-encoding. WAV/FLAC input re-encodes through OxiMedia's own FLAC codec bit-exact on round-trip, Y4M decode is wired in, `-r` frame-rate conversion is a real drop/duplicate resampler, and new file muxers (`RawEsFileMuxer`, `FlacFileMuxer`, `CafAlacFileMuxer`, `Y4mFileMuxer`) back real outputs.
+- **AV1 key-frame/intra-frame decoder** (`oximedia-codec`): a full port of the AV1 intra decode path — symbol/range decoder, header parsing, transform-coefficient decode, intra prediction (incl. CFL), inverse transforms, deblocking, CDEF, and loop restoration — verified bit-exact (0 differing Y/U/V pixels) against `dav1d` 1.5.1 and `aomdec`/libaom v3.12.1 on 13 keyframe test vectors.
+- **VP9 key-frame/intra-frame decoder**: an exact port of libvpx's intra decode path (boolean decoder, inverse DCT/ADST/Walsh-Hadamard transforms, loop filter), verified bit-exact against `ffmpeg`/libvpx reference decodes.
+- **VP8 key-frame decoder**: the full RFC 6386 §11–§15 intra pipeline, cross-checked against OxiMedia's own production-verified WebP/VP8 still-image decoder and bit-exact against libwebp reference output. Inter-frame decode for all three codecs is the remaining gap, tracked for 0.2.x.
+- **Real CENC/`cbcs` packager encryption** (`oximedia-packager`): genuine full-sample AES-128-CTR for CENC, and the real ISO/IEC 23001-7 §9.6 `cbcs` pattern (1 encrypted block per 9 clear, CBC chain reset per sample) for SAMPLE-AES — the format FairPlay/Shaka/hls.js/dash.js actually expect — replacing a mislabeled full-buffer CBC path that no real client could decrypt.
+- **~40 `oximedia-cli` flags verified real**: `--map`, `-ss`/`-t`, `-vf`, `-af`, `-r`, `--crf`, `--normalize-audio`, `probe --hash`/`--quality-snapshot`, `validate --loudness-check`, `mam --extract-metadata`, `batch-engine --priority`/`--config`/`--state`, `workflow --source`/`--destination`, `edl parse --format`, `recommend --bitrate`/`--resolution`, and a global `--quiet` flag now do what they say instead of silently no-opping; the already-dead `transcode --resume` flag (never wired to any resume capability) was removed rather than left as a silent no-op.
+- **Fabricated-success elimination sweep**: Python bindings (`oximedia-py`), the RTMP relay (`oximedia-net`), the `oximedia-effects` shelf EQ filters, and a dozen more "returns `Ok` with fake data" paths across `oximedia-renderfarm`, `oximedia-stabilize`, `oximedia-vfx`, `oximedia-access`, `oximedia-captions`, `oximedia-automation`, `oximedia-conform`, and `oximedia-accel` now return an honest `Err` instead, each pinned by a new regression test. A related `oximedia-workflow` scheduler bug that silently dropped non-root tasks while still reporting the workflow `Completed` is also fixed.
+- **Security hardening**: parser bounds/allocation caps against malicious input added across MP4 box nesting, DVB subtitle regions, RTSP bodies, RTMP chunks, WebRTC SCTP reassembly, and AAF essence ranges; the SRT key exchange's RFC 3394 AES key wrap was rewritten from a masquerading stub into the real six-round algorithm, verified against the RFC 3394 §4.1 test vector.
 
 ## What's New in v0.1.8
 
@@ -535,7 +534,7 @@ or pin the version and pick features in `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia = { version = "0.1.9", features = ["full"] }
+oximedia = { version = "0.2.0", features = ["full"] }
 ```
 
 ### Python (PyPI)

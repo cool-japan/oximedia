@@ -27,7 +27,7 @@ Version: 0.2.0 — 2026-07-15 — extensively tested
 
 ```toml
 [dependencies]
-oximedia-caption-gen = "0.1.9"
+oximedia-caption-gen = "0.2.0"
 ```
 
 ### Speech Alignment and Caption Blocks

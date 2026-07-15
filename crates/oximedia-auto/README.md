@@ -23,7 +23,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-auto = "0.1.9"
+oximedia-auto = "0.2.0"
 ```
 
 ```rust

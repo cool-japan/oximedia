@@ -49,7 +49,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-repair = "0.1.9"
+oximedia-repair = "0.2.0"
 ```
 
 ```rust

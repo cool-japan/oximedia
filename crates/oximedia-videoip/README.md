@@ -53,7 +53,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-videoip = "0.1.9"
+oximedia-videoip = "0.2.0"
 ```
 
 ### Broadcasting a Video Stream

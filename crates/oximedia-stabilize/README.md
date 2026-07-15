@@ -37,7 +37,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-stabilize = "0.1.9"
+oximedia-stabilize = "0.2.0"
 ```
 
 ```rust

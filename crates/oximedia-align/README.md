@@ -64,7 +64,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-align = "0.1.9"
+oximedia-align = "0.2.0"
 ```
 
 ### Audio-Based Synchronization

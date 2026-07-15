@@ -35,7 +35,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-restoration = "0.1.9"
+oximedia-restoration = "0.2.0"
 ```
 
 ```rust

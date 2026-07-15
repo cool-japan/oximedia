@@ -39,7 +39,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-recommend = "0.1.9"
+oximedia-recommend = "0.2.0"
 ```
 
 ```rust

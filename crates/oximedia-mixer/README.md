@@ -30,7 +30,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-mixer = "0.1.9"
+oximedia-mixer = "0.2.0"
 ```
 
 ```rust

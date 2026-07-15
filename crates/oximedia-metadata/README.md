@@ -40,7 +40,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-metadata = "0.1.9"
+oximedia-metadata = "0.2.0"
 ```
 
 ```rust

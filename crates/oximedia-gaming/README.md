@@ -41,7 +41,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-gaming = "0.1.9"
+oximedia-gaming = "0.2.0"
 ```
 
 ```rust

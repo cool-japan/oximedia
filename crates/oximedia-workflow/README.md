@@ -65,7 +65,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-workflow = "0.1.9"
+oximedia-workflow = "0.2.0"
 ```
 
 ```rust

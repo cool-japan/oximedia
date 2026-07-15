@@ -48,7 +48,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-codec = "0.1.9"
+oximedia-codec = "0.2.0"
 # or with additional codecs:
 oximedia-codec = { version = "0.1.9", features = ["av1", "vp9", "vp8", "opus"] }
 ```

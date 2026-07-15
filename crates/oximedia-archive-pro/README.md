@@ -30,7 +30,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-archive-pro = "0.1.9"
+oximedia-archive-pro = "0.2.0"
 ```
 
 ```rust

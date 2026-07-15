@@ -54,7 +54,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-subtitle = "0.1.9"
+oximedia-subtitle = "0.2.0"
 ```
 
 ```rust

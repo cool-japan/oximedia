@@ -30,7 +30,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-colormgmt = "0.1.9"
+oximedia-colormgmt = "0.2.0"
 # Optional features:
 oximedia-colormgmt = { version = "0.1.9", features = ["lut-integration", "gpu-accel"] }
 ```

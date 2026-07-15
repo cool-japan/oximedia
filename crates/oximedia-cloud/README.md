@@ -30,7 +30,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-cloud = "0.1.9"
+oximedia-cloud = "0.2.0"
 ```
 
 ## Cargo features

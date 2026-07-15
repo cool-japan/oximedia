@@ -65,7 +65,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oximedia-codec = { version = "0.2.0", features = ["av1", "vp9", "opus", "jpegxl"] }
+//! oximedia-codec = { version = "0.2.1", features = ["av1", "vp9", "opus", "jpegxl"] }
 //! ```
 //!
 //! Available features: `av1` (default), `vp9`, `vp8`, `theora`, `h263`, `opus`,

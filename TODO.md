@@ -1,12 +1,12 @@
 # OxiMedia — The Sovereign Media Framework: Development Roadmap
 
-**Version: 0.2.0 (active, dev branch `0.2.0`) / 0.1.9 (stable, `master`)**
+**Version: 0.2.1 (active, dev branch `0.2.1`, no new feature work yet) / 0.2.0 (stable, `master` — released 2026-07-15)**
 **Status as of: 2026-07-15**
 **Total SLOC: ~2,951,319 lines of code (Rust, measured via `tokei .` this session; 3,603,734 total lines / 9,309 files / 181,073 comments)**
 **Total Tests: 101,814 passing with `--all-features` / 100,160 with default features (0 failed, 0 warnings — `cargo nextest run --workspace`, genuine full run this session, verified 2026-07-13)**
 **Total Crates: 114 (measured via `cargo metadata --no-deps` this session; root workspace only — `web/` is a separate, excluded nested workspace, see below)**
 **Crate Status: 110 Stable library crates under `crates/` + facade `oximedia` + `oximedia-cli` + `oximedia-wasm` + internal bench harness = 114 workspace members; 0 Alpha / 0 Partial**
-**Current Branch: 0.2.0 — production-readiness release landed 2026-07-08 (100% Pure Rust default build); Waves 21–30 + `oximedia-web` (browser modules) shipped in 0.1.9. This session (0.2.0 dev): a real frame-level transcode engine (`oximedia-transcode`), real AV1, VP9 and VP8 key-frame/intra video decoders (bit-exact vs dav1d/aomdec/libvpx/libwebp; inter-frame decode still open), ~40 `oximedia-cli` flags made real or honest, real CENC/`cbcs` packager encryption, a real RFC 3394 SRT key wrap, a broad fabricated-success-elimination sweep (Python bindings, RTMP relay, workflow executor, codec error honesty), and parser bounds/DoS hardening across MP4/DVB/RTSP/RTMP/WebRTC/AAF — see `CHANGELOG.md`'s `[0.2.0]` section for full detail, and the new "Deferred (0.2.x)" section at the end of this file for what's left. SLOC/test counts below are the last full measurement (2026-07-13, pre-dating this session's work) and have not been re-measured.**
+**Current Branch: 0.2.1 — production-readiness release landed 2026-07-08 (100% Pure Rust default build); Waves 21–30 + `oximedia-web` (browser modules) shipped in 0.1.9. 0.2.0 shipped 2026-07-15 (tagged, pushed, live on crates.io): a real frame-level transcode engine (`oximedia-transcode`), real AV1, VP9 and VP8 key-frame/intra video decoders (bit-exact vs dav1d/aomdec/libvpx/libwebp; inter-frame decode still open), ~40 `oximedia-cli` flags made real or honest, real CENC/`cbcs` packager encryption, a real RFC 3394 SRT key wrap, a broad fabricated-success-elimination sweep (Python bindings, RTMP relay, workflow executor, codec error honesty), and parser bounds/DoS hardening across MP4/DVB/RTSP/RTMP/WebRTC/AAF — see `CHANGELOG.md`'s `[0.2.0]` section for full detail, and the new "Deferred (0.2.x)" section at the end of this file for what's left. SLOC/test counts below are the last full measurement (2026-07-13, pre-dating the 0.2.0 work described above) and have not been re-measured since.**
 
 ---
 

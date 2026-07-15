@@ -38,7 +38,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-metering = "0.1.9"
+oximedia-metering = "0.2.0"
 ```
 
 ```rust

@@ -48,7 +48,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-timeline = "0.1.9"
+oximedia-timeline = "0.2.0"
 ```
 
 ```rust

@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-scaling = "0.1.9"
+oximedia-scaling = "0.2.0"
 ```
 
 ```rust

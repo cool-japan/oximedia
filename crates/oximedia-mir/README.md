@@ -37,7 +37,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-mir = "0.1.9"
+oximedia-mir = "0.2.0"
 # Select specific features:
 oximedia-mir = { version = "0.1.9", features = ["tempo", "beat", "key", "chord"] }
 ```

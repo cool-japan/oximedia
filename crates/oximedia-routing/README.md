@@ -49,7 +49,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-routing = "0.1.9"
+oximedia-routing = "0.2.0"
 
 # Enable NMOS HTTP server + mDNS discovery
 # oximedia-routing = { version = "0.1.9", features = ["nmos-discovery"] }

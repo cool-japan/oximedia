@@ -38,7 +38,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-timesync = "0.1.9"
+oximedia-timesync = "0.2.0"
 ```
 
 ```rust

@@ -39,7 +39,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-renderfarm = "0.1.9"
+oximedia-renderfarm = "0.2.0"
 ```
 
 ```rust

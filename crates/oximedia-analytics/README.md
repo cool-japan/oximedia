@@ -25,7 +25,7 @@ Version: 0.2.0 — 2026-07-15 — extensively tested
 
 ```toml
 [dependencies]
-oximedia-analytics = "0.1.9"
+oximedia-analytics = "0.2.0"
 ```
 
 ### Session Analysis

@@ -50,7 +50,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-graph = "0.1.9"
+oximedia-graph = "0.2.0"
 ```
 
 ```rust

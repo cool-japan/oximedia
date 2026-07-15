@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-multicam = "0.1.9"
+oximedia-multicam = "0.2.0"
 ```
 
 ```rust

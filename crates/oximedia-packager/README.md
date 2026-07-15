@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-packager = "0.1.9"
+oximedia-packager = "0.2.0"
 
 # Optional features
 # oximedia-packager = { version = "0.1.9", features = ["encryption", "s3"] }

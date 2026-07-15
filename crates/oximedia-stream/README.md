@@ -24,7 +24,7 @@ Part of the [OxiMedia](https://github.com/cool-japan/oximedia) sovereign media f
 
 ```toml
 [dependencies]
-oximedia-stream = "0.1.9"
+oximedia-stream = "0.2.0"
 ```
 
 ```rust

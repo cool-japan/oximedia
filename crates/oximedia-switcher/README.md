@@ -41,7 +41,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-switcher = "0.1.9"
+oximedia-switcher = "0.2.0"
 ```
 
 ```rust

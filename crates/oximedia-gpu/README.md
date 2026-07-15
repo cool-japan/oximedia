@@ -71,7 +71,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-gpu = "0.1.9"
+oximedia-gpu = "0.2.0"
 ```
 
 ```rust

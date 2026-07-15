@@ -45,7 +45,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-simd = "0.1.9"
+oximedia-simd = "0.2.0"
 ```
 
 ```rust

@@ -23,7 +23,7 @@ Part of the [OxiMedia](https://github.com/cool-japan/oximedia) sovereign media f
 
 ```toml
 [dependencies]
-oximedia-video = "0.1.9"
+oximedia-video = "0.2.0"
 ```
 
 ```rust

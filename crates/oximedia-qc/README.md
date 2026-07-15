@@ -31,7 +31,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-qc = "0.1.9"
+oximedia-qc = "0.2.0"
 ```
 
 ```rust

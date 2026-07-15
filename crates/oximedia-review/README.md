@@ -30,7 +30,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-review = "0.1.9"
+oximedia-review = "0.2.0"
 ```
 
 ```rust

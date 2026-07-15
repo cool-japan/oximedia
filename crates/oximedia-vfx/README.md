@@ -51,7 +51,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-vfx = "0.1.9"
+oximedia-vfx = "0.2.0"
 ```
 
 ```rust

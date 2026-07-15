@@ -25,7 +25,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-bench = "0.1.9"
+oximedia-bench = "0.2.0"
 # or without VMAF:
 oximedia-bench = { version = "0.1.9", default-features = false }
 ```

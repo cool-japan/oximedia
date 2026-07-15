@@ -27,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-calibrate = "0.1.9"
+oximedia-calibrate = "0.2.0"
 ```
 
 ```rust

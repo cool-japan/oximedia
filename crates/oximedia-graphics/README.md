@@ -36,7 +36,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-graphics = "0.1.9"
+oximedia-graphics = "0.2.0"
 # With GPU and server features (default):
 oximedia-graphics = { version = "0.1.9", features = ["gpu", "server"] }
 ```

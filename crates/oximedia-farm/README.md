@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-farm = "0.1.9"
+oximedia-farm = "0.2.0"
 ```
 
 ### Starting a Coordinator

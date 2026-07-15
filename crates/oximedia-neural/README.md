@@ -24,7 +24,7 @@ Part of the [OxiMedia](https://github.com/cool-japan/oximedia) sovereign media f
 
 ```toml
 [dependencies]
-oximedia-neural = "0.1.9"
+oximedia-neural = "0.2.0"
 ```
 
 ```rust

@@ -36,7 +36,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-transcode = "0.1.9"
+oximedia-transcode = "0.2.0"
 ```
 
 ```rust

@@ -50,7 +50,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-normalize = "0.1.9"
+oximedia-normalize = "0.2.0"
 ```
 
 ## Quick Start

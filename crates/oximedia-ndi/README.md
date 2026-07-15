@@ -31,7 +31,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-ndi = "0.1.9"
+oximedia-ndi = "0.2.0"
 ```
 
 ```rust

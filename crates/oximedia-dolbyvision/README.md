@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-dolbyvision = "0.1.9"
+oximedia-dolbyvision = "0.2.0"
 # With serde support:
 oximedia-dolbyvision = { version = "0.1.9", features = ["serde"] }
 ```

@@ -40,7 +40,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-forensics = "0.1.9"
+oximedia-forensics = "0.2.0"
 # With computer vision features:
 oximedia-forensics = { version = "0.1.9", features = ["cv"] }
 ```

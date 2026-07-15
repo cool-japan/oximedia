@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-captions = "0.1.9"
+oximedia-captions = "0.2.0"
 # or with specific format support:
 oximedia-captions = { version = "0.1.9", features = ["cea", "web", "broadcast"] }
 ```

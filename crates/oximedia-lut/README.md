@@ -44,7 +44,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-lut = "0.1.9"
+oximedia-lut = "0.2.0"
 ```
 
 ```rust

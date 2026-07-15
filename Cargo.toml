@@ -242,7 +242,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.87"
@@ -641,115 +641,115 @@ smallvec = { version = "1.15", features = ["union"] }
 flv = "0.0.1"
 
 # Workspace internal
-oximedia-core = { version = "0.2.0", path ="crates/oximedia-core" }
-oximedia-io = { version = "0.2.0", path ="crates/oximedia-io" }
-oximedia-codec = { version = "0.2.0", path ="crates/oximedia-codec", default-features = false }
-oximedia-container = { version = "0.2.0", path ="crates/oximedia-container" }
-oximedia-audio = { version = "0.2.0", path ="crates/oximedia-audio" }
-oximedia-audio-analysis = { version = "0.2.0", path ="crates/oximedia-audio-analysis" }
-oximedia-audiopost = { version = "0.2.0", path ="crates/oximedia-audiopost" }
-oximedia-effects = { version = "0.2.0", path ="crates/oximedia-effects" }
-oximedia-vfx = { version = "0.2.0", path ="crates/oximedia-vfx" }
-oximedia-graph = { version = "0.2.0", path ="crates/oximedia-graph" }
-oximedia-cv = { version = "0.2.0", path ="crates/oximedia-cv" }
-oximedia-net = { version = "0.2.0", path ="crates/oximedia-net" }
-oximedia-ndi = { version = "0.2.0", path ="crates/oximedia-ndi" }
-oximedia-accel = { version = "0.2.0", path ="crates/oximedia-accel" }
-oximedia-edit = { version = "0.2.0", path ="crates/oximedia-edit" }
-oximedia-gpu = { version = "0.2.0", path ="crates/oximedia-gpu" }
-oximedia-subtitle = { version = "0.2.0", path ="crates/oximedia-subtitle" }
-oximedia-captions = { version = "0.2.0", path ="crates/oximedia-captions" }
-oximedia-packager = { version = "0.2.0", path ="crates/oximedia-packager" }
-oximedia-jobs = { version = "0.2.0", path ="crates/oximedia-jobs" }
-oximedia-server = { version = "0.2.0", path ="crates/oximedia-server" }
-oximedia-qc = { version = "0.2.0", path ="crates/oximedia-qc" }
-oximedia-auto = { version = "0.2.0", path ="crates/oximedia-auto" }
-oximedia-drm = { version = "0.2.0", path ="crates/oximedia-drm" }
-oximedia-dedup = { version = "0.2.0", path ="crates/oximedia-dedup" }
-oximedia-archive = { version = "0.2.0", path ="crates/oximedia-archive" }
-oximedia-archive-pro = { version = "0.2.0", path ="crates/oximedia-archive-pro" }
-oximedia-timecode = { version = "0.2.0", path ="crates/oximedia-timecode" }
-oximedia-timeline = { version = "0.2.0", path ="crates/oximedia-timeline" }
-oximedia-timesync = { version = "0.2.0", path ="crates/oximedia-timesync" }
-oximedia-storage = { version = "0.2.0", path ="crates/oximedia-storage" }
-oximedia-distributed = { version = "0.2.0", path ="crates/oximedia-distributed" }
-oximedia-farm = { version = "0.2.0", path ="crates/oximedia-farm" }
-oximedia-collab = { version = "0.2.0", path ="crates/oximedia-collab" }
-oximedia-simd = { version = "0.2.0", path ="crates/oximedia-simd" }
-oximedia-mam = { version = "0.2.0", path ="crates/oximedia-mam" }
-oximedia-forensics = { version = "0.2.0", path ="crates/oximedia-forensics" }
-oximedia-playout = { version = "0.2.0", path ="crates/oximedia-playout" }
-oximedia-scopes = { version = "0.2.0", path ="crates/oximedia-scopes" }
-oximedia-dolbyvision = { version = "0.2.0", path ="crates/oximedia-dolbyvision" }
-oximedia-bitstream = { version = "0.2.0", path = "crates/oximedia-bitstream" }
-oximedia-mixer = { version = "0.2.0", path ="crates/oximedia-mixer" }
-oximedia-aaf = { version = "0.2.0", path ="crates/oximedia-aaf" }
-oximedia-image = { version = "0.2.0", path ="crates/oximedia-image" }
-oximedia-metering = { version = "0.2.0", path ="crates/oximedia-metering" }
-oximedia-monitor = { version = "0.2.0", path ="crates/oximedia-monitor" }
-oximedia-stream = { version = "0.2.0", path ="crates/oximedia-stream" }
-oximedia-normalize = { version = "0.2.0", path ="crates/oximedia-normalize" }
-oximedia-restore = { version = "0.2.0", path ="crates/oximedia-restore" }
-oximedia-restoration = { version = "0.2.0", path ="crates/oximedia-restoration" }
-oximedia-mir = { version = "0.2.0", path ="crates/oximedia-mir" }
-oximedia-imf = { version = "0.2.0", path ="crates/oximedia-imf" }
-oximedia-edl = { version = "0.2.0", path ="crates/oximedia-edl" }
-oximedia-align = { version = "0.2.0", path ="crates/oximedia-align" }
-oximedia-bench = { version = "0.2.0", path ="crates/oximedia-bench" }
-oximedia-metadata = { version = "0.2.0", path ="crates/oximedia-metadata" }
-oximedia-lut = { version = "0.2.0", path ="crates/oximedia-lut" }
-oximedia-watermark = { version = "0.2.0", path ="crates/oximedia-watermark" }
-oximedia-quality = { version = "0.2.0", path ="crates/oximedia-quality" }
-oximedia-analysis = { version = "0.2.0", path ="crates/oximedia-analysis" }
-oximedia-switcher = { version = "0.2.0", path ="crates/oximedia-switcher" }
-oximedia-transcode = { version = "0.2.0", path ="crates/oximedia-transcode" }
-oximedia-denoise = { version = "0.2.0", path ="crates/oximedia-denoise" }
-oximedia-multicam = { version = "0.2.0", path ="crates/oximedia-multicam" }
-oximedia-scene = { version = "0.2.0", path ="crates/oximedia-scene" }
-oximedia-stabilize = { version = "0.2.0", path ="crates/oximedia-stabilize" }
-oximedia-optimize = { version = "0.2.0", path ="crates/oximedia-optimize" }
-oximedia-calibrate = { version = "0.2.0", path ="crates/oximedia-calibrate" }
-oximedia-search = { version = "0.2.0", path ="crates/oximedia-search" }
-oximedia-proxy = { version = "0.2.0", path ="crates/oximedia-proxy" }
-oximedia-playlist = { version = "0.2.0", path ="crates/oximedia-playlist" }
-oximedia-clips = { version = "0.2.0", path ="crates/oximedia-clips" }
-oximedia-routing = { version = "0.2.0", path ="crates/oximedia-routing" }
-oximedia-automation = { version = "0.2.0", path ="crates/oximedia-automation" }
-oximedia-presets = { version = "0.2.0", path ="crates/oximedia-presets" }
-oximedia-shots = { version = "0.2.0", path ="crates/oximedia-shots" }
-oximedia-access = { version = "0.2.0", path ="crates/oximedia-access" }
-oximedia-convert = { version = "0.2.0", path ="crates/oximedia-convert" }
-oximedia-rights = { version = "0.2.0", path ="crates/oximedia-rights" }
-oximedia-virtual = { version = "0.2.0", path ="crates/oximedia-virtual" }
-oximedia-gaming = { version = "0.2.0", path ="crates/oximedia-gaming" }
-oximedia-profiler = { version = "0.2.0", path ="crates/oximedia-profiler" }
-oximedia-recommend = { version = "0.2.0", path ="crates/oximedia-recommend" }
-oximedia-repair = { version = "0.2.0", path ="crates/oximedia-repair" }
-oximedia-review = { version = "0.2.0", path ="crates/oximedia-review" }
-oximedia-scaling = { version = "0.2.0", path ="crates/oximedia-scaling" }
-oximedia-workflow = { version = "0.2.0", path ="crates/oximedia-workflow" }
-oximedia-graphics = { version = "0.2.0", path ="crates/oximedia-graphics" }
-oximedia-cloud = { version = "0.2.0", path ="crates/oximedia-cloud" }
-oximedia-conform = { version = "0.2.0", path ="crates/oximedia-conform" }
-oximedia-videoip = { version = "0.2.0", path ="crates/oximedia-videoip" }
-oximedia-video = { version = "0.2.0", path ="crates/oximedia-video" }
-oximedia-colormgmt = { version = "0.2.0", path ="crates/oximedia-colormgmt" }
-oximedia-batch = { version = "0.2.0", path ="crates/oximedia-batch" }
-oximedia-renderfarm = { version = "0.2.0", path ="crates/oximedia-renderfarm" }
-oximedia-neural = { version = "0.2.0", path ="crates/oximedia-neural" }
-oximedia-compat-ffmpeg = { version = "0.2.0", path ="crates/oximedia-compat-ffmpeg" }
-oximedia-compat-cv2 = { version = "0.2.0", path ="crates/oximedia-compat-cv2" }
-oximedia-plugin = { version = "0.2.0", path ="crates/oximedia-plugin" }
-oximedia-hdr = { version = "0.2.0", path ="crates/oximedia-hdr" }
-oximedia-spatial = { version = "0.2.0", path ="crates/oximedia-spatial" }
-oximedia-cache = { version = "0.2.0", path ="crates/oximedia-cache" }
-oximedia-cdn = { version = "0.2.0", path ="crates/oximedia-cdn" }
-oximedia-pipeline = { version = "0.2.0", path ="crates/oximedia-pipeline" }
-oximedia-image-transform = { version = "0.2.0", path ="crates/oximedia-image-transform" }
-oximedia-360 = { version = "0.2.0", path = "crates/oximedia-360" }
-oximedia-analytics = { version = "0.2.0", path = "crates/oximedia-analytics" }
-oximedia-caption-gen = { version = "0.2.0", path = "crates/oximedia-caption-gen" }
-oximedia-ml = { version = "0.2.0", path = "crates/oximedia-ml" }
+oximedia-core = { version = "0.2.1", path ="crates/oximedia-core" }
+oximedia-io = { version = "0.2.1", path ="crates/oximedia-io" }
+oximedia-codec = { version = "0.2.1", path ="crates/oximedia-codec", default-features = false }
+oximedia-container = { version = "0.2.1", path ="crates/oximedia-container" }
+oximedia-audio = { version = "0.2.1", path ="crates/oximedia-audio" }
+oximedia-audio-analysis = { version = "0.2.1", path ="crates/oximedia-audio-analysis" }
+oximedia-audiopost = { version = "0.2.1", path ="crates/oximedia-audiopost" }
+oximedia-effects = { version = "0.2.1", path ="crates/oximedia-effects" }
+oximedia-vfx = { version = "0.2.1", path ="crates/oximedia-vfx" }
+oximedia-graph = { version = "0.2.1", path ="crates/oximedia-graph" }
+oximedia-cv = { version = "0.2.1", path ="crates/oximedia-cv" }
+oximedia-net = { version = "0.2.1", path ="crates/oximedia-net" }
+oximedia-ndi = { version = "0.2.1", path ="crates/oximedia-ndi" }
+oximedia-accel = { version = "0.2.1", path ="crates/oximedia-accel" }
+oximedia-edit = { version = "0.2.1", path ="crates/oximedia-edit" }
+oximedia-gpu = { version = "0.2.1", path ="crates/oximedia-gpu" }
+oximedia-subtitle = { version = "0.2.1", path ="crates/oximedia-subtitle" }
+oximedia-captions = { version = "0.2.1", path ="crates/oximedia-captions" }
+oximedia-packager = { version = "0.2.1", path ="crates/oximedia-packager" }
+oximedia-jobs = { version = "0.2.1", path ="crates/oximedia-jobs" }
+oximedia-server = { version = "0.2.1", path ="crates/oximedia-server" }
+oximedia-qc = { version = "0.2.1", path ="crates/oximedia-qc" }
+oximedia-auto = { version = "0.2.1", path ="crates/oximedia-auto" }
+oximedia-drm = { version = "0.2.1", path ="crates/oximedia-drm" }
+oximedia-dedup = { version = "0.2.1", path ="crates/oximedia-dedup" }
+oximedia-archive = { version = "0.2.1", path ="crates/oximedia-archive" }
+oximedia-archive-pro = { version = "0.2.1", path ="crates/oximedia-archive-pro" }
+oximedia-timecode = { version = "0.2.1", path ="crates/oximedia-timecode" }
+oximedia-timeline = { version = "0.2.1", path ="crates/oximedia-timeline" }
+oximedia-timesync = { version = "0.2.1", path ="crates/oximedia-timesync" }
+oximedia-storage = { version = "0.2.1", path ="crates/oximedia-storage" }
+oximedia-distributed = { version = "0.2.1", path ="crates/oximedia-distributed" }
+oximedia-farm = { version = "0.2.1", path ="crates/oximedia-farm" }
+oximedia-collab = { version = "0.2.1", path ="crates/oximedia-collab" }
+oximedia-simd = { version = "0.2.1", path ="crates/oximedia-simd" }
+oximedia-mam = { version = "0.2.1", path ="crates/oximedia-mam" }
+oximedia-forensics = { version = "0.2.1", path ="crates/oximedia-forensics" }
+oximedia-playout = { version = "0.2.1", path ="crates/oximedia-playout" }
+oximedia-scopes = { version = "0.2.1", path ="crates/oximedia-scopes" }
+oximedia-dolbyvision = { version = "0.2.1", path ="crates/oximedia-dolbyvision" }
+oximedia-bitstream = { version = "0.2.1", path = "crates/oximedia-bitstream" }
+oximedia-mixer = { version = "0.2.1", path ="crates/oximedia-mixer" }
+oximedia-aaf = { version = "0.2.1", path ="crates/oximedia-aaf" }
+oximedia-image = { version = "0.2.1", path ="crates/oximedia-image" }
+oximedia-metering = { version = "0.2.1", path ="crates/oximedia-metering" }
+oximedia-monitor = { version = "0.2.1", path ="crates/oximedia-monitor" }
+oximedia-stream = { version = "0.2.1", path ="crates/oximedia-stream" }
+oximedia-normalize = { version = "0.2.1", path ="crates/oximedia-normalize" }
+oximedia-restore = { version = "0.2.1", path ="crates/oximedia-restore" }
+oximedia-restoration = { version = "0.2.1", path ="crates/oximedia-restoration" }
+oximedia-mir = { version = "0.2.1", path ="crates/oximedia-mir" }
+oximedia-imf = { version = "0.2.1", path ="crates/oximedia-imf" }
+oximedia-edl = { version = "0.2.1", path ="crates/oximedia-edl" }
+oximedia-align = { version = "0.2.1", path ="crates/oximedia-align" }
+oximedia-bench = { version = "0.2.1", path ="crates/oximedia-bench" }
+oximedia-metadata = { version = "0.2.1", path ="crates/oximedia-metadata" }
+oximedia-lut = { version = "0.2.1", path ="crates/oximedia-lut" }
+oximedia-watermark = { version = "0.2.1", path ="crates/oximedia-watermark" }
+oximedia-quality = { version = "0.2.1", path ="crates/oximedia-quality" }
+oximedia-analysis = { version = "0.2.1", path ="crates/oximedia-analysis" }
+oximedia-switcher = { version = "0.2.1", path ="crates/oximedia-switcher" }
+oximedia-transcode = { version = "0.2.1", path ="crates/oximedia-transcode" }
+oximedia-denoise = { version = "0.2.1", path ="crates/oximedia-denoise" }
+oximedia-multicam = { version = "0.2.1", path ="crates/oximedia-multicam" }
+oximedia-scene = { version = "0.2.1", path ="crates/oximedia-scene" }
+oximedia-stabilize = { version = "0.2.1", path ="crates/oximedia-stabilize" }
+oximedia-optimize = { version = "0.2.1", path ="crates/oximedia-optimize" }
+oximedia-calibrate = { version = "0.2.1", path ="crates/oximedia-calibrate" }
+oximedia-search = { version = "0.2.1", path ="crates/oximedia-search" }
+oximedia-proxy = { version = "0.2.1", path ="crates/oximedia-proxy" }
+oximedia-playlist = { version = "0.2.1", path ="crates/oximedia-playlist" }
+oximedia-clips = { version = "0.2.1", path ="crates/oximedia-clips" }
+oximedia-routing = { version = "0.2.1", path ="crates/oximedia-routing" }
+oximedia-automation = { version = "0.2.1", path ="crates/oximedia-automation" }
+oximedia-presets = { version = "0.2.1", path ="crates/oximedia-presets" }
+oximedia-shots = { version = "0.2.1", path ="crates/oximedia-shots" }
+oximedia-access = { version = "0.2.1", path ="crates/oximedia-access" }
+oximedia-convert = { version = "0.2.1", path ="crates/oximedia-convert" }
+oximedia-rights = { version = "0.2.1", path ="crates/oximedia-rights" }
+oximedia-virtual = { version = "0.2.1", path ="crates/oximedia-virtual" }
+oximedia-gaming = { version = "0.2.1", path ="crates/oximedia-gaming" }
+oximedia-profiler = { version = "0.2.1", path ="crates/oximedia-profiler" }
+oximedia-recommend = { version = "0.2.1", path ="crates/oximedia-recommend" }
+oximedia-repair = { version = "0.2.1", path ="crates/oximedia-repair" }
+oximedia-review = { version = "0.2.1", path ="crates/oximedia-review" }
+oximedia-scaling = { version = "0.2.1", path ="crates/oximedia-scaling" }
+oximedia-workflow = { version = "0.2.1", path ="crates/oximedia-workflow" }
+oximedia-graphics = { version = "0.2.1", path ="crates/oximedia-graphics" }
+oximedia-cloud = { version = "0.2.1", path ="crates/oximedia-cloud" }
+oximedia-conform = { version = "0.2.1", path ="crates/oximedia-conform" }
+oximedia-videoip = { version = "0.2.1", path ="crates/oximedia-videoip" }
+oximedia-video = { version = "0.2.1", path ="crates/oximedia-video" }
+oximedia-colormgmt = { version = "0.2.1", path ="crates/oximedia-colormgmt" }
+oximedia-batch = { version = "0.2.1", path ="crates/oximedia-batch" }
+oximedia-renderfarm = { version = "0.2.1", path ="crates/oximedia-renderfarm" }
+oximedia-neural = { version = "0.2.1", path ="crates/oximedia-neural" }
+oximedia-compat-ffmpeg = { version = "0.2.1", path ="crates/oximedia-compat-ffmpeg" }
+oximedia-compat-cv2 = { version = "0.2.1", path ="crates/oximedia-compat-cv2" }
+oximedia-plugin = { version = "0.2.1", path ="crates/oximedia-plugin" }
+oximedia-hdr = { version = "0.2.1", path ="crates/oximedia-hdr" }
+oximedia-spatial = { version = "0.2.1", path ="crates/oximedia-spatial" }
+oximedia-cache = { version = "0.2.1", path ="crates/oximedia-cache" }
+oximedia-cdn = { version = "0.2.1", path ="crates/oximedia-cdn" }
+oximedia-pipeline = { version = "0.2.1", path ="crates/oximedia-pipeline" }
+oximedia-image-transform = { version = "0.2.1", path ="crates/oximedia-image-transform" }
+oximedia-360 = { version = "0.2.1", path = "crates/oximedia-360" }
+oximedia-analytics = { version = "0.2.1", path = "crates/oximedia-analytics" }
+oximedia-caption-gen = { version = "0.2.1", path = "crates/oximedia-caption-gen" }
+oximedia-ml = { version = "0.2.1", path = "crates/oximedia-ml" }
 numpy = "0.29"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
 serde_yaml_ng = "0.10"

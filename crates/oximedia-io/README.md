@@ -37,7 +37,7 @@ Part of the [OxiMedia](https://github.com/cool-japan/oximedia) multimedia framew
 
 ```toml
 [dependencies]
-oximedia-io = "0.1.9"
+oximedia-io = "0.2.0"
 ```
 
 ### Detect media format
