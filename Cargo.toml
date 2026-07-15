@@ -594,7 +594,7 @@ azure_storage_blobs = { version = "1.0", package = "azure_storage_blob", default
 
 # Google Cloud
 google-cloud-storage = "1.15"
-scirs2-core = { version = "0.6.0", features = ["random", "linalg", "simd"] }
+scirs2-core = { version = "0.6.1", features = ["random", "linalg", "simd"] }
 oxifft = "0.3.2"
 oxionnx = "0.1.4"
 
