@@ -132,7 +132,7 @@ src/
 
 ```toml
 [dependencies]
-oximedia-cv = { version = "0.1.9", features = ["onnx"] }
+oximedia-cv = { version = "0.2.0", features = ["onnx"] }
 ```
 
 ## License

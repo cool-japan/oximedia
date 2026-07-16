@@ -38,7 +38,7 @@ Add to your `Cargo.toml`:
 [dependencies]
 oximedia-graphics = "0.2.0"
 # With GPU and server features (default):
-oximedia-graphics = { version = "0.1.9", features = ["gpu", "server"] }
+oximedia-graphics = { version = "0.2.0", features = ["gpu", "server"] }
 ```
 
 ## Feature Flags
@@ -108,7 +108,7 @@ oximedia-graphics = { version = "0.1.9", features = ["gpu", "server"] }
 
 ```toml
 [dependencies]
-oximedia-graphics = { version = "0.1.9", features = ["gpu"] }
+oximedia-graphics = { version = "0.2.0", features = ["gpu"] }
 ```
 
 See the `examples/` directory for broadcast graphics usage examples.

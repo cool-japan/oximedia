@@ -45,7 +45,7 @@ Add to your `Cargo.toml`:
 [dependencies]
 oximedia-drm = "0.2.0"
 # Enable specific DRM systems:
-oximedia-drm = { version = "0.1.9", features = ["all-drm"] }
+oximedia-drm = { version = "0.2.0", features = ["all-drm"] }
 ```
 
 ## Feature Flags

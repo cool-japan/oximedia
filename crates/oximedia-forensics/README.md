@@ -42,7 +42,7 @@ Add to your `Cargo.toml`:
 [dependencies]
 oximedia-forensics = "0.2.0"
 # With computer vision features:
-oximedia-forensics = { version = "0.1.9", features = ["cv"] }
+oximedia-forensics = { version = "0.2.0", features = ["cv"] }
 ```
 
 ## Feature Flags

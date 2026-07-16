@@ -47,7 +47,7 @@ These prerequisites are only needed when explicitly opting in:
 
 ```toml
 [dependencies]
-oximedia-accel = { version = "0.1.9", features = ["vulkan-backend"] }
+oximedia-accel = { version = "0.2.0", features = ["vulkan-backend"] }
 ```
 
 Without `vulkan-backend` (the default), `vulkano`/`vulkano-shaders` are not

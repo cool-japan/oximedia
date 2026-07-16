@@ -36,7 +36,7 @@ Add to your `Cargo.toml`:
 oximedia-packager = "0.2.0"
 
 # Optional features
-# oximedia-packager = { version = "0.1.9", features = ["encryption", "s3"] }
+# oximedia-packager = { version = "0.2.0", features = ["encryption", "s3"] }
 ```
 
 ```rust

@@ -22,7 +22,7 @@ Version: 0.2.0 — 2026-07-15 — extensively tested
 
 ```toml
 [dependencies]
-oximedia-bitstream = { version = "0.1.9" }
+oximedia-bitstream = { version = "0.2.0" }
 ```
 
 ### Reading bits

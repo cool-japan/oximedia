@@ -32,7 +32,7 @@ Add to your `Cargo.toml`:
 [dependencies]
 oximedia-colormgmt = "0.2.0"
 # Optional features:
-oximedia-colormgmt = { version = "0.1.9", features = ["lut-integration", "gpu-accel"] }
+oximedia-colormgmt = { version = "0.2.0", features = ["lut-integration", "gpu-accel"] }
 ```
 
 ```rust

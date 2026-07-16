@@ -17,6 +17,8 @@
 //! A REAL libvpx inter frame (frame 2 of the IVF stream) must produce the
 //! honest `UnsupportedFeature` error — never a blank frame.
 
+#![cfg(feature = "vp8")]
+
 mod vp8_fixtures;
 
 use oximedia_codec::error::CodecError;

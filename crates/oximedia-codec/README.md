@@ -50,7 +50,7 @@ Add to your `Cargo.toml`:
 [dependencies]
 oximedia-codec = "0.2.0"
 # or with additional codecs:
-oximedia-codec = { version = "0.1.9", features = ["av1", "vp9", "vp8", "opus"] }
+oximedia-codec = { version = "0.2.0", features = ["av1", "vp9", "vp8", "opus"] }
 ```
 
 ### AV1 / VP9 / VP8 / Theora Bitstream Parsing

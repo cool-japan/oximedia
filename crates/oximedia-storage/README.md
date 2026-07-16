@@ -88,10 +88,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-storage = { version = "0.1.9", features = ["azure", "gcs"] }
+oximedia-storage = { version = "0.2.0", features = ["azure", "gcs"] }
 
 # Enable S3 / MinIO (requires Rust 1.91+)
-# oximedia-storage = { version = "0.1.9", features = ["minio"] }
+# oximedia-storage = { version = "0.2.0", features = ["minio"] }
 ```
 
 ```rust

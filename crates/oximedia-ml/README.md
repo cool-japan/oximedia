@@ -16,13 +16,13 @@ The default build pulls in **zero** ONNX symbols; enable the `onnx` feature to o
 
 ```toml
 [dependencies]
-oximedia-ml = { version = "0.1.9", features = ["scene-classifier"] }
+oximedia-ml = { version = "0.2.0", features = ["scene-classifier"] }
 ```
 
 To enable all pipelines:
 
 ```toml
-oximedia-ml = { version = "0.1.9", features = ["all-pipelines"] }
+oximedia-ml = { version = "0.2.0", features = ["all-pipelines"] }
 ```
 
 ## Quick Start
