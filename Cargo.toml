@@ -557,8 +557,8 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 tonic = "0.14"
 prost = "0.14"
 prost-types = "0.14"
-oxisql-core = "0.3.2"
-oxisql-sqlite-compat = { version = "0.3.2", features = ["blocking"] }
+oxisql-core = "0.3.3"
+oxisql-sqlite-compat = { version = "0.3.3", features = ["blocking"] }
 dashmap = "6.2"
 parking_lot = "0.12"
 uuid = { version = "1.23", features = ["v4", "serde", "js"] }
