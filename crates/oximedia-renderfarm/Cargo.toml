@@ -44,6 +44,14 @@ oximedia-monitor = { workspace = true }
 oximedia-storage = { workspace = true }
 oximedia-distributed = { workspace = true }
 oximedia-net = { workspace = true }
+# Real post-render output assembly: MJPEG-in-AVI / Y4M muxing.
+oximedia-container = { workspace = true }
+# Real post-render quality metrics: PSNR/SSIM/blockiness/blur.
+oximedia-quality = { workspace = true }
+# Real frame decode (JPEG/PNG/WebP) for output assembly + quality metrics.
+# `image-io` is a default feature upstream but the workspace pins
+# `default-features = false`, so it must be re-enabled explicitly here.
+oximedia-codec = { workspace = true, features = ["image-io"] }
 
 # Additional dependencies
 axum = { workspace = true }
@@ -59,6 +67,7 @@ tokio-util = { workspace = true }
 # build of this crate would compile C/assembly SIMD kernels via `cc`.
 blake3.workspace = true
 sha2 = { workspace = true }
+hex = { workspace = true }
 oxiarc-lz4 = { workspace = true }
 oxiarc-zstd = { workspace = true }
 walkdir.workspace = true
@@ -74,6 +83,8 @@ memmap2 = { workspace = true }
 tempfile.workspace = true
 criterion = { workspace = true }
 proptest = { workspace = true }
+# Real JPEG/PNG encode for building test fixtures (assembly/quality tests).
+oximedia-image = { workspace = true }
 
 [[bench]]
 name = "scheduler"

@@ -1,6 +1,6 @@
 //! Metadata writing to container formats.
 //!
-//! FLAC's writer lives in the sibling [`flac`] module (split out to keep
+//! FLAC's writer lives in the sibling `flac` module (split out to keep
 //! this file under the workspace's per-file size guideline); it is
 //! re-exported here so `crate::metadata::writer::FlacMetadataWriter` keeps
 //! resolving exactly as before.

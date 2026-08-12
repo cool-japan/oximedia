@@ -154,28 +154,67 @@ fn make_mpeg2_encoder(_params: &VideoEncoderParams) -> Result<Box<dyn VideoEncod
 // ─── FFV1 ────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ffv1")]
-fn make_ffv1_encoder(params: &VideoEncoderParams) -> Result<Box<dyn VideoEncoder>> {
+fn ffv1_encoder_config(params: &VideoEncoderParams) -> oximedia_codec::traits::EncoderConfig {
     use oximedia_codec::traits::EncoderConfig;
-    use oximedia_codec::Ffv1Encoder;
     use oximedia_core::PixelFormat;
 
     // FFV1 is lossless — `quality` has no effect. All-intra (keyint = 1)
     // keeps every frame independently decodable.
-    let config = EncoderConfig {
+    EncoderConfig {
         codec: CodecId::Ffv1,
         width: params.width,
         height: params.height,
         pixel_format: PixelFormat::Yuv420p,
         keyint: 1,
         ..EncoderConfig::default()
-    };
-    let encoder =
-        Ffv1Encoder::new(config).map_err(|e| TranscodeError::CodecError(e.to_string()))?;
+    }
+}
+
+#[cfg(feature = "ffv1")]
+fn make_ffv1_encoder(params: &VideoEncoderParams) -> Result<Box<dyn VideoEncoder>> {
+    use oximedia_codec::Ffv1Encoder;
+
+    let encoder = Ffv1Encoder::new(ffv1_encoder_config(params))
+        .map_err(|e| TranscodeError::CodecError(e.to_string()))?;
     Ok(Box::new(encoder))
 }
 
 #[cfg(not(feature = "ffv1"))]
 fn make_ffv1_encoder(_params: &VideoEncoderParams) -> Result<Box<dyn VideoEncoder>> {
+    Err(TranscodeError::Unsupported(
+        "FFV1 support requires the `ffv1` feature of oximedia-codec".into(),
+    ))
+}
+
+/// Computes the FFV1 extradata (configuration record) for `params` without
+/// keeping the encoder around — used by the frame-level engine's raw-FFV1
+/// sink, which needs the extradata *before* any packets are produced (to
+/// write it into the file header) but consumes the actual encoder only
+/// through the boxed [`VideoEncoder`] trait object from
+/// [`make_video_encoder`]. Deterministic: `Ffv1Encoder::new` derives
+/// `Ffv1Config` purely from `width`/`height`, so this always matches the
+/// extradata the real encoder for the same `params` would report.
+///
+/// # Errors
+///
+/// Same as [`make_video_encoder`] for [`oximedia_core::CodecId::Ffv1`].
+#[cfg(feature = "ffv1")]
+pub fn ffv1_extradata(params: &VideoEncoderParams) -> Result<Vec<u8>> {
+    use oximedia_codec::Ffv1Encoder;
+
+    let encoder = Ffv1Encoder::new(ffv1_encoder_config(params))
+        .map_err(|e| TranscodeError::CodecError(e.to_string()))?;
+    Ok(encoder.extradata())
+}
+
+/// See the `ffv1` feature-enabled overload.
+///
+/// # Errors
+///
+/// Always returns [`TranscodeError::Unsupported`] — the `ffv1` feature of
+/// `oximedia-codec` is not compiled in.
+#[cfg(not(feature = "ffv1"))]
+pub fn ffv1_extradata(_params: &VideoEncoderParams) -> Result<Vec<u8>> {
     Err(TranscodeError::Unsupported(
         "FFV1 support requires the `ffv1` feature of oximedia-codec".into(),
     ))
@@ -277,5 +316,192 @@ mod tests {
         let p = VideoEncoderParams::new(320, 240, 22).expect("valid");
         let result = make_video_encoder(CodecId::Apv, &p);
         assert!(matches!(result, Err(TranscodeError::Unsupported(_))));
+    }
+
+    // ── ProRes: what does this codec genuinely support? ───────────────────
+    //
+    // This is the empirical basis for frame_level.rs's honest-Err message
+    // on the ProRes video target (task: "check what the in-tree ProRes
+    // codec genuinely supports"). Findings, verified here:
+    //
+    // - The encoder is real: it accepts genuine 10-bit 4:2:2 (`Yuv422p10le`)
+    //   input and produces a real ProRes 'icpf' bitstream (verified below:
+    //   distinct 10-bit inputs produce distinct, non-trivial output).
+    // - The decoder is real but its output is capped at 8 bits: both
+    //   `ProResDecoder::decode` and the `VideoDecoder::send_packet` /
+    //   `receive_frame` path right-shift the internally-reconstructed
+    //   10-bit planes by 2 before returning them (see
+    //   `oximedia_codec::prores::decoder::decode_impl`'s "Convert 10-bit
+    //   planes to 8-bit output" step) — there is no API that returns 10-bit
+    //   decoded samples. So even with a genuine 10-bit source, this codec
+    //   cannot deliver a 10-bit-in/10-bit-out round trip.
+    /// Builds a plane split into 4 constant-value quadrants — genuinely
+    /// varying (non-degenerate) 10-bit content that still aligns with
+    /// 8×8-ish DCT block boundaries, so quantization error stays small
+    /// (matching the flat-frame tolerances `oximedia-codec`'s own
+    /// `prores_roundtrip.rs` suite uses; an arbitrary per-pixel pattern
+    /// is adversarial for any DCT codec and isn't representative of real
+    /// video).
+    #[cfg(feature = "prores")]
+    fn quadrant_plane(width: usize, height: usize, values: [u16; 4]) -> Vec<u16> {
+        let (half_w, half_h) = (width / 2, height / 2);
+        let mut out = Vec::with_capacity(width * height);
+        for row in 0..height {
+            for col in 0..width {
+                let qi = usize::from(col >= half_w) + 2 * usize::from(row >= half_h);
+                out.push(values[qi]);
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "prores")]
+    #[test]
+    fn test_prores_genuine_10bit_encode_8bit_decode_roundtrip() {
+        use oximedia_codec::frame::{Plane, VideoFrame};
+        use oximedia_codec::prores::{ProResDecoder, ProResEncoderConfig, ProResProfile};
+        use oximedia_codec::traits::VideoEncoder;
+        use oximedia_codec::ProResEncoder;
+        use oximedia_core::PixelFormat;
+
+        // 16-pixel-aligned (ProRes slice requirement), genuinely 10-bit,
+        // genuinely varying (4 distinct quadrant values, moderate contrast)
+        // — NOT derived by shifting 8-bit data, and not so high-contrast
+        // that it hits the entropy-decoder limitation documented in
+        // `test_prores_decoder_rejects_high_contrast_content` below.
+        let (w, h) = (16u32, 16u32);
+        let cw = (w / 2) as usize;
+        let y_10bit = quadrant_plane(w as usize, h as usize, [420, 480, 540, 600]);
+        let cb_10bit = quadrant_plane(cw, h as usize, [460, 520, 500, 560]);
+        let cr_10bit = quadrant_plane(cw, h as usize, [560, 500, 520, 460]);
+
+        let to_le_bytes =
+            |samples: &[u16]| -> Vec<u8> { samples.iter().flat_map(|s| s.to_le_bytes()).collect() };
+
+        let mut frame = VideoFrame::new(PixelFormat::Yuv422p10le, w, h);
+        frame.planes = vec![
+            Plane::with_dimensions(to_le_bytes(&y_10bit), w as usize * 2, w, h),
+            Plane::with_dimensions(to_le_bytes(&cb_10bit), cw * 2, w / 2, h),
+            Plane::with_dimensions(to_le_bytes(&cr_10bit), cw * 2, w / 2, h),
+        ];
+
+        let config = ProResEncoderConfig::new(ProResProfile::Standard, w, h);
+        let mut encoder = ProResEncoder::new(config).expect("real 10-bit prores encoder");
+        encoder
+            .send_frame(&frame)
+            .expect("encode genuine 10-bit frame");
+        let packet = encoder
+            .receive_packet()
+            .expect("receive_packet")
+            .expect("encoder must produce a packet for one sent frame");
+        assert!(
+            packet.data.len() > 16,
+            "encoded ProRes packet suspiciously small: {} bytes",
+            packet.data.len()
+        );
+
+        let decoded = ProResDecoder::decode(&packet.data).expect("real prores decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(
+            decoded.y.len(),
+            y_10bit.len(),
+            "decoder output is 8-bit (not 10-bit)"
+        );
+
+        // The decoder's contract is "10-bit internal reconstruction >> 2".
+        // ProRes is a DCT/quantization codec (visually, not mathematically,
+        // lossless), so compare against that expectation within tolerance,
+        // not bit-exact.
+        let expected_y8: Vec<u8> = y_10bit.iter().map(|&s| (s >> 2) as u8).collect();
+        let max_diff = expected_y8
+            .iter()
+            .zip(decoded.y.iter())
+            .map(|(&a, &b)| (i32::from(a) - i32::from(b)).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_diff <= 8,
+            "10-bit-encode -> 8-bit-decode luma drifted too far: max diff {max_diff} \
+             (encoder/decoder pipeline is not functioning as real DCT codec)"
+        );
+
+        // A different 10-bit source must produce different encoded bytes —
+        // guards against a stub encoder that ignores its input.
+        let mut frame2 = frame.clone();
+        frame2.planes[0].data =
+            to_le_bytes(&y_10bit.iter().map(|&s| 1023 - s).collect::<Vec<u16>>());
+        let mut encoder2 =
+            ProResEncoder::new(ProResEncoderConfig::new(ProResProfile::Standard, w, h))
+                .expect("encoder 2");
+        encoder2.send_frame(&frame2).expect("encode inverted frame");
+        let packet2 = encoder2
+            .receive_packet()
+            .expect("receive_packet 2")
+            .expect("packet 2");
+        assert_ne!(
+            packet.data, packet2.data,
+            "encoder must not ignore its 10-bit input"
+        );
+    }
+
+    /// Documents a further finding beyond the 8-bit-decode ceiling: this
+    /// build's `ProResDecoder` also fails outright — `DecoderError`,
+    /// "entropy decode: malformed codeword (unary prefix too long)" — on
+    /// content with a large sample-value swing within one macroblock (a
+    /// 500 → 900 step reproduces it; 500 → 600 does not), even though
+    /// `ProResEncoder::send_frame`/`receive_packet` succeed and produce a
+    /// non-trivial packet for the same input. High-contrast content (a
+    /// sharp edge, a title card, a specular highlight) is unremarkable in
+    /// real video, so this is a real robustness gap in the encoder/decoder
+    /// pair, not just a synthetic-test artifact — a second, independent
+    /// reason (beyond the pipeline/bit-depth issues) that ProRes stays
+    /// honest-`Err` in `frame_level.rs` rather than being wired up.
+    ///
+    /// This asserts today's (broken) behavior on purpose: if a future
+    /// `oximedia-codec` fix makes this decode succeed, this test starts
+    /// failing, which is the signal to revisit the ProRes wiring decision
+    /// — not a bug in this test.
+    #[cfg(feature = "prores")]
+    #[test]
+    fn test_prores_decoder_rejects_high_contrast_content() {
+        use oximedia_codec::frame::{Plane, VideoFrame};
+        use oximedia_codec::prores::{ProResDecoder, ProResEncoderConfig, ProResProfile};
+        use oximedia_codec::traits::VideoEncoder;
+        use oximedia_codec::ProResEncoder;
+        use oximedia_core::PixelFormat;
+
+        let (w, h) = (16u32, 16u32);
+        let cw = (w / 2) as usize;
+        // A hard 500 -> 900 edge at the halfway column, one macroblock.
+        let y_10bit: Vec<u16> = (0..h)
+            .flat_map(|_row| (0..w).map(|col| if col < 8 { 500u16 } else { 900u16 }))
+            .collect();
+        let flat_chroma = vec![512u16; cw * h as usize];
+        let to_le_bytes =
+            |samples: &[u16]| -> Vec<u8> { samples.iter().flat_map(|s| s.to_le_bytes()).collect() };
+        let mut frame = VideoFrame::new(PixelFormat::Yuv422p10le, w, h);
+        frame.planes = vec![
+            Plane::with_dimensions(to_le_bytes(&y_10bit), w as usize * 2, w, h),
+            Plane::with_dimensions(to_le_bytes(&flat_chroma), cw * 2, w / 2, h),
+            Plane::with_dimensions(to_le_bytes(&flat_chroma), cw * 2, w / 2, h),
+        ];
+        let config = ProResEncoderConfig::new(ProResProfile::Standard, w, h);
+        let mut encoder = ProResEncoder::new(config).expect("encoder accepts the frame");
+        encoder
+            .send_frame(&frame)
+            .expect("encoder accepts high-contrast content");
+        let packet = encoder
+            .receive_packet()
+            .expect("receive_packet")
+            .expect("encoder produces a packet");
+
+        let result = ProResDecoder::decode(&packet.data);
+        assert!(
+            result.is_err(),
+            "expected the known entropy-decoder limitation on high-contrast \
+             content to still reproduce; if this now succeeds, ProRes may be \
+             ready to reconsider for frame_level.rs wiring"
+        );
     }
 }

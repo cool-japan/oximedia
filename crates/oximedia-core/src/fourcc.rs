@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_from_array_trait() {
-        let fcc: FourCC = [b'V', b'P', b'8', b'0'].into();
+        let fcc: FourCC = (*b"VP80").into();
         assert!(fcc.is_video());
     }
 

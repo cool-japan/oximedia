@@ -31,6 +31,7 @@
 
 use crate::error::{Result, WorkflowError};
 use crate::task::{Task, TaskId, TaskResult, TaskState};
+use crate::task_exec::{self, http::StatusAllowList, TaskOutcome};
 use crate::workflow::{Workflow, WorkflowId, WorkflowState};
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -1144,91 +1145,79 @@ pub struct ExecutionResult {
 }
 
 /// Default task executor implementation.
+///
+/// Every media-oriented task type is executed **for real** through
+/// [`crate::task_exec`]:
+///
+/// - [`TaskType::HttpRequest`] sends the request with `reqwest` and fails on
+///   an unaccepted status,
+/// - [`TaskType::Transcode`] runs an `oximedia-transcode` pipeline and
+///   verifies the produced file,
+/// - [`TaskType::QualityControl`] runs `oximedia-qc` rules and fails when the
+///   report fails,
+/// - [`TaskType::Analysis`] decodes the input and runs the requested
+///   `oximedia-analysis` / `oximedia-audio-analysis` / `oximedia-quality`
+///   measurements,
+/// - [`TaskType::CustomScript`] spawns the process and checks its exit status,
+/// - [`TaskType::Transfer`] copies the file for
+///   [`TransferProtocol::Local`](crate::task::TransferProtocol::Local).
+///
+/// Two arms remain **simulation only** and report success without performing
+/// the work — provide a custom [`TaskExecutor`] when a workflow depends on
+/// them: remote [`TaskType::Transfer`] protocols (FTP/SFTP/S3/HTTP/rsync) and
+/// [`TaskType::Notification`] delivery.
+///
+/// [`TaskType::HttpRequest`]: crate::task::TaskType::HttpRequest
+/// [`TaskType::Transcode`]: crate::task::TaskType::Transcode
+/// [`TaskType::QualityControl`]: crate::task::TaskType::QualityControl
+/// [`TaskType::Analysis`]: crate::task::TaskType::Analysis
+/// [`TaskType::CustomScript`]: crate::task::TaskType::CustomScript
+/// [`TaskType::Transfer`]: crate::task::TaskType::Transfer
+/// [`TaskType::Notification`]: crate::task::TaskType::Notification
 pub struct DefaultTaskExecutor;
 
-#[async_trait]
-impl TaskExecutor for DefaultTaskExecutor {
-    async fn execute(&self, task: &Task) -> Result<TaskResult> {
+impl DefaultTaskExecutor {
+    /// Runs a task and returns the evidence it produced.
+    ///
+    /// Errors returned here become a [`TaskState::Failed`] result in
+    /// [`TaskExecutor::execute`], which is what makes the DAG mark the task —
+    /// and every dependant — as failed.
+    async fn run(&self, task: &Task) -> Result<TaskOutcome> {
         use crate::task::TaskType;
 
-        let start = Instant::now();
-
-        let result: Result<()> = match &task.task_type {
+        match &task.task_type {
             TaskType::Wait { duration } => {
                 tokio::time::sleep(*duration).await;
-                Ok(())
+                Ok(TaskOutcome::empty())
             }
             TaskType::HttpRequest {
                 url,
                 method,
-                headers: _,
-                body: _,
+                headers,
+                body,
             } => {
-                debug!("HTTP {:?} request to: {}", method, url);
-                // HTTP client integration would go here (reqwest / hyper).
-                // At the workflow-engine layer we log the intent and succeed;
-                // callers that need real HTTP should provide a custom TaskExecutor.
-                info!("HTTP {} {}", format!("{:?}", method).to_uppercase(), url);
-                Ok(())
+                let allow_status = StatusAllowList::from_metadata(&task.metadata)?;
+                task_exec::http::execute_http_request(
+                    url,
+                    method,
+                    headers,
+                    body.as_deref(),
+                    task.timeout,
+                    &allow_status,
+                )
+                .await
             }
             TaskType::Transcode {
                 input,
                 output,
                 preset,
-                params: _,
-            } => {
-                info!("Transcode: {:?} → {:?} (preset: {})", input, output, preset);
-                // Validate that the input path exists before handing off to a
-                // transcode engine.  The actual codec pipeline is implemented in
-                // oximedia-transcode; this executor records the intent and
-                // succeeds so the workflow graph continues.
-                if !input.exists() {
-                    return Err(WorkflowError::generic(format!(
-                        "Transcode input not found: {}",
-                        input.display()
-                    )));
-                }
-                // Ensure parent directory of output exists.
-                if let Some(parent) = output.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                            WorkflowError::generic(format!(
-                                "Cannot create output directory {}: {e}",
-                                parent.display()
-                            ))
-                        })?;
-                    }
-                }
-                info!("Transcode task recorded for {:?}", output);
-                Ok(())
-            }
+                params,
+            } => task_exec::transcode::execute_transcode(input, output, preset, params).await,
             TaskType::QualityControl {
                 input,
                 profile,
                 rules,
-            } => {
-                info!(
-                    "QualityControl: {:?} profile={} rules={:?}",
-                    input, profile, rules
-                );
-                if !input.exists() {
-                    return Err(WorkflowError::generic(format!(
-                        "QC input not found: {}",
-                        input.display()
-                    )));
-                }
-                // QC validation logic lives in oximedia-qc; here we confirm
-                // the file is reachable and log that QC was requested.
-                let metadata = tokio::fs::metadata(input)
-                    .await
-                    .map_err(|e| WorkflowError::generic(format!("QC metadata error: {e}")))?;
-                info!(
-                    "QC target size: {} bytes, profile: {}",
-                    metadata.len(),
-                    profile
-                );
-                Ok(())
-            }
+            } => task_exec::qc::execute_quality_control(input, profile, rules).await,
             TaskType::Transfer {
                 source,
                 destination,
@@ -1236,10 +1225,6 @@ impl TaskExecutor for DefaultTaskExecutor {
                 options: _,
             } => {
                 use crate::task::TransferProtocol;
-                info!("Transfer: {} → {} via {:?}", source, destination, protocol);
-                // For local-filesystem transfers we perform the copy directly.
-                // Remote protocols (S3, SFTP, FTP, rsync, HTTP) are handled by
-                // dedicated transfer agents; this executor logs the request.
                 match protocol {
                     TransferProtocol::Local => {
                         let src_path = std::path::Path::new(source.as_str());
@@ -1253,7 +1238,7 @@ impl TaskExecutor for DefaultTaskExecutor {
                                 })?;
                             }
                         }
-                        tokio::fs::copy(src_path, dst_path).await.map_err(|e| {
+                        let copied = tokio::fs::copy(src_path, dst_path).await.map_err(|e| {
                             WorkflowError::generic(format!(
                                 "Local copy {} → {} failed: {e}",
                                 src_path.display(),
@@ -1261,15 +1246,27 @@ impl TaskExecutor for DefaultTaskExecutor {
                             ))
                         })?;
                         info!("Local transfer complete: {} → {}", source, destination);
+                        Ok(TaskOutcome::with_data(serde_json::json!({
+                            "kind": "transfer",
+                            "protocol": "local",
+                            "source": source,
+                            "destination": destination,
+                            "bytes": copied,
+                        }))
+                        .and_output(dst_path.to_path_buf()))
                     }
                     other => {
-                        info!(
-                            "Remote transfer ({:?}) queued: {} → {}",
+                        // Simulation only: no bytes are moved. Documented on
+                        // `DefaultTaskExecutor`; supply a custom `TaskExecutor`
+                        // for real remote transfers.
+                        warn!(
+                            "Remote transfer ({:?}) NOT performed (no transfer agent in this \
+                             executor): {} → {}",
                             other, source, destination
                         );
+                        Ok(TaskOutcome::empty())
                     }
                 }
-                Ok(())
             }
             TaskType::Notification {
                 channel,
@@ -1277,6 +1274,8 @@ impl TaskExecutor for DefaultTaskExecutor {
                 metadata: _,
             } => {
                 use crate::task::NotificationChannel;
+                // Simulation only: nothing is delivered. Documented on
+                // `DefaultTaskExecutor`.
                 match channel {
                     NotificationChannel::Email { to, subject } => {
                         info!(
@@ -1300,7 +1299,7 @@ impl TaskExecutor for DefaultTaskExecutor {
                         info!("Notification [Discord] url={}: {}", webhook_url, message);
                     }
                 }
-                Ok(())
+                Ok(TaskOutcome::empty())
             }
             TaskType::CustomScript { script, args, env } => {
                 info!(
@@ -1331,41 +1330,18 @@ impl TaskExecutor for DefaultTaskExecutor {
                     )));
                 }
                 info!("Script {:?} completed successfully", script);
-                Ok(())
+                Ok(TaskOutcome::with_data(serde_json::json!({
+                    "kind": "custom_script",
+                    "script": script.display().to_string(),
+                    "args": args,
+                    "exit_code": status.code(),
+                })))
             }
             TaskType::Analysis {
                 input,
                 analyses,
                 output,
-            } => {
-                info!(
-                    "Analysis: {:?} types={:?} output={:?}",
-                    input, analyses, output
-                );
-                if !input.exists() {
-                    return Err(WorkflowError::generic(format!(
-                        "Analysis input not found: {}",
-                        input.display()
-                    )));
-                }
-                // If an output path was requested, ensure its parent exists.
-                if let Some(out_path) = output {
-                    if let Some(parent) = out_path.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                                WorkflowError::generic(format!(
-                                    "Cannot create analysis output dir: {e}"
-                                ))
-                            })?;
-                        }
-                    }
-                }
-                // Analysis engines live in oximedia-quality / oximedia-scene etc.
-                // This executor records the request and succeeds; real analysis
-                // is performed by the domain-specific pipeline.
-                info!("Analysis task recorded for {:?}", input);
-                Ok(())
-            }
+            } => task_exec::analysis::execute_analysis(input, analyses, output.as_deref()).await,
             TaskType::Conditional {
                 condition,
                 true_task,
@@ -1391,35 +1367,47 @@ impl TaskExecutor for DefaultTaskExecutor {
                     false_task.as_deref()
                 };
 
-                if let Some(inner_task) = branch_task {
-                    info!(
-                        "Conditional branch selected: condition={} task={}",
-                        condition_result, inner_task.name
-                    );
-                    // Recursively execute the selected branch task.
-                    let branch_result = self.execute(inner_task).await?;
-                    if !matches!(branch_result.status, TaskState::Completed) {
-                        return Err(WorkflowError::generic(format!(
-                            "Conditional branch task '{}' failed: {}",
-                            inner_task.name,
-                            branch_result.error.as_deref().unwrap_or("unknown")
-                        )));
-                    }
-                } else {
+                let Some(inner_task) = branch_task else {
                     debug!("Conditional task: selected branch has no task, skipping");
-                }
-                Ok(())
-            }
-        };
+                    return Ok(TaskOutcome::empty());
+                };
 
-        match result {
-            Ok(()) => Ok(TaskResult {
+                info!(
+                    "Conditional branch selected: condition={} task={}",
+                    condition_result, inner_task.name
+                );
+                // Recursively execute the selected branch task through the
+                // trait method, whose future `async_trait` already boxes.
+                let branch_result = self.execute(inner_task).await?;
+                if !matches!(branch_result.status, TaskState::Completed) {
+                    return Err(WorkflowError::generic(format!(
+                        "Conditional branch task '{}' failed: {}",
+                        inner_task.name,
+                        branch_result.error.as_deref().unwrap_or("unknown")
+                    )));
+                }
+                Ok(TaskOutcome {
+                    data: branch_result.data,
+                    outputs: branch_result.outputs,
+                })
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for DefaultTaskExecutor {
+    async fn execute(&self, task: &Task) -> Result<TaskResult> {
+        let start = Instant::now();
+
+        match self.run(task).await {
+            Ok(outcome) => Ok(TaskResult {
                 task_id: task.id,
                 status: TaskState::Completed,
-                data: None,
+                data: outcome.data,
                 error: None,
                 duration: start.elapsed(),
-                outputs: Vec::new(),
+                outputs: outcome.outputs,
             }),
             Err(e) => Ok(TaskResult {
                 task_id: task.id,

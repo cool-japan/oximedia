@@ -184,7 +184,10 @@ const ENCUMBERED_PARSE_NAMES: &[&str] = &[
     // H.264 / AVC
     "h264", "h.264", "avc", "avc1", // H.265 / HEVC
     "h265", "h.265", "hevc",
-    // AAC (still patent-encumbered in some jurisdictions through 2027)
+    // AAC. `CodecId::Aac` exists as an *identification-only* variant (stream
+    // inspectors and platform extensions must be able to name what they found),
+    // but it stays unreachable from a string so no name-driven code path can
+    // select AAC. See `types::codec_id`'s `FromStr` docs.
     "aac", "he-aac", "aac-lc", "mp4a", // AC-3 / E-AC-3 (Dolby)
     "ac3", "ac-3", "eac3", "eac-3", // DTS
     "dts", "dtshd", // VC-1 / WMV

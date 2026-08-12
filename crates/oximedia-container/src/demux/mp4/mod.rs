@@ -33,13 +33,16 @@
 
 mod atom;
 mod boxes;
+mod fragments;
 
 pub use atom::Mp4Atom;
 pub use boxes::{
     BoxHeader, BoxType, CttsEntry, FtypBox, MoovBox, MvhdBox, StscEntry, SttsEntry, TkhdBox,
     TrakBox,
 };
+pub use fragments::{parse_moof, parse_mvex, FragmentSample, MoofInfo, TrexBox};
 
+use std::collections::HashMap;
 use std::io::SeekFrom;
 
 use async_trait::async_trait;
@@ -49,7 +52,17 @@ use oximedia_io::MediaSource;
 
 use crate::demux::Demuxer;
 use crate::DecodeSkipCursor;
-use crate::{CodecParams, ContainerFormat, Metadata, Packet, PacketFlags, ProbeResult, StreamInfo};
+use crate::{
+    CodecParams, ContainerFormat, Metadata, Packet, PacketFlags, ProbeResult, SeekFlags,
+    SeekTarget, StreamInfo,
+};
+
+/// Upper bound on the size of a single `moof` box we will buffer in memory.
+///
+/// Real fragment headers are a few kilobytes; a crafted file could declare a
+/// multi-gigabyte `moof` purely to force an allocation. Anything larger than
+/// this is skipped rather than read.
+const MAX_MOOF_SIZE: u64 = 64 * 1024 * 1024;
 
 /// MP4/ISOBMFF demuxer supporting AV1 and VP9 only.
 ///
@@ -100,6 +113,12 @@ pub struct Mp4Demuxer<R> {
 
     /// Whether headers have been parsed.
     header_parsed: bool,
+
+    /// Whether the file declares `mvex` (i.e. is a fragmented MP4).
+    fragmented: bool,
+
+    /// Number of `moof` boxes consumed while parsing headers.
+    fragment_count: usize,
 }
 
 /// Per-track demuxing state.
@@ -117,8 +136,35 @@ pub struct TrackState {
     pub samples: Vec<SampleInfo>,
 }
 
+impl TrackState {
+    /// Returns the decode timestamp of the sample at `sample_index`.
+    ///
+    /// Past the end of the table this returns the track's total duration
+    /// (the DTS the next sample *would* have had).
+    #[must_use]
+    pub fn dts_at(&self, sample_index: usize) -> u64 {
+        self.samples.get(sample_index).map_or_else(
+            || {
+                self.samples
+                    .last()
+                    .map_or(0, |s| s.dts.saturating_add(u64::from(s.duration)))
+            },
+            |s| s.dts,
+        )
+    }
+
+    /// Returns the presentation timestamp of the sample at `sample_index`, or
+    /// `None` when the index is out of range.
+    #[must_use]
+    pub fn pts_at(&self, sample_index: usize) -> Option<i64> {
+        let sample = self.samples.get(sample_index)?;
+        let dts = i64::try_from(sample.dts).ok()?;
+        Some(dts.saturating_add(i64::from(sample.cts_offset)))
+    }
+}
+
 /// Information about a single sample in a track.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleInfo {
     /// Absolute offset in the file.
     pub offset: u64,
@@ -128,6 +174,13 @@ pub struct SampleInfo {
     pub duration: u32,
     /// Composition time offset (PTS - DTS).
     pub cts_offset: i32,
+    /// Absolute decode timestamp in media timescale units.
+    ///
+    /// Precomputed while the sample table is built (prefix sum of all
+    /// preceding sample durations, or the fragment's `tfdt` base plus the
+    /// intra-fragment prefix sum). Storing it makes packet emission O(1) per
+    /// sample instead of re-summing every predecessor.
+    pub dts: u64,
     /// Whether this sample is a sync point (keyframe).
     pub is_sync: bool,
 }
@@ -150,7 +203,30 @@ impl<R> Mp4Demuxer<R> {
             mdat_start: 0,
             mdat_size: 0,
             header_parsed: false,
+            fragmented: false,
+            fragment_count: 0,
         }
+    }
+
+    /// Returns `true` when the file declared an `mvex` box, i.e. it is a
+    /// fragmented MP4 whose samples come from `moof` boxes.
+    ///
+    /// Only meaningful after [`probe`](Demuxer::probe).
+    #[must_use]
+    pub const fn is_fragmented(&self) -> bool {
+        self.fragmented
+    }
+
+    /// Returns the number of `moof` fragments consumed while parsing headers.
+    #[must_use]
+    pub const fn fragment_count(&self) -> usize {
+        self.fragment_count
+    }
+
+    /// Returns the per-track demuxing state (sample tables included).
+    #[must_use]
+    pub fn tracks(&self) -> &[TrackState] {
+        &self.tracks
     }
 
     /// Returns a reference to the underlying source.
@@ -244,10 +320,16 @@ impl<R: MediaSource> Mp4Demuxer<R> {
         self.seek_to(0).await?;
 
         let mut ftyp_data: Option<Vec<u8>> = None;
-        let mut moov_data: Option<Vec<u8>> = None;
+        let mut moov_box: Option<MoovBox> = None;
+        let mut fragment_samples: Vec<FragmentSample> = Vec::new();
+        let mut decode_times: HashMap<u32, u64> = HashMap::new();
 
         // Scan top-level boxes
         loop {
+            // Absolute offset of the box about to be read. `moof` addressing
+            // (`default-base-is-moof`) is anchored on this value.
+            let box_start = self.position;
+
             // Read 8-byte box header
             let mut header_buf = [0u8; 8];
             let mut filled = 0usize;
@@ -319,7 +401,31 @@ impl<R: MediaSource> Mp4Demuxer<R> {
                 BoxType::MOOV => {
                     if content_size > 0 {
                         let data = self.read_n(content_size as usize).await?;
-                        moov_data = Some(data);
+                        let moov = MoovBox::parse(&data)?;
+                        self.fragmented = moov.is_fragmented();
+                        moov_box = Some(moov);
+                    }
+                }
+                BoxType::MOOF => {
+                    // Fragment header: parse it so its samples join the track
+                    // tables. Oversized declarations are skipped, not buffered.
+                    if content_size > 0 && content_size <= MAX_MOOF_SIZE {
+                        let data = self.read_n(content_size as usize).await?;
+                        let trex = moov_box.as_ref().map_or(&[][..], |m| m.trex.as_slice());
+                        let info =
+                            fragments::parse_moof(&data, box_start, trex, &mut decode_times)?;
+                        fragment_samples.extend(info.samples);
+                        self.fragment_count += 1;
+                    } else if content_size > 0 {
+                        self.source
+                            .seek(SeekFrom::Current(content_size as i64))
+                            .await?;
+                        self.position += content_size;
+                    } else if box_size == 0 {
+                        // A `moof` declaring "extends to EOF" is malformed and
+                        // its length cannot be recovered; stop scanning rather
+                        // than re-reading its body as top-level boxes.
+                        break;
                     }
                 }
                 BoxType::MDAT => {
@@ -357,8 +463,10 @@ impl<R: MediaSource> Mp4Demuxer<R> {
                 }
             }
 
-            // Stop if we have both ftyp and moov (no need to scan further)
-            if ftyp_data.is_some() && moov_data.is_some() {
+            // Stop once ftyp and moov are in hand — unless the file is
+            // fragmented, in which case the samples live in `moof` boxes that
+            // follow and the whole file must be scanned.
+            if ftyp_data.is_some() && moov_box.is_some() && !self.fragmented {
                 break;
             }
         }
@@ -374,15 +482,59 @@ impl<R: MediaSource> Mp4Demuxer<R> {
             self.ftyp = Some(ftyp);
         }
 
-        // Parse moov and build streams
-        if let Some(ref data) = moov_data {
-            let moov = MoovBox::parse(data)?;
+        // Build streams from moov
+        if let Some(moov) = moov_box {
             self.build_streams_and_tracks(&moov)?;
             self.moov = Some(moov);
         }
 
+        // Splice in fragment samples. ISO/IEC 14496-12 §8.8.1 requires the
+        // `moov` sample tables of a fragmented file to be empty, so any
+        // moov-derived samples here would be a writer bug; drop them rather
+        // than emitting each sample twice.
+        if !fragment_samples.is_empty() {
+            self.apply_fragment_samples(&fragment_samples);
+        }
+
         self.header_parsed = true;
         Ok(())
+    }
+
+    /// Replaces the `moov`-derived sample tables with the samples described by
+    /// the file's `moof` boxes.
+    fn apply_fragment_samples(&mut self, samples: &[FragmentSample]) {
+        // Only discard the moov-derived tables for a genuinely fragmented file
+        // (one that declared `mvex`). A file without `mvex` whose `moov` follows
+        // a stray `moof` keeps its progressive tables and simply gains the
+        // fragment's samples.
+        if self.fragmented {
+            for track in &mut self.tracks {
+                track.samples.clear();
+                track.sample_index = 0;
+            }
+        }
+
+        for sample in samples {
+            let Some(track) = self
+                .tracks
+                .iter_mut()
+                .find(|t| t.track_id == sample.track_id)
+            else {
+                continue;
+            };
+            track.samples.push(SampleInfo {
+                offset: sample.offset,
+                size: sample.size,
+                duration: sample.duration,
+                cts_offset: sample.cts_offset,
+                dts: sample.dts,
+                is_sync: sample.is_sync,
+            });
+        }
+
+        for track in &mut self.tracks {
+            track.sample_count = u32::try_from(track.samples.len()).unwrap_or(u32::MAX);
+        }
     }
 
     /// Builds stream info and track state from a parsed `MoovBox`.
@@ -403,8 +555,8 @@ impl<R: MediaSource> Mp4Demuxer<R> {
             // Attempt codec mapping — skip tracks with unsupported/patent-encumbered codecs
             let stream_info = match build_stream_info(stream_index, trak, movie_timescale) {
                 Ok(info) => info,
-                Err(OxiError::PatentViolation(_)) => {
-                    return Err(build_stream_info(stream_index, trak, movie_timescale).unwrap_err());
+                Err(err @ OxiError::PatentViolation(_)) => {
+                    return Err(err);
                 }
                 Err(_) => {
                     // Unknown codec: skip silently (don't add to streams)
@@ -456,46 +608,45 @@ impl<R: MediaSource> Mp4Demuxer<R> {
     /// Selects the track with the lowest current DTS (decode timestamp) to emit next.
     ///
     /// Returns the index into `self.tracks`, or `None` if all tracks are exhausted.
+    ///
+    /// Each candidate's DTS is read straight off the precomputed
+    /// [`SampleInfo::dts`] prefix sum, so this is O(tracks) per packet rather
+    /// than O(samples).
+    ///
+    /// Tracks routinely use different timescales (90 kHz video next to 48 kHz
+    /// audio), so DTS values are compared as exact rationals
+    /// (`dts_a / ts_a` vs `dts_b / ts_b`) by cross-multiplying in `u128` — never
+    /// as raw ticks, which would run one track far ahead of the other.
     fn next_track_index(&self) -> Option<usize> {
-        let mut best: Option<(usize, u64)> = None;
+        let mut best: Option<(usize, u128, u128)> = None;
 
         for (i, track) in self.tracks.iter().enumerate() {
             if track.sample_index >= track.sample_count {
                 continue;
             }
-            let idx = track.sample_index as usize;
-            // Compute cumulative DTS as sum of durations up to this sample
-            let dts: u64 = track.samples[..idx]
-                .iter()
-                .map(|s| u64::from(s.duration))
-                .sum();
+            let Some(sample) = track.samples.get(track.sample_index as usize) else {
+                continue;
+            };
+            let timescale = self
+                .streams
+                .get(track.stream_index)
+                .map_or(1u128, |s| u128::from(s.timebase.den.max(1).unsigned_abs()));
+            let dts = u128::from(sample.dts);
 
             match best {
-                Some((_, best_dts)) if dts < best_dts => {
-                    best = Some((i, dts));
+                Some((_, best_dts, best_timescale))
+                    if dts.saturating_mul(best_timescale) < best_dts.saturating_mul(timescale) =>
+                {
+                    best = Some((i, dts, timescale));
                 }
                 None => {
-                    best = Some((i, dts));
+                    best = Some((i, dts, timescale));
                 }
                 _ => {}
             }
         }
 
-        best.map(|(i, _)| i)
-    }
-
-    fn sample_dts(track: &TrackState, sample_index: usize) -> u64 {
-        track.samples[..sample_index]
-            .iter()
-            .map(|s| u64::from(s.duration))
-            .sum()
-    }
-
-    fn sample_pts(track: &TrackState, sample_index: usize) -> Option<i64> {
-        let sample = track.samples.get(sample_index)?;
-        let dts = Self::sample_dts(track, sample_index);
-        let dts_i64 = i64::try_from(dts).ok()?;
-        Some(dts_i64 + i64::from(sample.cts_offset))
+        best.map(|(i, _, _)| i)
     }
 
     fn sample_accurate_cursor_for_track(
@@ -515,7 +666,8 @@ impl<R: MediaSource> Mp4Demuxer<R> {
             .iter()
             .enumerate()
             .find_map(|(index, _)| {
-                Self::sample_pts(track, index)
+                track
+                    .pts_at(index)
                     .filter(|&pts| pts >= target_pts_i64)
                     .map(|_| index)
             })
@@ -563,6 +715,239 @@ impl<R: MediaSource> Mp4Demuxer<R> {
 
         self.sample_accurate_cursor_for_track(track, target_pts)
     }
+
+    /// Resolves the reference stream index for a seek.
+    fn resolve_seek_stream(&self, requested: Option<usize>) -> OxiResult<usize> {
+        match requested {
+            Some(index) if index >= self.streams.len() => Err(OxiError::InvalidData(format!(
+                "Stream index {index} out of range"
+            ))),
+            Some(index) => Ok(index),
+            None => Ok(self
+                .streams
+                .iter()
+                .position(StreamInfo::is_video)
+                .unwrap_or(0)),
+        }
+    }
+
+    /// Finds the last sample of `track` whose PTS is at or before `target_pts`.
+    ///
+    /// Falls back to sample 0 when the target precedes the whole track.
+    fn sample_index_for_pts(track: &TrackState, target_pts: i64) -> usize {
+        let mut best = 0usize;
+        for index in 0..track.samples.len() {
+            match track.pts_at(index) {
+                Some(pts) if pts <= target_pts => best = index,
+                Some(_) => break,
+                None => break,
+            }
+        }
+        best
+    }
+
+    /// Finds the last sample of `track` whose DTS is at or before `target_dts`.
+    fn sample_index_for_dts(track: &TrackState, target_dts: u64) -> usize {
+        let mut best = 0usize;
+        for (index, sample) in track.samples.iter().enumerate() {
+            if sample.dts <= target_dts {
+                best = index;
+            } else {
+                break;
+            }
+        }
+        best
+    }
+
+    /// Finds the last sample of `track` starting at or before `byte_offset`.
+    fn sample_index_for_byte(track: &TrackState, byte_offset: u64) -> usize {
+        let mut best = 0usize;
+        for (index, sample) in track.samples.iter().enumerate() {
+            if sample.offset <= byte_offset {
+                best = index;
+            }
+        }
+        best
+    }
+
+    /// Walks back from `index` to the closest preceding sync sample (`stss`).
+    ///
+    /// Tracks with no `stss` box have every sample marked sync, so this is a
+    /// no-op for them.
+    fn preceding_sync_sample(track: &TrackState, index: usize) -> usize {
+        (0..=index)
+            .rev()
+            .find(|&i| track.samples.get(i).is_some_and(|s| s.is_sync))
+            .unwrap_or(0)
+    }
+
+    /// Repositions every non-reference track so its next sample is the last one
+    /// whose decode time is at or before `reference_dts` (expressed in the
+    /// reference track's timescale).
+    fn align_other_tracks(&mut self, reference_track: usize, reference_dts: u64) {
+        let reference_timescale = self
+            .streams
+            .get(self.tracks[reference_track].stream_index)
+            .map_or(0i64, |s| s.timebase.den);
+
+        for index in 0..self.tracks.len() {
+            if index == reference_track {
+                continue;
+            }
+            let timescale = self
+                .streams
+                .get(self.tracks[index].stream_index)
+                .map_or(0i64, |s| s.timebase.den);
+
+            let target_dts = if reference_timescale > 0 && timescale > 0 {
+                let scaled = u128::from(reference_dts)
+                    .saturating_mul(timescale.unsigned_abs().into())
+                    / u128::from(reference_timescale.unsigned_abs());
+                u64::try_from(scaled).unwrap_or(u64::MAX)
+            } else {
+                reference_dts
+            };
+
+            let track = &self.tracks[index];
+            let sample_index = if track.samples.is_empty() {
+                0
+            } else {
+                let candidate = Self::sample_index_for_dts(track, target_dts);
+                Self::preceding_sync_sample(track, candidate)
+            };
+            self.tracks[index].sample_index = u32::try_from(sample_index).unwrap_or(u32::MAX);
+        }
+    }
+
+    /// Repositions the demuxer so the next [`read_packet`](Demuxer::read_packet)
+    /// resumes at (or just before) `target`, and reports where it landed.
+    ///
+    /// Unlike [`seek_sample_accurate`](Self::seek_sample_accurate) — which only
+    /// *plans* a decode-and-discard cursor — this method mutates the demuxer's
+    /// internal per-track sample cursors.
+    ///
+    /// Behaviour:
+    ///
+    /// - The reference stream is [`SeekTarget::stream_index`], else the first
+    ///   video stream, else stream 0.
+    /// - [`SeekFlags::BYTE`] interprets `target.position` as a byte offset;
+    ///   otherwise it is a timestamp in seconds.
+    /// - By default the demuxer lands on the closest *preceding sync sample*
+    ///   (`stss`) so decoding can start immediately. Pass [`SeekFlags::ANY`] to
+    ///   land on the exact sample instead.
+    /// - Every other track is repositioned to the sample covering the same
+    ///   decode time, rescaled through each track's own timescale.
+    ///
+    /// # Errors
+    ///
+    /// - `OxiError::Unsupported` if the source is not seekable.
+    /// - `OxiError::InvalidData` if there are no tracks, or the requested
+    ///   stream index is out of range.
+    pub async fn seek_position(&mut self, target: SeekTarget) -> OxiResult<Mp4SeekPosition> {
+        if !self.header_parsed {
+            self.parse_headers().await?;
+        }
+        if !self.source.is_seekable() {
+            return Err(OxiError::unsupported("Source is not seekable"));
+        }
+        if self.tracks.is_empty() {
+            return Err(OxiError::InvalidData("No MP4 tracks available".into()));
+        }
+
+        let stream_index = self.resolve_seek_stream(target.stream_index)?;
+        let track_index = self
+            .tracks
+            .iter()
+            .position(|t| t.stream_index == stream_index)
+            .ok_or_else(|| {
+                OxiError::InvalidData(format!("Stream {stream_index} has no MP4 track"))
+            })?;
+
+        if self.tracks[track_index].samples.is_empty() {
+            return Err(OxiError::InvalidData(format!(
+                "Stream {stream_index} has no samples to seek in"
+            )));
+        }
+
+        let candidate = {
+            let track = &self.tracks[track_index];
+            if target.flags.contains(SeekFlags::BYTE) {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let byte_offset = target.position.max(0.0) as u64;
+                Self::sample_index_for_byte(track, byte_offset)
+            } else {
+                let timescale = self
+                    .streams
+                    .get(stream_index)
+                    .map_or(1i64, |s| s.timebase.den.max(1));
+                #[allow(clippy::cast_possible_truncation)]
+                let target_pts = (target.position * timescale as f64).round() as i64;
+                Self::sample_index_for_pts(track, target_pts)
+            }
+        };
+
+        let sample_index = if target.flags.contains(SeekFlags::ANY) {
+            candidate
+        } else {
+            Self::preceding_sync_sample(&self.tracks[track_index], candidate)
+        };
+
+        self.tracks[track_index].sample_index = u32::try_from(sample_index).unwrap_or(u32::MAX);
+
+        let sample = self.tracks[track_index].samples[sample_index].clone();
+        self.align_other_tracks(track_index, sample.dts);
+
+        let dts = i64::try_from(sample.dts).unwrap_or(i64::MAX);
+        Ok(Mp4SeekPosition {
+            stream_index,
+            sample_index: u32::try_from(sample_index).unwrap_or(u32::MAX),
+            dts,
+            pts: dts.saturating_add(i64::from(sample.cts_offset)),
+            byte_offset: sample.offset,
+            is_sync: sample.is_sync,
+        })
+    }
+
+    /// Convenience wrapper over [`seek_position`](Self::seek_position) that
+    /// takes a PTS in the given stream's own timebase.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`seek_position`](Self::seek_position).
+    pub async fn seek_to_stream_pts(
+        &mut self,
+        stream_index: usize,
+        target_pts: i64,
+    ) -> OxiResult<Mp4SeekPosition> {
+        if !self.header_parsed {
+            self.parse_headers().await?;
+        }
+        let timescale = self
+            .streams
+            .get(stream_index)
+            .map_or(1i64, |s| s.timebase.den.max(1));
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = target_pts as f64 / timescale as f64;
+        self.seek_position(SeekTarget::time(seconds).with_stream(stream_index))
+            .await
+    }
+}
+
+/// Where an [`Mp4Demuxer`] landed after a repositioning seek.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mp4SeekPosition {
+    /// Stream the seek was resolved against.
+    pub stream_index: usize,
+    /// Index of the sample the next `read_packet` will emit for that stream.
+    pub sample_index: u32,
+    /// Decode timestamp of that sample, in the stream's timebase.
+    pub dts: i64,
+    /// Presentation timestamp of that sample, in the stream's timebase.
+    pub pts: i64,
+    /// Absolute byte offset of that sample in the file.
+    pub byte_offset: u64,
+    /// Whether the landing sample is a sync sample.
+    pub is_sync: bool,
 }
 
 #[async_trait]
@@ -628,12 +1013,10 @@ impl<R: MediaSource> Demuxer for Mp4Demuxer<R> {
         let stream = &self.streams[stream_index];
         let timebase = stream.timebase;
 
-        let dts: i64 = self.tracks[track_idx].samples[..sample_idx]
-            .iter()
-            .map(|s| i64::from(s.duration))
-            .sum();
+        // DTS comes straight from the precomputed prefix sum on the sample.
+        let dts = i64::try_from(sample.dts).unwrap_or(i64::MAX);
 
-        let pts = dts + i64::from(sample.cts_offset);
+        let pts = dts.saturating_add(i64::from(sample.cts_offset));
 
         let mut timestamp = Timestamp::new(pts, timebase);
         timestamp.dts = Some(dts);
@@ -650,6 +1033,23 @@ impl<R: MediaSource> Demuxer for Mp4Demuxer<R> {
 
     fn streams(&self) -> &[StreamInfo] {
         &self.streams
+    }
+
+    /// Repositions the demuxer so the next `read_packet` resumes at the sync
+    /// sample preceding `target`.
+    ///
+    /// See [`Mp4Demuxer::seek_position`] for the full behaviour and for the
+    /// resolved landing position, which this trait method discards.
+    ///
+    /// # Errors
+    ///
+    /// See [`Mp4Demuxer::seek_position`].
+    async fn seek(&mut self, target: SeekTarget) -> OxiResult<()> {
+        self.seek_position(target).await.map(|_| ())
+    }
+
+    fn is_seekable(&self) -> bool {
+        self.source.is_seekable()
     }
 }
 
@@ -809,13 +1209,22 @@ fn build_stream_info(index: usize, track: &TrakBox, movie_timescale: u32) -> Oxi
         stream.codec_params.extradata = Some(Bytes::copy_from_slice(extra));
     }
 
-    // Calculate duration
+    // Calculate duration and surface the tkhd display transform
     if let Some(tkhd) = &track.tkhd {
         if movie_timescale > 0 {
             #[allow(clippy::cast_possible_wrap)]
             let duration_in_stream_tb =
                 (tkhd.duration as i64 * i64::from(timescale)) / i64::from(movie_timescale);
             stream.duration = Some(duration_in_stream_tb);
+        }
+
+        // Phone and camera captures record portrait/landscape orientation in
+        // the tkhd matrix rather than in the bitstream; downstream reframing
+        // has to honour it, so surface both the derived quarter-turn and the
+        // raw matrix.
+        if track.handler_type == "vide" {
+            stream.rotation = Some(tkhd.rotation_degrees());
+            stream.display_matrix = Some(tkhd.transform_matrix());
         }
     }
 
@@ -889,10 +1298,17 @@ fn build_sample_table(track: &TrakBox) -> Vec<SampleInfo> {
         }
     }
 
-    // Now build the sample table
+    // Now build the sample table.
+    //
+    // Both the intra-chunk byte offset and the decode timestamp are carried as
+    // running cursors: re-summing the preceding samples per sample made this
+    // O(n^2) in the chunk size (and in the whole track for DTS).
     let mut current_chunk_idx = 0usize;
     let mut sample_in_chunk = 0u32;
+    let mut offset_in_chunk = 0u64;
+    let mut running_dts = 0u64;
 
+    samples.reserve(sample_count);
     for sample_idx in 0..sample_count {
         #[allow(clippy::cast_possible_truncation)]
         let sample_num_1based = sample_idx as u32 + 1;
@@ -904,27 +1320,14 @@ fn build_sample_table(track: &TrakBox) -> Vec<SampleInfo> {
             0
         };
 
-        // Calculate offset within chunk
+        // Number of samples that share the current chunk
         let samples_per_chunk = if current_chunk_idx < chunk_sample_map.len() {
             chunk_sample_map[current_chunk_idx].2
         } else {
             1
         };
 
-        let mut offset_in_chunk = 0u64;
-        let first_sample_in_chunk = sample_idx - sample_in_chunk as usize;
-        for i in first_sample_in_chunk..sample_idx {
-            let size = if track.default_sample_size > 0 {
-                track.default_sample_size
-            } else if i < track.sample_sizes.len() {
-                track.sample_sizes[i]
-            } else {
-                0
-            };
-            offset_in_chunk += u64::from(size);
-        }
-
-        let offset = chunk_offset + offset_in_chunk;
+        let offset = chunk_offset.saturating_add(offset_in_chunk);
 
         // Get sample size
         let size = if track.default_sample_size > 0 {
@@ -944,21 +1347,26 @@ fn build_sample_table(track: &TrakBox) -> Vec<SampleInfo> {
         // Check if sync
         let is_sync = sync_set
             .as_ref()
-            .map_or(true, |set| set.contains(&sample_num_1based));
+            .is_none_or(|set| set.contains(&sample_num_1based));
 
         samples.push(SampleInfo {
             offset,
             size,
             duration,
             cts_offset,
+            dts: running_dts,
             is_sync,
         });
+
+        offset_in_chunk = offset_in_chunk.saturating_add(u64::from(size));
+        running_dts = running_dts.saturating_add(u64::from(duration));
 
         // Advance to next chunk if needed
         sample_in_chunk += 1;
         if sample_in_chunk >= samples_per_chunk {
             sample_in_chunk = 0;
             current_chunk_idx += 1;
+            offset_in_chunk = 0;
         }
     }
 
@@ -1435,6 +1843,7 @@ mod tests {
             duration: 240_000,
             width: 1920.0,
             height: 1080.0,
+            ..TkhdBox::default()
         });
 
         let stream = build_stream_info(0, &track, 1000).expect("operation should succeed");

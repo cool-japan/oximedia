@@ -42,7 +42,7 @@ pub fn bilateral_filter(frame: &VideoFrame, strength: f32) -> DenoiseResult<Vide
 
             bilateral_filter_plane(
                 input_plane.data.as_ref(),
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,
@@ -139,7 +139,7 @@ pub fn fast_bilateral_filter(frame: &VideoFrame, strength: f32) -> DenoiseResult
 
             fast_bilateral_filter_plane(
                 input_plane.data.as_ref(),
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,
@@ -485,6 +485,149 @@ mod tests {
 
         let result = bilateral_filter(&frame, 1.0);
         assert!(result.is_ok());
+    }
+
+    // ----- Regression tests for the clone-discard identity bug -----
+    //
+    // `bilateral_filter`/`fast_bilateral_filter` used to call their `*_plane`
+    // worker with `&mut plane.data.clone()` — a temporary that was mutated
+    // and then immediately discarded, so `plane.data` (the buffer actually
+    // returned to the caller) never changed. These tests exercise the
+    // public `VideoFrame`-level API (not the private `*_plane` helpers,
+    // which were always correct) so they fail if that call-site regresses.
+
+    /// Build a Yuv420p frame whose luma plane is a flat base value with
+    /// deterministic pseudo-noise (no RNG dependency), i.e. exactly the
+    /// "flat region with noise" scenario bilateral filtering should smooth.
+    fn build_noisy_luma_frame(w: u32, h: u32) -> VideoFrame {
+        let mut frame = VideoFrame::new(PixelFormat::Yuv420p, w, h);
+        frame.allocate();
+        let stride = frame.planes[0].stride;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let idx = y * w as usize + x;
+                // Deterministic noise: base 120, +20 on every third pixel.
+                let val: u8 = if idx % 3 == 0 { 140 } else { 120 };
+                frame.planes[0].data[y * stride + x] = val;
+            }
+        }
+        frame
+    }
+
+    /// Variance of the top-left `w`×`h` region of the luma plane (stride-aware).
+    fn luma_variance(frame: &VideoFrame, w: usize, h: usize) -> f64 {
+        let stride = frame.planes[0].stride;
+        let mut vals = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                vals.push(f64::from(frame.planes[0].data[y * stride + x]));
+            }
+        }
+        let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+        vals.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64
+    }
+
+    #[test]
+    fn test_bilateral_filter_output_differs_from_input() {
+        let frame = build_noisy_luma_frame(48, 48);
+        let filtered = bilateral_filter(&frame, 0.6).expect("bilateral_filter should succeed");
+
+        let in_stride = frame.planes[0].stride;
+        let out_stride = filtered.planes[0].stride;
+        let mut differs = false;
+        for y in 0..48usize {
+            for x in 0..48usize {
+                if filtered.planes[0].data[y * out_stride + x]
+                    != frame.planes[0].data[y * in_stride + x]
+                {
+                    differs = true;
+                }
+            }
+        }
+        assert!(
+            differs,
+            "bilateral_filter output must differ from noisy input; identical output means \
+             the filtered buffer was written to a temporary and discarded"
+        );
+    }
+
+    #[test]
+    fn test_bilateral_filter_reduces_local_variance() {
+        let frame = build_noisy_luma_frame(48, 48);
+        let filtered = bilateral_filter(&frame, 0.6).expect("bilateral_filter should succeed");
+
+        let input_var = luma_variance(&frame, 48, 48);
+        let output_var = luma_variance(&filtered, 48, 48);
+        assert!(
+            output_var < input_var,
+            "bilateral_filter should reduce local variance: input={input_var:.4} output={output_var:.4}"
+        );
+    }
+
+    #[test]
+    fn test_bilateral_filter_deterministic_across_runs() {
+        let frame = build_noisy_luma_frame(40, 40);
+        let first = bilateral_filter(&frame, 0.6).expect("first run should succeed");
+        let second = bilateral_filter(&frame, 0.6).expect("second run should succeed");
+
+        for plane_idx in 0..first.planes.len() {
+            assert_eq!(
+                first.planes[plane_idx].data, second.planes[plane_idx].data,
+                "bilateral_filter must be deterministic across runs on identical input \
+                 (plane {plane_idx})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bilateral_filter_flat_plane_stays_flat() {
+        // A perfectly uniform plane has zero local variance everywhere, so
+        // bilateral filtering must not introduce ringing/drift.
+        let mut frame = VideoFrame::new(PixelFormat::Yuv420p, 32, 32);
+        frame.allocate();
+        let stride = frame.planes[0].stride;
+        for y in 0..32usize {
+            for x in 0..32usize {
+                frame.planes[0].data[y * stride + x] = 96;
+            }
+        }
+
+        let filtered = bilateral_filter(&frame, 0.8).expect("bilateral_filter should succeed");
+        let out_stride = filtered.planes[0].stride;
+        for y in 0..32usize {
+            for x in 0..32usize {
+                let v = filtered.planes[0].data[y * out_stride + x];
+                assert!(
+                    (i32::from(v) - 96).abs() <= 1,
+                    "flat plane must stay flat (±1) at ({x},{y}), got {v}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fast_bilateral_filter_output_differs_from_input() {
+        // fast_bilateral_filter had the identical clone-discard bug; cover it too.
+        let frame = build_noisy_luma_frame(40, 40);
+        let filtered =
+            fast_bilateral_filter(&frame, 0.6).expect("fast_bilateral_filter should succeed");
+
+        let in_stride = frame.planes[0].stride;
+        let out_stride = filtered.planes[0].stride;
+        let mut differs = false;
+        for y in 0..40usize {
+            for x in 0..40usize {
+                if filtered.planes[0].data[y * out_stride + x]
+                    != frame.planes[0].data[y * in_stride + x]
+                {
+                    differs = true;
+                }
+            }
+        }
+        assert!(
+            differs,
+            "fast_bilateral_filter output must differ from noisy input"
+        );
     }
 
     // ----- apply_simd standalone function tests -----

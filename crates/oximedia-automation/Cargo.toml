@@ -17,6 +17,9 @@ oximedia-core = { workspace = true }
 oximedia-playlist = { workspace = true }
 oximedia-switcher = { workspace = true }
 oximedia-timecode = { workspace = true }
+# The real (Pure-Rust) WAV decoder used to load pre-recorded EAS
+# announcements — see `eas::audio::EasAudioInsertion::load_prerecorded_announcement`.
+oximedia-audio = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }

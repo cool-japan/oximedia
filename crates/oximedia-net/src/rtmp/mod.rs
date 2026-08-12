@@ -62,7 +62,8 @@ pub use message::{
 };
 pub use rtmp_ext::{ExVideoHeader, ExVideoPacketType, RtmpExtendedCodec, RtmpExtendedPacket};
 pub use server::{
-    ActiveStream, AllowAllAuth, AuthHandler, AuthResult, ConnectionInfo, MediaPacket,
-    MediaPacketType, OutgoingMessage, PublishType, RtmpServer, RtmpServerBuilder, RtmpServerConfig,
-    ServerConnection, ServerConnectionState, StreamMetadata, StreamRegistry,
+    is_audio_sequence_header, is_video_sequence_header, ActiveStream, AllowAllAuth, AuthHandler,
+    AuthResult, ConnectionInfo, MediaPacket, MediaPacketType, OutgoingMessage, PublishType,
+    RtmpServer, RtmpServerBuilder, RtmpServerConfig, SeqHeaderCache, ServerConnection,
+    ServerConnectionState, StreamMetadata, StreamRegistry,
 };

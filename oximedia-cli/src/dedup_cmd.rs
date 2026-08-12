@@ -673,7 +673,7 @@ async fn run_report(
         });
         let s = serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Dedup Report".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Output:", output.display());
@@ -827,7 +827,7 @@ async fn run_clean(
         });
         let s = serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Dedup Clean".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Strategy:", strategy);

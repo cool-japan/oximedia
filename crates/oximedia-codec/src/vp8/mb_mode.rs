@@ -1,5 +1,16 @@
 //! VP8 macroblock modes and partition types.
 //!
+//! # Deprecated: defective early seed, not RFC 6386-accurate
+//!
+//! **Every public item in this module is `#[deprecated]`** (since 0.2.1,
+//! scheduled for removal in 0.3.0). These enums are an early, H.264-shaped
+//! mode taxonomy that predates VP8 inter-frame decode landing in this
+//! crate: they do not represent RFC 6386's real near/nearest/zero/new-MV
+//! survey (SS16.3) or SPLITMV sub-partitioning (SS16), and nothing in the
+//! decoder uses them. The real, bit-exact decode pipeline behind
+//! `Vp8Decoder` has its own private mode representation in `vp8::dec::mode`
+//! and `vp8::dec::mv`. Kept only for API stability.
+//!
 //! This module defines the various prediction modes and partition types
 //! used in VP8. VP8 operates on 16x16 macroblocks which can be predicted
 //! in different ways:
@@ -15,20 +26,44 @@
 #![allow(dead_code)]
 
 /// Number of I16 (16x16 intra) modes.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
 pub const NUM_I16_MODES: usize = 4;
 
 /// Number of I4 (4x4 intra) modes.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
 pub const NUM_I4_MODES: usize = 10;
 
 /// Number of chroma intra modes.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
 pub const NUM_CHROMA_MODES: usize = 4;
 
 /// Number of inter motion vector modes.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
 pub const NUM_MV_MODES: usize = 4;
 
 /// 16x16 intra prediction mode.
 ///
 /// These modes predict the entire 16x16 luma macroblock at once.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
+// `derive(Default)`'s generated `impl Default` names the `#[default]`
+// variant directly; that generated code is not covered by any attribute on
+// the variant itself, only by one on the enum item. Internal reference site.
+#[allow(deprecated)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum IntraMode16 {
@@ -43,6 +78,11 @@ pub enum IntraMode16 {
     TmPred = 3,
 }
 
+// Internal reference site: this impl block's own methods necessarily name
+// `IntraMode16` and its variants, which are deprecated above; the impl
+// itself is not deprecated (see the module doc's policy on inherent
+// methods), so it needs its own targeted allow.
+#[allow(deprecated)]
 impl IntraMode16 {
     /// Converts from u8 to `IntraMode16`.
     #[must_use]
@@ -66,6 +106,12 @@ impl IntraMode16 {
 /// 4x4 intra prediction mode.
 ///
 /// These modes predict individual 4x4 sub-blocks within a macroblock.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
+// See `IntraMode16`'s identical note on `derive(Default)` above.
+#[allow(deprecated)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum IntraMode4 {
@@ -92,6 +138,8 @@ pub enum IntraMode4 {
     HuPred = 9,
 }
 
+// Internal reference site: see the identical note on `impl IntraMode16` above.
+#[allow(deprecated)]
 impl IntraMode4 {
     /// All 4x4 intra modes.
     pub const ALL: [Self; NUM_I4_MODES] = [
@@ -141,6 +189,12 @@ impl IntraMode4 {
 /// Chroma intra prediction mode.
 ///
 /// Used for predicting the U and V chroma planes.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
+// See `IntraMode16`'s identical note on `derive(Default)` above.
+#[allow(deprecated)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum ChromaMode {
@@ -155,6 +209,8 @@ pub enum ChromaMode {
     TmPred = 3,
 }
 
+// Internal reference site: see the identical note on `impl IntraMode16` above.
+#[allow(deprecated)]
 impl ChromaMode {
     /// Converts from u8 to `ChromaMode`.
     #[must_use]
@@ -178,6 +234,12 @@ impl ChromaMode {
 /// Inter prediction mode (motion vector mode).
 ///
 /// Defines how motion vectors are obtained for inter-predicted macroblocks.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
+// See `IntraMode16`'s identical note on `derive(Default)` above.
+#[allow(deprecated)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum InterMode {
@@ -192,6 +254,8 @@ pub enum InterMode {
     New = 3,
 }
 
+// Internal reference site: see the identical note on `impl IntraMode16` above.
+#[allow(deprecated)]
 impl InterMode {
     /// Converts from u8 to `InterMode`.
     #[must_use]
@@ -221,6 +285,12 @@ impl InterMode {
 /// Macroblock partition type.
 ///
 /// Defines how a 16x16 macroblock is partitioned for prediction.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
+// See `IntraMode16`'s identical note on `derive(Default)` above.
+#[allow(deprecated)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum PartitionType {
@@ -235,6 +305,8 @@ pub enum PartitionType {
     P8x8 = 3,
 }
 
+// Internal reference site: see the identical note on `impl IntraMode16` above.
+#[allow(deprecated)]
 impl PartitionType {
     /// Converts from u8 to `PartitionType`.
     #[must_use]
@@ -298,6 +370,12 @@ impl PartitionType {
 /// Reference frame type.
 ///
 /// VP8 uses up to 3 reference frames for inter prediction.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
+// See `IntraMode16`'s identical note on `derive(Default)` above.
+#[allow(deprecated)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum RefFrame {
@@ -310,6 +388,8 @@ pub enum RefFrame {
     AltRef = 2,
 }
 
+// Internal reference site: see the identical note on `impl IntraMode16` above.
+#[allow(deprecated)]
 impl RefFrame {
     /// Converts from u8 to `RefFrame`.
     #[must_use]
@@ -332,6 +412,13 @@ impl RefFrame {
 /// Macroblock type.
 ///
 /// Combines prediction mode and partitioning information.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (H.264-shaped mode taxonomy, not RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
+// Its own variant fields name the other deprecated enums in this module;
+// internal reference site, see the note on `impl IntraMode16` above.
+#[allow(deprecated)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MacroblockType {
     /// Intra macroblock with 16x16 prediction.
@@ -354,6 +441,8 @@ pub enum MacroblockType {
     },
 }
 
+// Internal reference site: see the identical note on `impl IntraMode16` above.
+#[allow(deprecated)]
 impl MacroblockType {
     /// Returns whether this is an intra macroblock.
     #[must_use]
@@ -369,6 +458,9 @@ impl MacroblockType {
 }
 
 #[cfg(test)]
+// This module's entire purpose is exercising the deprecated types declared
+// above; targeted (not blanket/crate-wide) allow for exactly that site.
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

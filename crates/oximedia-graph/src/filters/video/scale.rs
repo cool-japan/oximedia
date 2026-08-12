@@ -27,11 +27,22 @@
 
 use std::f64::consts::PI;
 
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
+
 use crate::error::{GraphError, GraphResult};
 use crate::frame::FilterFrame;
 use crate::node::{Node, NodeId, NodeState, NodeType};
 use crate::port::{InputPort, OutputPort, PortFormat, PortId, PortType, VideoPortFormat};
 use oximedia_codec::{Plane, VideoFrame};
+
+/// Minimum number of samples a resampling pass must produce before it is handed to rayon.
+///
+/// Row parallelism is bit-exact (rows never read each other's output), so this threshold is a
+/// pure scheduling decision: below roughly a 256x256 pass the fork/join cost dominates the work.
+/// Thumbnail-sized planes therefore stay on the calling thread while a 1080x1920 plane -- ~2.1 M
+/// samples -- is split across the pool.
+const PARALLEL_SAMPLE_THRESHOLD: usize = 64 * 1024;
 
 /// Scaling algorithm for image resampling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -229,21 +240,399 @@ pub struct ScaleFilter {
     inputs: Vec<InputPort>,
     outputs: Vec<OutputPort>,
     config: ScaleConfig,
-    /// Precomputed horizontal filter coefficients.
-    h_coefficients: Vec<FilterCoefficients>,
-    /// Precomputed vertical filter coefficients.
-    v_coefficients: Vec<FilterCoefficients>,
-    /// Source dimensions (cached for coefficient reuse).
-    cached_src_dims: Option<(u32, u32)>,
+    /// Cached coefficient tables for planes with the frame's full (luma) geometry.
+    luma_coefficients: Option<PlaneCoefficients>,
+    /// Cached coefficient tables for the subsampled (chroma) plane geometry.
+    ///
+    /// Both chroma planes of a 4:2:0/4:2:2 frame share one geometry, so a single entry serves
+    /// them for the whole lifetime of the filter instead of being rebuilt per plane per frame.
+    chroma_coefficients: Option<PlaneCoefficients>,
 }
 
-/// Filter coefficients for a single output pixel.
+/// Identity of a coefficient table pair: everything the weights depend on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CoefficientKey {
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    algorithm: ScaleAlgorithm,
+    antialias: bool,
+}
+
+/// Horizontal + vertical coefficient tables for one plane geometry.
 #[derive(Clone, Debug)]
-struct FilterCoefficients {
-    /// Starting position in source.
-    start: usize,
-    /// Coefficient weights.
+struct PlaneCoefficients {
+    /// Geometry these tables were built for.
+    key: CoefficientKey,
+    /// Weights mapping source columns to destination columns.
+    horizontal: CoefficientTable,
+    /// Weights mapping source rows to destination rows.
+    vertical: CoefficientTable,
+}
+
+impl PlaneCoefficients {
+    /// Build both passes for a geometry.
+    fn build(key: CoefficientKey) -> Self {
+        Self {
+            key,
+            horizontal: CoefficientTable::build(
+                key.src_width,
+                key.dst_width,
+                key.algorithm,
+                key.antialias,
+            ),
+            vertical: CoefficientTable::build(
+                key.src_height,
+                key.dst_height,
+                key.algorithm,
+                key.antialias,
+            ),
+        }
+    }
+}
+
+/// Tap window for one output position.
+///
+/// Deliberately three `u32`s (12 bytes) rather than `usize`s: the whole table stays small enough
+/// to sit in L2 next to the weights even for 4K geometries.
+#[derive(Clone, Copy, Debug)]
+struct TapSpan {
+    /// First source sample the window reads.
+    src_start: u32,
+    /// Index of the first weight inside [`CoefficientTable::weights`].
+    weight_offset: u32,
+    /// Number of taps.
+    len: u32,
+}
+
+/// Flat 1-D resampling coefficients.
+///
+/// All weights live in one contiguous allocation; `spans` slices into it. This replaces a
+/// `Vec<Vec<f64>>`, which cost a pointer chase and a separate cache line per output position and
+/// forced per-tap bounds checks in the innermost loop.
+#[derive(Clone, Debug)]
+struct CoefficientTable {
+    /// One entry per output position.
+    spans: Vec<TapSpan>,
+    /// Normalised weights, packed back to back in `spans` order.
     weights: Vec<f64>,
+}
+
+impl CoefficientTable {
+    /// Compute normalised 1-D filter coefficients for `src_size -> dst_size`.
+    fn build(src_size: u32, dst_size: u32, algorithm: ScaleAlgorithm, antialias: bool) -> Self {
+        // `Nearest` is a point sampler, not a convolution, and the generic windowing below cannot
+        // express it. Its support is exactly 0.5, so an output centre that lands on a source-pixel
+        // boundary leaves every candidate tap at distance exactly 0.5 -- outside the `x < 0.5`
+        // kernel -- and the window comes out all zero, which the (skipped) normalisation leaves
+        // alone and the resampler turns into a black output sample. An exact 2x downscale puts
+        // *every* centre on a boundary. Widening the kernel by an epsilon would not fix it either:
+        // on the antialias path the support is multiplied by the downscale factor, which turns
+        // `Nearest` into a box average over the whole footprint. Build the taps directly instead.
+        if matches!(algorithm, ScaleAlgorithm::Nearest) {
+            return Self::build_nearest(src_size, dst_size);
+        }
+
+        let dst_len = dst_size as usize;
+        let scale = if dst_size == 0 {
+            1.0
+        } else {
+            src_size as f64 / dst_size as f64
+        };
+
+        // For downscaling with antialiasing, expand the filter support
+        let filter_scale = if antialias && scale > 1.0 { scale } else { 1.0 };
+
+        let support = algorithm.support() * filter_scale;
+
+        let mut spans = Vec::with_capacity(dst_len);
+        let taps_estimate = (2.0 * support).ceil() as usize + 2;
+        let mut weights = Vec::with_capacity(dst_len.saturating_mul(taps_estimate));
+
+        for dst_pos in 0..dst_size {
+            let center = (dst_pos as f64 + 0.5) * scale - 0.5;
+            let start = ((center - support).floor() as i64).max(0) as usize;
+            let end = ((center + support).ceil() as i64).min(src_size as i64) as usize;
+            let end = end.max(start);
+
+            let weight_offset = weights.len();
+            let mut sum = 0.0;
+
+            for src_pos in start..end {
+                let distance = (src_pos as f64 - center) / filter_scale;
+                let weight = algorithm.kernel(distance);
+                weights.push(weight);
+                sum += weight;
+            }
+
+            // Normalize weights
+            if sum != 0.0 {
+                if let Some(window) = weights.get_mut(weight_offset..) {
+                    for w in window {
+                        *w /= sum;
+                    }
+                }
+            }
+
+            spans.push(TapSpan {
+                src_start: start as u32,
+                weight_offset: weight_offset as u32,
+                len: (end - start) as u32,
+            });
+        }
+
+        Self { spans, weights }
+    }
+
+    /// Point-sampling taps for [`ScaleAlgorithm::Nearest`]: one source sample, weight 1.0.
+    ///
+    /// The sampled index is `floor((dst_pos + 0.5) * src_size / dst_size)` clamped into the
+    /// source -- the same formula [`NearestNeighborScaler`] uses -- so the generic two-pass
+    /// resampler and the dedicated scaler produce identical bytes. `antialias` is deliberately not
+    /// a parameter: widening the footprint of a point sampler is what turned it into a box filter.
+    fn build_nearest(src_size: u32, dst_size: u32) -> Self {
+        let dst_len = dst_size as usize;
+
+        let Some(last_index) = src_size.checked_sub(1) else {
+            // Nothing to sample. Emit empty windows so the resampler reads the missing samples as
+            // 0, exactly as the generic path does for a zero-width/height source.
+            return Self {
+                spans: vec![
+                    TapSpan {
+                        src_start: 0,
+                        weight_offset: 0,
+                        len: 0,
+                    };
+                    dst_len
+                ],
+                weights: Vec::new(),
+            };
+        };
+
+        let scale = if dst_size == 0 {
+            1.0
+        } else {
+            src_size as f64 / dst_size as f64
+        };
+
+        let mut spans = Vec::with_capacity(dst_len);
+        let mut weights = Vec::with_capacity(dst_len);
+
+        for dst_pos in 0..dst_size {
+            // `f64 -> u32` saturates at 0 for negative inputs, so this is the full clamp into
+            // `[0, src_size - 1]`; the product is non-negative anyway.
+            let index = (((dst_pos as f64 + 0.5) * scale).floor() as u32).min(last_index);
+            spans.push(TapSpan {
+                src_start: index,
+                weight_offset: weights.len() as u32,
+                len: 1,
+            });
+            weights.push(1.0);
+        }
+
+        Self { spans, weights }
+    }
+
+    /// Weight slice for one output position (empty when the span is out of range).
+    fn window(&self, span: TapSpan) -> &[f64] {
+        let offset = span.weight_offset as usize;
+        self.weights
+            .get(offset..offset + span.len as usize)
+            .unwrap_or(&[])
+    }
+}
+
+/// Horizontal pass for a single source row.
+///
+/// Writes `dst_width` f64 samples. The accumulation order per output sample is unchanged from the
+/// original scalar implementation (taps ascending, starting from `0.0`), so results are
+/// bit-identical.
+fn resample_row_horizontal(
+    table: &CoefficientTable,
+    src: &Plane,
+    y: usize,
+    src_width: usize,
+    scratch: &mut Vec<u8>,
+    out: &mut [f64],
+) {
+    let row = src.row(y);
+    let source: &[u8] = if row.len() >= src_width {
+        // Fast path: the row covers the full plane width, so every tap window is in bounds and
+        // the inner loop is a straight slice walk.
+        row.get(..src_width).unwrap_or(row)
+    } else {
+        // `Plane::row` yields a short (or empty) slice when the backing buffer is truncated. The
+        // reference implementation read those missing samples as `0`, so pad explicitly instead
+        // of re-checking every tap.
+        scratch.clear();
+        scratch.extend_from_slice(row);
+        scratch.resize(src_width, 0);
+        scratch.as_slice()
+    };
+
+    for (out_value, &span) in out.iter_mut().zip(table.spans.iter()) {
+        let start = span.src_start as usize;
+        let pixels = source
+            .get(start..start + span.len as usize)
+            .unwrap_or(&[][..]);
+        let weights = table.window(span);
+
+        let mut sum = 0.0f64;
+        for (&pixel, &weight) in pixels.iter().zip(weights.iter()) {
+            sum += pixel as f64 * weight;
+        }
+        *out_value = sum;
+    }
+}
+
+/// Vertical pass for a single destination row.
+///
+/// Accumulates whole intermediate rows into `acc` instead of walking a column per output pixel.
+/// For a fixed output pixel the taps are still applied in ascending order onto an accumulator
+/// that starts at `0.0`, so the result is bit-identical to the per-pixel loop -- but the memory
+/// access pattern becomes sequential instead of striding `dst_width * 8` bytes per tap.
+fn resample_row_vertical(
+    table: &CoefficientTable,
+    intermediate: &[f64],
+    dst_width: usize,
+    y: usize,
+    acc: &mut [f64],
+    out: &mut [u8],
+) {
+    acc.fill(0.0);
+
+    if let Some(&span) = table.spans.get(y) {
+        let start = span.src_start as usize;
+        for (tap, &weight) in table.window(span).iter().enumerate() {
+            let row_start = (start + tap) * dst_width;
+            let row = intermediate
+                .get(row_start..row_start + dst_width)
+                .unwrap_or(&[][..]);
+            for (slot, &value) in acc.iter_mut().zip(row.iter()) {
+                *slot += value * weight;
+            }
+        }
+    }
+
+    for (byte, &value) in out.iter_mut().zip(acc.iter()) {
+        *byte = value.round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Execution policy for the two resampling passes.
+///
+/// Kept explicit (rather than deciding inline) so tests can force both settings and assert that
+/// they produce identical bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PassParallelism {
+    /// Run the horizontal pass across the rayon pool.
+    horizontal: bool,
+    /// Run the vertical pass across the rayon pool.
+    vertical: bool,
+}
+
+impl PassParallelism {
+    /// Both passes on the calling thread.
+    const SERIAL: Self = Self {
+        horizontal: false,
+        vertical: false,
+    };
+
+    /// Both passes on the rayon pool.
+    const PARALLEL: Self = Self {
+        horizontal: true,
+        vertical: true,
+    };
+
+    /// Pick per pass based on how many samples that pass produces.
+    fn automatic(dst_width: usize, src_height: usize, dst_height: usize) -> Self {
+        Self {
+            horizontal: dst_width.saturating_mul(src_height) >= PARALLEL_SAMPLE_THRESHOLD,
+            vertical: dst_width.saturating_mul(dst_height) >= PARALLEL_SAMPLE_THRESHOLD,
+        }
+    }
+}
+
+/// Resample one plane with a precomputed coefficient pair.
+fn scale_plane_with(
+    coefficients: &PlaneCoefficients,
+    src: &Plane,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Plane {
+    let parallelism =
+        PassParallelism::automatic(dst_width as usize, src_height as usize, dst_height as usize);
+    resample_plane(
+        coefficients,
+        src,
+        src_width,
+        src_height,
+        dst_width,
+        dst_height,
+        parallelism,
+    )
+}
+
+/// Resample one plane with an explicit execution policy.
+fn resample_plane(
+    coefficients: &PlaneCoefficients,
+    src: &Plane,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    parallelism: PassParallelism,
+) -> Plane {
+    let src_w = src_width as usize;
+    let src_h = src_height as usize;
+    let dst_w = dst_width as usize;
+    let dst_h = dst_height as usize;
+
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return Plane::new(vec![0u8; dst_w * dst_h], dst_w);
+    }
+
+    // Horizontal pass: `src_h` independent rows of `dst_w` f64 samples.
+    let mut intermediate = vec![0.0f64; dst_w * src_h];
+    let horizontal = &coefficients.horizontal;
+
+    if parallelism.horizontal {
+        intermediate
+            .par_chunks_mut(dst_w)
+            .enumerate()
+            .for_each_init(Vec::<u8>::new, |scratch, (y, out_row)| {
+                resample_row_horizontal(horizontal, src, y, src_w, scratch, out_row);
+            });
+    } else {
+        let mut scratch = Vec::<u8>::new();
+        for (y, out_row) in intermediate.chunks_mut(dst_w).enumerate() {
+            resample_row_horizontal(horizontal, src, y, src_w, &mut scratch, out_row);
+        }
+    }
+
+    // Vertical pass: `dst_h` independent rows, each reading whole intermediate rows.
+    let mut dst_data = vec![0u8; dst_w * dst_h];
+    let vertical = &coefficients.vertical;
+    let intermediate: &[f64] = &intermediate;
+
+    if parallelism.vertical {
+        dst_data.par_chunks_mut(dst_w).enumerate().for_each_init(
+            || vec![0.0f64; dst_w],
+            |acc, (y, out_row)| {
+                resample_row_vertical(vertical, intermediate, dst_w, y, acc, out_row);
+            },
+        );
+    } else {
+        let mut acc = vec![0.0f64; dst_w];
+        for (y, out_row) in dst_data.chunks_mut(dst_w).enumerate() {
+            resample_row_vertical(vertical, intermediate, dst_w, y, &mut acc, out_row);
+        }
+    }
+
+    Plane::new(dst_data, dst_w)
 }
 
 impl ScaleFilter {
@@ -263,9 +652,8 @@ impl ScaleFilter {
                 OutputPort::new(PortId(0), "output", PortType::Video).with_format(output_format)
             ],
             config,
-            h_coefficients: Vec::new(),
-            v_coefficients: Vec::new(),
-            cached_src_dims: None,
+            luma_coefficients: None,
+            chroma_coefficients: None,
         }
     }
 
@@ -280,149 +668,56 @@ impl ScaleFilter {
         if self.config.width != width || self.config.height != height {
             self.config.width = width;
             self.config.height = height;
-            self.cached_src_dims = None;
-            self.h_coefficients.clear();
-            self.v_coefficients.clear();
+            self.luma_coefficients = None;
+            self.chroma_coefficients = None;
         }
     }
 
-    /// Precompute filter coefficients for a given source and target size.
-    fn compute_coefficients(&mut self, src_width: u32, src_height: u32) {
-        if self.cached_src_dims == Some((src_width, src_height)) {
-            return;
+    /// Return the cached coefficient pair for `key`, rebuilding it only when the geometry changed.
+    ///
+    /// Taking the slot as a plain `&mut Option<_>` keeps this independent of `&mut self`, so the
+    /// caller can hold the returned borrow while reading other fields.
+    fn slot_entry(slot: &mut Option<PlaneCoefficients>, key: CoefficientKey) -> &PlaneCoefficients {
+        if !slot.as_ref().is_some_and(|entry| entry.key == key) {
+            *slot = None;
         }
-
-        self.h_coefficients =
-            Self::compute_1d_coefficients(src_width, self.config.width, &self.config);
-        self.v_coefficients =
-            Self::compute_1d_coefficients(src_height, self.config.height, &self.config);
-        self.cached_src_dims = Some((src_width, src_height));
-    }
-
-    /// Compute 1D filter coefficients.
-    fn compute_1d_coefficients(
-        src_size: u32,
-        dst_size: u32,
-        config: &ScaleConfig,
-    ) -> Vec<FilterCoefficients> {
-        let mut coefficients = Vec::with_capacity(dst_size as usize);
-        let scale = src_size as f64 / dst_size as f64;
-        let algorithm = config.algorithm;
-
-        // For downscaling with antialiasing, expand the filter support
-        let filter_scale = if config.antialias && scale > 1.0 {
-            scale
-        } else {
-            1.0
-        };
-
-        let support = algorithm.support() * filter_scale;
-
-        for dst_pos in 0..dst_size {
-            let center = (dst_pos as f64 + 0.5) * scale - 0.5;
-            let start = ((center - support).floor() as i64).max(0) as usize;
-            let end = ((center + support).ceil() as i64).min(src_size as i64) as usize;
-
-            let mut weights = Vec::with_capacity(end - start);
-            let mut sum = 0.0;
-
-            for src_pos in start..end {
-                let distance = (src_pos as f64 - center) / filter_scale;
-                let weight = algorithm.kernel(distance);
-                weights.push(weight);
-                sum += weight;
-            }
-
-            // Normalize weights
-            if sum != 0.0 {
-                for w in &mut weights {
-                    *w /= sum;
-                }
-            }
-
-            coefficients.push(FilterCoefficients { start, weights });
-        }
-
-        coefficients
-    }
-
-    /// Scale a single plane.
-    #[allow(clippy::too_many_arguments)]
-    fn scale_plane(
-        &self,
-        src: &Plane,
-        src_width: u32,
-        src_height: u32,
-        dst_width: u32,
-        dst_height: u32,
-    ) -> Plane {
-        // Create intermediate buffer for horizontal pass
-        let mut intermediate = vec![0.0f64; dst_width as usize * src_height as usize];
-
-        // Horizontal pass
-        for y in 0..src_height as usize {
-            let src_row = src.row(y);
-            for (x, coef) in self.h_coefficients.iter().enumerate() {
-                let mut sum = 0.0;
-                for (i, &weight) in coef.weights.iter().enumerate() {
-                    let src_x = (coef.start + i).min(src_width as usize - 1);
-                    sum += src_row.get(src_x).copied().unwrap_or(0) as f64 * weight;
-                }
-                intermediate[y * dst_width as usize + x] = sum;
-            }
-        }
-
-        // Vertical pass
-        let mut dst_data = vec![0u8; dst_width as usize * dst_height as usize];
-
-        for y in 0..dst_height as usize {
-            let coef = &self.v_coefficients[y];
-            for x in 0..dst_width as usize {
-                let mut sum = 0.0;
-                for (i, &weight) in coef.weights.iter().enumerate() {
-                    let src_y = (coef.start + i).min(src_height as usize - 1);
-                    sum += intermediate[src_y * dst_width as usize + x] * weight;
-                }
-                dst_data[y * dst_width as usize + x] = sum.round().clamp(0.0, 255.0) as u8;
-            }
-        }
-
-        Plane::new(dst_data, dst_width as usize)
+        slot.get_or_insert_with(|| PlaneCoefficients::build(key))
     }
 
     /// Scale a video frame.
     fn scale_frame(&mut self, input: &VideoFrame) -> VideoFrame {
-        self.compute_coefficients(input.width, input.height);
-
         let mut output = VideoFrame::new(input.format, self.config.width, self.config.height);
         output.timestamp = input.timestamp;
         output.frame_type = input.frame_type;
         output.color_info = input.color_info;
+
+        let algorithm = self.config.algorithm;
+        let antialias = self.config.antialias;
 
         // Scale each plane
         for (i, src_plane) in input.planes.iter().enumerate() {
             let (src_w, src_h) = input.plane_dimensions(i);
             let (dst_w, dst_h) = output.plane_dimensions(i);
 
-            // For chroma planes, we need to compute separate coefficients
-            if i > 0 && input.format.is_yuv() {
-                let old_h = self.h_coefficients.clone();
-                let old_v = self.v_coefficients.clone();
-                let old_cached = self.cached_src_dims;
+            let key = CoefficientKey {
+                src_width: src_w,
+                src_height: src_h,
+                dst_width: dst_w,
+                dst_height: dst_h,
+                algorithm,
+                antialias,
+            };
 
-                self.h_coefficients = Self::compute_1d_coefficients(src_w, dst_w, &self.config);
-                self.v_coefficients = Self::compute_1d_coefficients(src_h, dst_h, &self.config);
-
-                let plane = self.scale_plane(src_plane, src_w, src_h, dst_w, dst_h);
-                output.planes.push(plane);
-
-                self.h_coefficients = old_h;
-                self.v_coefficients = old_v;
-                self.cached_src_dims = old_cached;
+            // Subsampled chroma planes need their own coefficients; both of them share one
+            // geometry, so they share one cache slot.
+            let coefficients = if i > 0 && input.format.is_yuv() {
+                Self::slot_entry(&mut self.chroma_coefficients, key)
             } else {
-                let plane = self.scale_plane(src_plane, src_w, src_h, dst_w, dst_h);
-                output.planes.push(plane);
-            }
+                Self::slot_entry(&mut self.luma_coefficients, key)
+            };
+
+            let plane = scale_plane_with(coefficients, src_plane, src_w, src_h, dst_w, dst_h);
+            output.planes.push(plane);
         }
 
         output
@@ -685,6 +980,353 @@ mod tests {
 
         // Lanczos at center should be 1
         assert!((ScaleAlgorithm::Lanczos3.kernel(0.0) - 1.0).abs() < 0.001);
+    }
+
+    /// Deterministic single-plane test pattern: gradient + checkerboard + a non-separable ripple.
+    fn create_test_plane(width: u32, height: u32) -> Plane {
+        let mut data = vec![0u8; width as usize * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let gradient = (x * 3 + y * 5) % 200;
+                let checker = if ((x / 6) + (y / 6)) % 2 == 0 { 48 } else { 0 };
+                let ripple = ((x * 7 + y * 13) % 17) * 3;
+                if let Some(slot) = data.get_mut(y * width as usize + x) {
+                    *slot = ((gradient + checker + ripple) % 256) as u8;
+                }
+            }
+        }
+        Plane::new(data, width as usize)
+    }
+
+    #[test]
+    fn test_parallel_and_serial_passes_are_byte_identical() {
+        // Row parallelism must be a pure scheduling change: every output pixel still accumulates
+        // its taps in ascending order onto an accumulator seeded at 0.0, so the two execution
+        // policies have to agree bit for bit. Production frames are far above the automatic
+        // threshold, so this is the only place the parallel path is compared directly.
+        let algorithms = [
+            ScaleAlgorithm::Nearest,
+            ScaleAlgorithm::Bilinear,
+            ScaleAlgorithm::Bicubic,
+            ScaleAlgorithm::CatmullRom,
+            ScaleAlgorithm::Lanczos2,
+            ScaleAlgorithm::Lanczos3,
+            ScaleAlgorithm::Lanczos4,
+        ];
+        // (src_w, src_h, dst_w, dst_h, antialias)
+        let geometries = [
+            (160u32, 120u32, 96u32, 72u32, true),
+            (160, 120, 96, 72, false),
+            (61, 37, 128, 96, true),
+            (152, 90, 90, 160, true),
+            (97, 61, 97, 61, true),
+        ];
+
+        for algorithm in algorithms {
+            for (src_w, src_h, dst_w, dst_h, antialias) in geometries {
+                let key = CoefficientKey {
+                    src_width: src_w,
+                    src_height: src_h,
+                    dst_width: dst_w,
+                    dst_height: dst_h,
+                    algorithm,
+                    antialias,
+                };
+                let coefficients = PlaneCoefficients::build(key);
+                let src = create_test_plane(src_w, src_h);
+
+                let serial = resample_plane(
+                    &coefficients,
+                    &src,
+                    src_w,
+                    src_h,
+                    dst_w,
+                    dst_h,
+                    PassParallelism::SERIAL,
+                );
+                let parallel = resample_plane(
+                    &coefficients,
+                    &src,
+                    src_w,
+                    src_h,
+                    dst_w,
+                    dst_h,
+                    PassParallelism::PARALLEL,
+                );
+                let mixed = resample_plane(
+                    &coefficients,
+                    &src,
+                    src_w,
+                    src_h,
+                    dst_w,
+                    dst_h,
+                    PassParallelism {
+                        horizontal: true,
+                        vertical: false,
+                    },
+                );
+
+                assert_eq!(
+                    serial.data, parallel.data,
+                    "{algorithm:?} {src_w}x{src_h}->{dst_w}x{dst_h} aa={antialias}: \
+                     parallel output differs from serial"
+                );
+                assert_eq!(
+                    serial.data, mixed.data,
+                    "{algorithm:?} {src_w}x{src_h}->{dst_w}x{dst_h} aa={antialias}: \
+                     mixed-policy output differs from serial"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_automatic_parallelism_threshold() {
+        // A thumbnail-sized pass stays on the calling thread; a 1080x1920 pass does not.
+        assert_eq!(
+            PassParallelism::automatic(96, 120, 72),
+            PassParallelism::SERIAL
+        );
+        assert_eq!(
+            PassParallelism::automatic(1080, 1080, 1920),
+            PassParallelism::PARALLEL
+        );
+        // Horizontal above, vertical below: the two passes are decided independently.
+        let mixed = PassParallelism::automatic(1024, 128, 32);
+        assert!(mixed.horizontal);
+        assert!(!mixed.vertical);
+    }
+
+    #[test]
+    fn test_short_source_row_reads_as_zero() {
+        // `Plane::row` returns a short/empty slice for a truncated buffer. The scaler must treat
+        // the missing samples as 0 rather than panicking or reading a neighbouring row.
+        let key = CoefficientKey {
+            src_width: 32,
+            src_height: 8,
+            dst_width: 16,
+            dst_height: 4,
+            algorithm: ScaleAlgorithm::Lanczos3,
+            antialias: true,
+        };
+        let coefficients = PlaneCoefficients::build(key);
+
+        // Only three full rows of data behind a 32-byte stride, eight rows claimed.
+        let truncated = Plane::new(vec![200u8; 32 * 3], 32);
+        let scaled = resample_plane(
+            &coefficients,
+            &truncated,
+            32,
+            8,
+            16,
+            4,
+            PassParallelism::SERIAL,
+        );
+        assert_eq!(scaled.data.len(), 16 * 4);
+        assert_eq!(scaled.stride, 16);
+
+        let parallel = resample_plane(
+            &coefficients,
+            &truncated,
+            32,
+            8,
+            16,
+            4,
+            PassParallelism::PARALLEL,
+        );
+        assert_eq!(scaled.data, parallel.data);
+    }
+
+    #[test]
+    fn test_coefficient_table_is_normalized_and_in_bounds() {
+        for algorithm in [
+            ScaleAlgorithm::Nearest,
+            ScaleAlgorithm::Bilinear,
+            ScaleAlgorithm::Bicubic,
+            ScaleAlgorithm::CatmullRom,
+            ScaleAlgorithm::Lanczos2,
+            ScaleAlgorithm::Lanczos3,
+            ScaleAlgorithm::Lanczos4,
+        ] {
+            // `(608, 1080)` and the exact-ratio pairs put output centres exactly on source-pixel
+            // boundaries, which is where the tap window used to degenerate for `Nearest`. Every
+            // kernel is held to the same standard here: a usable, in-bounds, normalised window for
+            // every output position, with and without antialiasing.
+            for (src, dst) in [
+                (608u32, 1080u32),
+                (1080, 608),
+                (37, 37),
+                (1, 64),
+                (64, 1),
+                (8, 4),
+                (16, 4),
+                (120, 60),
+                (2, 3),
+            ] {
+                for antialias in [true, false] {
+                    let table = CoefficientTable::build(src, dst, algorithm, antialias);
+                    assert_eq!(table.spans.len(), dst as usize);
+                    for span in &table.spans {
+                        assert!(
+                            span.len >= 1,
+                            "{algorithm:?} {src}->{dst} aa={antialias}: empty tap window"
+                        );
+                        assert!(
+                            span.src_start + span.len <= src,
+                            "{algorithm:?} {src}->{dst} aa={antialias}: tap window runs past the \
+                             source"
+                        );
+                        let weights = table.window(*span);
+                        assert_eq!(weights.len(), span.len as usize);
+
+                        let sum: f64 = weights.iter().sum();
+                        assert!(
+                            (sum - 1.0).abs() < 1e-9,
+                            "{algorithm:?} {src}->{dst} aa={antialias}: weights sum to {sum}, not 1"
+                        );
+                        assert!(
+                            weights.iter().any(|weight| *weight != 0.0),
+                            "{algorithm:?} {src}->{dst} aa={antialias}: all-zero tap window"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reference point-sample index: the one `Nearest` is defined by.
+    fn nearest_source_index(dst_pos: u32, src_size: u32, dst_size: u32) -> u32 {
+        let scale = src_size as f64 / dst_size as f64;
+        (((dst_pos as f64 + 0.5) * scale).floor() as u32).min(src_size - 1)
+    }
+
+    #[test]
+    fn test_nearest_taps_are_a_single_source_pixel() {
+        // `Nearest` is a point sampler, so every output position must resolve to exactly one
+        // source sample with weight 1.0 -- independent of the antialias flag, which only ever
+        // widened the window into a box average.
+        //
+        // Regression: with the generic tap builder an output centre that lands exactly on a
+        // source-pixel boundary produced an all-zero window. `8 -> 4` (an exact 2x downscale,
+        // antialias off) puts *every* centre there: centre = (d + 0.5) * 2 - 0.5 = 2d + 0.5, whose
+        // only candidate tap sits at distance exactly 0.5, and the kernel is `x < 0.5`. The whole
+        // plane came out black. `608 -> 1080` hits the same boundary on 6 of its 1080 rows.
+        for (src, dst, antialias) in [
+            (8u32, 4u32, false),
+            (8, 4, true),
+            (16, 4, false),
+            (120, 60, false),
+            (2, 3, false),
+            (2, 3, true),
+            (608, 1080, true),
+            (1080, 608, true),
+            (160, 96, true),
+            (96, 224, true),
+            (37, 37, true),
+            (1, 64, true),
+            (64, 1, true),
+        ] {
+            let table = CoefficientTable::build(src, dst, ScaleAlgorithm::Nearest, antialias);
+            assert_eq!(table.spans.len(), dst as usize);
+            for (dst_pos, span) in table.spans.iter().enumerate() {
+                let weights = table.window(*span);
+                assert_eq!(
+                    weights,
+                    &[1.0],
+                    "Nearest {src}->{dst} aa={antialias} d={dst_pos}: expected one unit tap, \
+                     got {weights:?}"
+                );
+                assert_eq!(
+                    span.src_start,
+                    nearest_source_index(dst_pos as u32, src, dst),
+                    "Nearest {src}->{dst} aa={antialias} d={dst_pos}: wrong source pixel"
+                );
+                assert!(span.src_start < src);
+            }
+        }
+    }
+
+    #[test]
+    fn test_nearest_resample_matches_dedicated_scaler() {
+        // The generic two-pass resampler and [`NearestNeighborScaler`] must agree byte for byte:
+        // both are point samplers over the same index formula, so any divergence is a bug in one
+        // of them. Before the tap builder special-cased `Nearest`, the 2x cases below came out
+        // entirely black and the antialiased downscales came out box-filtered.
+        for (src_w, src_h, dst_w, dst_h, antialias) in [
+            (8u32, 8u32, 4u32, 4u32, false),
+            (8, 8, 4, 4, true),
+            (160, 120, 80, 60, false),
+            (160, 120, 80, 60, true),
+            (160, 120, 96, 72, true),
+            (152, 90, 90, 160, true),
+            (61, 37, 128, 96, true),
+            (96, 72, 224, 168, true),
+        ] {
+            let key = CoefficientKey {
+                src_width: src_w,
+                src_height: src_h,
+                dst_width: dst_w,
+                dst_height: dst_h,
+                algorithm: ScaleAlgorithm::Nearest,
+                antialias,
+            };
+            let coefficients = PlaneCoefficients::build(key);
+            let src = create_test_plane(src_w, src_h);
+
+            let resampled = resample_plane(
+                &coefficients,
+                &src,
+                src_w,
+                src_h,
+                dst_w,
+                dst_h,
+                PassParallelism::SERIAL,
+            );
+            let expected = NearestNeighborScaler::new(dst_w, dst_h).scale_plane(&src, src_w, src_h);
+
+            assert_eq!(
+                resampled.data, expected.data,
+                "Nearest {src_w}x{src_h}->{dst_w}x{dst_h} aa={antialias}: the generic resampler \
+                 does not point-sample"
+            );
+            assert!(
+                resampled.data.iter().any(|byte| *byte != 0),
+                "Nearest {src_w}x{src_h}->{dst_w}x{dst_h} aa={antialias}: output is entirely black"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chroma_coefficients_cached_across_planes() {
+        let config = ScaleConfig::new(128, 96).with_algorithm(ScaleAlgorithm::Lanczos3);
+        let mut filter = ScaleFilter::new(NodeId(0), "scale", config);
+        assert!(filter.luma_coefficients.is_none());
+        assert!(filter.chroma_coefficients.is_none());
+
+        let input = create_test_frame(61, 37);
+        let _ = filter.scale_frame(&input);
+
+        let luma_key = filter
+            .luma_coefficients
+            .as_ref()
+            .map(|entry| entry.key)
+            .expect("luma coefficients must be cached after a frame");
+        let chroma_key = filter
+            .chroma_coefficients
+            .as_ref()
+            .map(|entry| entry.key)
+            .expect("chroma coefficients must be cached after a frame");
+
+        assert_eq!((luma_key.src_width, luma_key.src_height), (61, 37));
+        assert_eq!((luma_key.dst_width, luma_key.dst_height), (128, 96));
+        // 4:2:0 chroma of a 61x37 frame is div_ceil-rounded to 31x19 -> 64x48.
+        assert_eq!((chroma_key.src_width, chroma_key.src_height), (31, 19));
+        assert_eq!((chroma_key.dst_width, chroma_key.dst_height), (64, 48));
+
+        // Retargeting must invalidate both slots.
+        filter.set_dimensions(64, 48);
+        assert!(filter.luma_coefficients.is_none());
+        assert!(filter.chroma_coefficients.is_none());
     }
 
     #[test]

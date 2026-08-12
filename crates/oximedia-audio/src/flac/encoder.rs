@@ -682,9 +682,18 @@ impl FlacEncoder {
                 "Fixed order must be 0-4".into(),
             ));
         }
+        if order as usize > samples.len() {
+            return Err(AudioError::InvalidData(
+                "Not enough samples for fixed predictor order".into(),
+            ));
+        }
 
-        // Subframe header: 0 + type (001000 + order) + wasted bits (0)
-        let type_bits = 0b0001_0000 | order;
+        // Subframe header: 0 (padding) | 6-bit type (001000 + order) | wasted-bits
+        // flag (0). The 6-bit type field occupies bits 6..1 of the header byte, so
+        // it must be shifted left by 1 before being combined with the wasted-bits
+        // flag bit at bit 0 — OR-ing `order` in directly (as before) corrupts bit 0
+        // for odd orders and shifts the type field the decoder recovers.
+        let type_bits = (0b0000_1000 | order) << 1;
         writer.write_bits(u32::from(type_bits), 8);
 
         // Warmup samples
@@ -696,7 +705,7 @@ impl FlacEncoder {
         let residuals = self.calculate_fixed_residuals(samples, order);
 
         // Encode residuals
-        self.encode_residuals(writer, &residuals)?;
+        self.encode_residuals(writer, &residuals, samples.len(), order)?;
 
         Ok(())
     }
@@ -733,12 +742,37 @@ impl FlacEncoder {
                 "LPC order must be 1-32".into(),
             ));
         }
+        if order as usize > samples.len() {
+            return Err(AudioError::InvalidData(
+                "Not enough samples for LPC order".into(),
+            ));
+        }
 
         // Calculate LPC coefficients using autocorrelation
         let (coeffs, shift) = self.calculate_lpc_coefficients(samples, order)?;
 
-        // Subframe header: 0 + type (100000 + order-1) + wasted bits (0)
-        let type_bits = 0b0100_0000 | (order - 1);
+        // Quantized LP coefficient precision (bits per coefficient, signed). Clamp
+        // the coefficients to what `precision` bits can represent *before* writing
+        // them or computing residuals from them: `write_signed` below truncates to
+        // `precision` bits regardless of what we pass it, so if the residual
+        // calculation used the untruncated value, the encoder would predict from
+        // different coefficients than the decoder reconstructs. That would not
+        // desync the bitstream (same bit count either way, so CRC-16 still
+        // passes) — it would silently recover the wrong PCM.
+        let precision: u8 = 12;
+        let coeff_min = -(1i32 << (precision - 1));
+        let coeff_max = (1i32 << (precision - 1)) - 1;
+        let coeffs: Vec<i32> = coeffs
+            .into_iter()
+            .map(|c| c.clamp(coeff_min, coeff_max))
+            .collect();
+
+        // Subframe header: 0 (padding) | 6-bit type (100000 + order-1) | wasted-bits
+        // flag (0). The 6-bit type field occupies bits 6..1 of the header byte, so
+        // it must be shifted left by 1 before being combined with the wasted-bits
+        // flag bit at bit 0 — OR-ing `order - 1` in directly (as before) corrupts
+        // bit 0 for even orders and shifts the type field the decoder recovers.
+        let type_bits = (0b0010_0000 | (order - 1)) << 1;
         writer.write_bits(u32::from(type_bits), 8);
 
         // Warmup samples
@@ -747,7 +781,6 @@ impl FlacEncoder {
         }
 
         // Quantized LP coefficient precision - 1 (4 bits)
-        let precision = 12; // Use 12-bit precision
         writer.write_bits(u32::from(precision - 1), 4);
 
         // Quantized LP coefficient shift (5 bits, signed)
@@ -758,11 +791,11 @@ impl FlacEncoder {
             writer.write_signed(coeff, precision);
         }
 
-        // Calculate residuals
+        // Calculate residuals from the same clamped coefficients written above.
         let residuals = self.calculate_lpc_residuals(samples, &coeffs, shift, order);
 
         // Encode residuals
-        self.encode_residuals(writer, &residuals)?;
+        self.encode_residuals(writer, &residuals, samples.len(), order)?;
 
         Ok(())
     }
@@ -816,6 +849,19 @@ impl FlacEncoder {
             lpc[i] = lambda;
 
             error *= 1.0 - lambda * lambda;
+
+            // A perfectly periodic (or otherwise numerically pathological) block
+            // can drive the prediction error to zero, negative, or non-finite,
+            // which would make the next iteration's `lambda` divide by zero (or
+            // by NaN/Inf) and propagate garbage into the remaining coefficients.
+            // Stop refining and keep whatever lower-order coefficients were
+            // already computed instead — they stay finite, and the later
+            // `coeff.clamp(..)` + residual round trip is lossless regardless of
+            // prediction quality. (`error <= 0.0` alone would miss NaN, since
+            // every comparison with NaN is false.)
+            if !error.is_finite() || error <= 0.0 {
+                break;
+            }
         }
 
         // Quantize coefficients
@@ -851,25 +897,59 @@ impl FlacEncoder {
     }
 
     /// Encode residuals using Rice coding.
-    fn encode_residuals(&self, writer: &mut BitWriter, residuals: &[i32]) -> AudioResult<()> {
+    ///
+    /// `block_size` is the full subframe length (warmup samples + residuals) and
+    /// `predictor_order` is the number of warmup samples, so
+    /// `residuals.len() == block_size - predictor_order`. Both are needed to pick
+    /// a partition order the decoder can reproduce: per the FLAC spec, the first
+    /// partition holds `(block_size >> partition_order) - predictor_order`
+    /// residuals (the warmup samples stand in for its first `predictor_order`
+    /// values) and every later partition holds exactly `block_size >>
+    /// partition_order`. This must match `FlacDecoder::decode_residuals` exactly,
+    /// or the decoder misreads partition boundaries and desyncs mid-frame.
+    fn encode_residuals(
+        &self,
+        writer: &mut BitWriter,
+        residuals: &[i32],
+        block_size: usize,
+        predictor_order: u8,
+    ) -> AudioResult<()> {
         // Coding method (2 bits): 00 = Rice with 4-bit param
         writer.write_bits(0, 2);
 
+        let predictor_order = predictor_order as usize;
+
+        // The compression level suggests a partition order, but it's only usable
+        // if `block_size` divides evenly by `2^order` and the first partition
+        // still has room for at least one residual after the warmup samples.
+        // Back off to a smaller order — 0 always qualifies — exactly as a
+        // spec-conformant encoder must for a ragged final block.
+        let mut partition_order = self.compression_level.partition_order();
+        while partition_order > 0 {
+            let count = 1usize << partition_order;
+            if block_size % count == 0 && (block_size >> partition_order) > predictor_order {
+                break;
+            }
+            partition_order -= 1;
+        }
+
         // Partition order (4 bits)
-        let partition_order = self.compression_level.partition_order();
         writer.write_bits(u32::from(partition_order), 4);
 
         let partition_count = 1usize << partition_order;
-        let samples_per_partition = residuals.len() / partition_count;
+        let mut pos = 0usize;
 
         for p in 0..partition_count {
-            let start = p * samples_per_partition;
-            let end = if p == partition_count - 1 {
+            let samples_in_partition = if partition_order == 0 {
                 residuals.len()
+            } else if p == 0 {
+                (block_size >> partition_order) - predictor_order
             } else {
-                (p + 1) * samples_per_partition
+                block_size >> partition_order
             };
-            let partition = &residuals[start..end];
+            let end = (pos + samples_in_partition).min(residuals.len());
+            let partition = &residuals[pos..end];
+            pos = end;
 
             // Calculate optimal Rice parameter
             let param = self.calculate_rice_parameter(partition);

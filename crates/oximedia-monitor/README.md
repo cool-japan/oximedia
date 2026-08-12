@@ -1,6 +1,6 @@
 # oximedia-monitor
 
-**Status: [Stable]** | Version: 0.2.0 | Tests: extensively tested | Updated: 2026-07-14
+**Status: [Stable]** | Version: 0.2.1 | Tests: extensively tested | Updated: 2026-08-12
 
 Comprehensive system monitoring and alerting for OxiMedia, providing professional-grade infrastructure monitoring with metrics collection, alerting, dashboards, REST API, and real-time streaming.
 
@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-monitor = "0.1.9"
+oximedia-monitor = "0.2.0"
 ```
 
 ```rust

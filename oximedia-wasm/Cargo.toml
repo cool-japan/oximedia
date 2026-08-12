@@ -25,6 +25,13 @@ oximedia-core = { workspace = true, features = ["wasm"] }
 # VP8 decoder (see video_decoder.rs removal); "av1" is still required by
 # WasmMediaPlayer (media_player.rs).
 oximedia-codec = { workspace = true, default-features = false, features = ["av1"] }
+# In-memory container demux (Matroska/WebM, Ogg, FLAC, WAV, MP4) for
+# src/demuxer.rs and src/streaming_demuxer.rs -- see src/block_on.rs for how
+# their async `Demuxer`/`MediaSource` APIs are driven synchronously. The
+# "mmap" feature is intentionally NOT enabled (filesystem-only, meaningless
+# and non-Pure-Rust-relevant in a browser sandbox).
+oximedia-container.workspace = true
+oximedia-io.workspace = true
 # NOTE: "vorbis" intentionally not requested here -- this crate's own src/
 # needs only opus+flac (see audio_decoder.rs; the WasmVorbisDecoder class
 # was removed because oximedia_audio::vorbis only round-trips its own

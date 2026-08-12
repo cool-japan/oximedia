@@ -6,15 +6,24 @@
 //! - Huffman table encode/decode (DC + AC)
 //! - Quantization tables (luma/chroma, quality-scaled)
 //! - 8x8 DCT / IDCT
-//! - 4:2:0 chroma subsampling
 //! - YCbCr ↔ RGB conversion
 //! - JFIF APP0 header
+//!
+//! Decoding ([`JpegDecoder`], implemented in the `decode` submodule) reads any
+//! chroma subsampling whose upsampling ratio is 1 or 2 per axis — 4:4:4,
+//! 4:2:2, 4:4:0, 4:2:0 — plus greyscale and restart intervals, and rejects
+//! everything it cannot reproduce. Encoding ([`JpegEncoder`]) always writes
+//! 4:4:4.
 
 #![allow(dead_code)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::cast_lossless)]
+
+mod decode;
+mod entropy;
+mod upsample;
 
 use crate::error::{ImageError, ImageResult};
 use crate::{ColorSpace, ImageData, ImageFrame, PixelType};
@@ -323,98 +332,6 @@ impl Default for JpegQuality {
     }
 }
 
-// ── JPEG bit-stream reader ────────────────────────────────────────────────────
-
-struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-    bit_buf: u32,
-    bits_left: u32,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-            bit_buf: 0,
-            bits_left: 0,
-        }
-    }
-
-    fn fill(&mut self) {
-        while self.bits_left <= 24 && self.pos < self.data.len() {
-            let byte = self.data[self.pos];
-            self.pos += 1;
-            // NOTE: scan_data has already been de-stuffed (0xFF 0x00 → 0xFF)
-            // by the outer scan extraction loop. Do NOT do stuffing removal here.
-            self.bit_buf = (self.bit_buf << 8) | byte as u32;
-            self.bits_left += 8;
-        }
-    }
-
-    fn read_bits(&mut self, n: u32) -> Option<u32> {
-        if n == 0 {
-            return Some(0);
-        }
-        self.fill();
-        if self.bits_left < n {
-            return None;
-        }
-        self.bits_left -= n;
-        Some((self.bit_buf >> self.bits_left) & ((1 << n) - 1))
-    }
-}
-
-// ── JPEG marker parser ────────────────────────────────────────────────────────
-
-struct JpegParser<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JpegParser<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    fn read_u8(&mut self) -> Option<u8> {
-        if self.pos < self.data.len() {
-            let v = self.data[self.pos];
-            self.pos += 1;
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    fn read_u16_be(&mut self) -> Option<u16> {
-        let hi = self.read_u8()? as u16;
-        let lo = self.read_u8()? as u16;
-        Some((hi << 8) | lo)
-    }
-
-    fn skip(&mut self, n: usize) {
-        self.pos = (self.pos + n).min(self.data.len());
-    }
-
-    fn next_marker(&mut self) -> Option<u16> {
-        // Scan for 0xFF followed by non-zero/non-padding byte
-        while self.pos + 1 < self.data.len() {
-            if self.data[self.pos] == 0xFF {
-                let mark = self.data[self.pos + 1];
-                if mark != 0x00 && mark != 0xFF {
-                    let marker = 0xFF00u16 | mark as u16;
-                    self.pos += 2;
-                    return Some(marker);
-                }
-            }
-            self.pos += 1;
-        }
-        None
-    }
-}
-
 /// JPEG SOF0 frame header.
 #[derive(Debug, Clone)]
 pub struct SofHeader {
@@ -456,9 +373,9 @@ fn parse_sof0(data: &[u8]) -> ImageResult<SofHeader> {
     })
 }
 
-// ── Decode (simplified baseline) ─────────────────────────────────────────────
+// ── Decode ─────────────────────────────────────────────────────────────────
 
-/// JPEG decoder (simplified baseline).
+/// JPEG decoder (baseline sequential DCT).
 #[derive(Debug, Default)]
 pub struct JpegDecoder;
 
@@ -469,333 +386,22 @@ impl JpegDecoder {
         Self
     }
 
-    /// Decode JPEG bytes to a `JpegFrame`.
+    /// Decode JPEG bytes to a [`JpegFrame`].
     ///
-    /// Supports baseline DCT grayscale and YCbCr JPEG files.
+    /// Handles baseline (`SOF0`) and 8-bit extended sequential (`SOF1`)
+    /// datastreams: greyscale, and YCbCr at any chroma subsampling whose
+    /// upsampling ratio is 1 or 2 on each axis — 4:4:4, 4:2:2, 4:4:0 and
+    /// 4:2:0 — with restart intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for anything outside that envelope (progressive,
+    /// arithmetic-coded, lossless, hierarchical, 12-bit, exotic sampling
+    /// ratios) and for malformed or truncated data. It never substitutes a
+    /// synthetic image for a file it cannot read.
     pub fn decode(&self, data: &[u8]) -> ImageResult<JpegFrame> {
-        if data.len() < 4 {
-            return Err(ImageError::invalid_format("JPEG data too short"));
-        }
-        let soi = u16::from_be_bytes([data[0], data[1]]);
-        if soi != JPEG_SOI {
-            return Err(ImageError::invalid_format("Not a JPEG file (missing SOI)"));
-        }
-
-        let mut parser = JpegParser::new(data);
-        parser.pos = 2; // skip SOI
-
-        let mut sof: Option<SofHeader> = None;
-        let mut quant_tables: [Option<[u16; 64]>; 4] = [None, None, None, None];
-        let mut huff_dc: [Option<HuffmanTable>; 4] = Default::default();
-        let mut huff_ac: [Option<HuffmanTable>; 4] = Default::default();
-        let mut scan_data_start = None;
-
-        while let Some(marker) = parser.next_marker() {
-            match marker {
-                JPEG_APP0 => {
-                    let len = parser.read_u16_be().unwrap_or(2) as usize;
-                    parser.skip(len.saturating_sub(2));
-                }
-                JPEG_DQT => {
-                    let len = parser.read_u16_be().unwrap_or(2) as usize;
-                    let end = parser.pos + len.saturating_sub(2);
-                    while parser.pos < end && parser.pos < data.len() {
-                        let prec_id = parser.read_u8().unwrap_or(0);
-                        let id = (prec_id & 0x0F) as usize;
-                        let prec = (prec_id >> 4) & 0x0F;
-                        if id < 4 {
-                            let mut qt = [1u16; 64];
-                            for coeff in &mut qt {
-                                *coeff = if prec == 0 {
-                                    parser.read_u8().unwrap_or(1) as u16
-                                } else {
-                                    parser.read_u16_be().unwrap_or(1)
-                                };
-                            }
-                            quant_tables[id] = Some(qt);
-                        }
-                    }
-                }
-                JPEG_DHT => {
-                    let len = parser.read_u16_be().unwrap_or(2) as usize;
-                    let end = parser.pos + len.saturating_sub(2);
-                    while parser.pos < end && parser.pos < data.len() {
-                        let tc_id = parser.read_u8().unwrap_or(0);
-                        let table_class = (tc_id >> 4) & 1; // 0=DC, 1=AC
-                        let id = (tc_id & 0x0F) as usize;
-                        let mut lengths = [0u8; 16];
-                        let mut total = 0usize;
-                        for l in &mut lengths {
-                            *l = parser.read_u8().unwrap_or(0);
-                            total += *l as usize;
-                        }
-                        let mut symbols = Vec::with_capacity(total);
-                        for _ in 0..total {
-                            symbols.push(parser.read_u8().unwrap_or(0));
-                        }
-                        let ht = HuffmanTable { lengths, symbols };
-                        if id < 4 {
-                            if table_class == 0 {
-                                huff_dc[id] = Some(ht);
-                            } else {
-                                huff_ac[id] = Some(ht);
-                            }
-                        }
-                    }
-                }
-                JPEG_SOF0 => {
-                    let len = parser.read_u16_be().unwrap_or(2) as usize;
-                    let seg_data = &data[parser.pos..parser.pos + len.saturating_sub(2)];
-                    sof = Some(parse_sof0(seg_data)?);
-                    parser.skip(len.saturating_sub(2));
-                }
-                JPEG_SOS => {
-                    let len = parser.read_u16_be().unwrap_or(2) as usize;
-                    parser.skip(len.saturating_sub(2));
-                    scan_data_start = Some(parser.pos);
-                    break;
-                }
-                JPEG_EOI => break,
-                _ => {
-                    let len = parser.read_u16_be().unwrap_or(2) as usize;
-                    parser.skip(len.saturating_sub(2));
-                }
-            }
-        }
-
-        let sof = sof.ok_or_else(|| ImageError::invalid_format("JPEG: missing SOF0"))?;
-        let scan_start =
-            scan_data_start.ok_or_else(|| ImageError::invalid_format("JPEG: missing SOS"))?;
-
-        // Extract compressed scan data (removing byte stuffing markers)
-        let mut scan_data = Vec::new();
-        let mut sp = scan_start;
-        while sp < data.len() {
-            if data[sp] == 0xFF {
-                if sp + 1 >= data.len() {
-                    break;
-                }
-                let next = data[sp + 1];
-                if next == 0x00 {
-                    scan_data.push(0xFF);
-                    sp += 2;
-                } else if next == 0xD9 {
-                    break; // EOI
-                } else if next >= 0xD0 && next <= 0xD7 {
-                    sp += 2; // restart markers
-                } else {
-                    break;
-                }
-            } else {
-                scan_data.push(data[sp]);
-                sp += 1;
-            }
-        }
-
-        // Simplified decode: produce gray/color output via IDCT
-        let width = sof.width as u32;
-        let height = sof.height as u32;
-        let components = sof.components;
-        let num_pixels = (width * height) as usize;
-
-        // For a real full JPEG decode we need full entropy decode.
-        // Here we provide a well-structured baseline decode with real Huffman.
-        // If tables are present, attempt real decode; else produce gradient placeholder.
-        let pixels = self
-            .decode_scan(
-                &scan_data,
-                width,
-                height,
-                components,
-                &quant_tables,
-                &huff_dc,
-                &huff_ac,
-            )
-            .unwrap_or_else(|_| {
-                // Fallback: gray gradient
-                (0..num_pixels * components as usize)
-                    .map(|i| ((i / components as usize) % 256) as u8)
-                    .collect()
-            });
-
-        Ok(JpegFrame {
-            width,
-            height,
-            components,
-            pixels,
-        })
+        decode::decode(data)
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn decode_scan(
-        &self,
-        scan_data: &[u8],
-        width: u32,
-        height: u32,
-        components: u8,
-        quant_tables: &[Option<[u16; 64]>; 4],
-        huff_dc: &[Option<HuffmanTable>; 4],
-        huff_ac: &[Option<HuffmanTable>; 4],
-    ) -> ImageResult<Vec<u8>> {
-        let mcu_cols = ((width + 7) / 8) as usize;
-        let mcu_rows = ((height + 7) / 8) as usize;
-        let n_comp = components as usize;
-        // Dimensions are SOF-validated, but size the buffer with checked usize
-        // math so the `width*height` u32 product cannot wrap and under-allocate.
-        let out_len = crate::limits::checked_dims(width as usize, height as usize, n_comp, 1)
-            .map_err(ImageError::InvalidFormat)?;
-        let mut out = vec![128u8; out_len];
-
-        let dc_table = huff_dc[0]
-            .as_ref()
-            .ok_or_else(|| ImageError::invalid_format("Missing DC Huffman table"))?;
-        let ac_table = huff_ac[0]
-            .as_ref()
-            .ok_or_else(|| ImageError::invalid_format("Missing AC Huffman table"))?;
-        let qt = quant_tables[0]
-            .as_ref()
-            .ok_or_else(|| ImageError::invalid_format("Missing quantization table"))?;
-
-        // Build decode maps for DC and AC
-        let _dc_decode: std::collections::HashMap<(u32, u32), u8> = dc_table
-            .build_codes()
-            .into_iter()
-            .map(|(sym, code, len)| ((code, len), sym))
-            .collect();
-        let _ac_decode: std::collections::HashMap<(u32, u32), u8> = ac_table
-            .build_codes()
-            .into_iter()
-            .map(|(sym, code, len)| ((code, len), sym))
-            .collect();
-
-        let mut reader = BitReader::new(scan_data);
-        let mut dc_pred = vec![0i32; n_comp];
-
-        for mcu_row in 0..mcu_rows {
-            for mcu_col in 0..mcu_cols {
-                for comp in 0..n_comp {
-                    let qt_comp = quant_tables[comp.min(1)].as_ref().unwrap_or(qt);
-                    let dc_huff = huff_dc[comp.min(1)].as_ref().unwrap_or(dc_table);
-                    let ac_huff = huff_ac[comp.min(1)].as_ref().unwrap_or(ac_table);
-
-                    let dc_dec: std::collections::HashMap<(u32, u32), u8> = dc_huff
-                        .build_codes()
-                        .into_iter()
-                        .map(|(sym, code, len)| ((code, len), sym))
-                        .collect();
-                    let ac_dec: std::collections::HashMap<(u32, u32), u8> = ac_huff
-                        .build_codes()
-                        .into_iter()
-                        .map(|(sym, code, len)| ((code, len), sym))
-                        .collect();
-
-                    let mut coeffs = [0i32; 64];
-
-                    // Decode DC
-                    let cat = decode_huffman_symbol(&mut reader, &dc_dec)
-                        .ok_or_else(|| ImageError::invalid_format("DC Huffman decode failed"))?;
-                    let diff = if cat == 0 {
-                        0i32
-                    } else {
-                        let bits = reader
-                            .read_bits(cat as u32)
-                            .ok_or_else(|| ImageError::invalid_format("DC bits truncated"))?;
-                        extend(bits, cat)
-                    };
-                    dc_pred[comp] += diff;
-                    coeffs[0] = dc_pred[comp];
-
-                    // Decode AC
-                    let mut k = 1usize;
-                    while k < 64 {
-                        let rs = decode_huffman_symbol(&mut reader, &ac_dec).ok_or_else(|| {
-                            ImageError::invalid_format("AC Huffman decode failed")
-                        })?;
-                        if rs == 0x00 {
-                            break;
-                        } // EOB
-                        let run = (rs >> 4) as usize;
-                        let cat = rs & 0x0F;
-                        k += run;
-                        if k >= 64 {
-                            break;
-                        }
-                        if cat > 0 {
-                            let bits = reader
-                                .read_bits(cat as u32)
-                                .ok_or_else(|| ImageError::invalid_format("AC bits truncated"))?;
-                            coeffs[ZIGZAG[k] as usize] = extend(bits, cat);
-                        }
-                        k += 1;
-                    }
-
-                    // Dequantize.
-                    // coeffs[i] holds the quantized coefficient at natural block position i.
-                    // qt_comp is also in natural order, so multiply element-wise.
-                    for (i, c) in coeffs.iter_mut().enumerate() {
-                        *c *= qt_comp[i] as i32;
-                    }
-
-                    // IDCT
-                    let mut block = [0.0f32; 64];
-                    for (i, &c) in coeffs.iter().enumerate() {
-                        block[i] = c as f32;
-                    }
-                    idct_8x8(&mut block);
-
-                    // Write to output
-                    for by in 0..8usize {
-                        let img_y = mcu_row * 8 + by;
-                        if img_y >= height as usize {
-                            continue;
-                        }
-                        for bx in 0..8usize {
-                            let img_x = mcu_col * 8 + bx;
-                            if img_x >= width as usize {
-                                continue;
-                            }
-                            let pix_idx = (img_y * width as usize + img_x) * n_comp + comp;
-                            let val = block[by * 8 + bx].clamp(0.0, 255.0) as u8;
-                            if pix_idx < out.len() {
-                                out[pix_idx] = val;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // YCbCr → RGB if 3 components
-        if n_comp == 3 {
-            for i in 0..(width * height) as usize {
-                let base = i * 3;
-                let y = out[base] as f32;
-                let cb = out[base + 1] as f32;
-                let cr = out[base + 2] as f32;
-                let (r, g, b) = ycbcr_to_rgb(y, cb, cr);
-                out[base] = r;
-                out[base + 1] = g;
-                out[base + 2] = b;
-            }
-        }
-
-        Ok(out)
-    }
-}
-
-fn decode_huffman_symbol(
-    reader: &mut BitReader<'_>,
-    table: &std::collections::HashMap<(u32, u32), u8>,
-) -> Option<u8> {
-    let mut code = 0u32;
-    for bit_len in 1u32..=16 {
-        let bit = reader.read_bits(1)?;
-        code = (code << 1) | bit;
-        if let Some(&sym) = table.get(&(code, bit_len)) {
-            return Some(sym);
-        }
-    }
-    None
 }
 
 /// Extend a sign-extended value from `nbit`-bit code.
@@ -867,16 +473,12 @@ impl JpegEncoder {
 
         // DQT: luma
         let mut dqt0 = vec![0x00u8]; // table 0, precision 8-bit
-        for &q in &luma_qt {
-            dqt0.push(q.min(255) as u8);
-        }
+        write_quant_table(&mut dqt0, &luma_qt);
         write_segment(&mut out, JPEG_DQT, &dqt0);
 
         // DQT: chroma
         let mut dqt1 = vec![0x01u8]; // table 1
-        for &q in &chroma_qt {
-            dqt1.push(q.min(255) as u8);
-        }
+        write_quant_table(&mut dqt1, &chroma_qt);
         write_segment(&mut out, JPEG_DQT, &dqt1);
 
         // SOF0
@@ -1135,6 +737,18 @@ fn build_chroma_ac_huffman() -> HuffmanTable {
             0xd7, 0xd8, 0xd9, 0xda, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2,
             0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
         ],
+    }
+}
+
+/// Append the 64 elements of a quantization table to a `DQT` payload.
+///
+/// T.81 §B.2.4.1 orders the elements by **zigzag scan position**, not by
+/// natural block position. The tables in this module are stored naturally
+/// (Annex K prints them that way), so the permutation happens here — the one
+/// place that serialises them.
+fn write_quant_table(out: &mut Vec<u8>, table: &[u16; 64]) {
+    for &position in &ZIGZAG {
+        out.push(table[position as usize].min(255) as u8);
     }
 }
 

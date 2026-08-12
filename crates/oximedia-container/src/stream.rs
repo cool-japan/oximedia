@@ -4,6 +4,7 @@ use bytes::Bytes;
 use oximedia_core::{CodecId, MediaType, Rational};
 
 use crate::demux::matroska::matroska_v4::BlockAdditionMapping;
+use crate::track_header::TransformMatrix;
 
 /// Information about a stream in a container.
 ///
@@ -34,6 +35,23 @@ pub struct StreamInfo {
 
     /// Stream metadata (title, language, etc.).
     pub metadata: Metadata,
+
+    /// Display rotation in degrees, snapped to a quarter turn
+    /// (`0`, `90`, `180` or `270`).
+    ///
+    /// Derived from the container's display transform matrix (MP4 `tkhd`).
+    /// `None` when the container carries no orientation metadata for this
+    /// stream. Phone and camera captures routinely record portrait footage as
+    /// landscape pixels plus a 90/270 degree rotation here, so any reframing or
+    /// scaling stage must consult this before trusting `width`/`height`.
+    pub rotation: Option<u16>,
+
+    /// The full display transform matrix backing [`Self::rotation`].
+    ///
+    /// Row-major `[a, b, u, c, d, v, tx, ty, w]` in floating point (the raw
+    /// 16.16 / 2.30 fixed-point values already decoded). `None` when the
+    /// container carries no matrix.
+    pub display_matrix: Option<TransformMatrix>,
 }
 
 impl StreamInfo {
@@ -48,6 +66,36 @@ impl StreamInfo {
             duration: None,
             codec_params: CodecParams::default(),
             metadata: Metadata::default(),
+            rotation: None,
+            display_matrix: None,
+        }
+    }
+
+    /// Sets the display rotation, in degrees.
+    #[must_use]
+    pub const fn with_rotation(mut self, degrees: u16) -> Self {
+        self.rotation = Some(degrees);
+        self
+    }
+
+    /// Returns `true` when the stream is rotated by a quarter turn, i.e. its
+    /// coded `width`/`height` are swapped relative to how it must be displayed.
+    #[must_use]
+    pub fn is_quarter_turned(&self) -> bool {
+        matches!(self.rotation, Some(90 | 270))
+    }
+
+    /// Returns the display dimensions with [`Self::rotation`] applied.
+    ///
+    /// Returns `None` unless both coded dimensions are known.
+    #[must_use]
+    pub fn display_dimensions(&self) -> Option<(u32, u32)> {
+        let width = self.codec_params.width?;
+        let height = self.codec_params.height?;
+        if self.is_quarter_turned() {
+            Some((height, width))
+        } else {
+            Some((width, height))
         }
     }
 

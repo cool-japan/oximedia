@@ -598,27 +598,123 @@ fn build_vorbis_comment(config: &MuxerConfig) -> Vec<u8> {
     header
 }
 
-/// Extracts Vorbis setup header from extradata.
-fn extract_vorbis_setup(extradata: &[u8]) -> Option<Vec<u8>> {
-    // Extradata format: packet lengths followed by data
-    // This is a simplified extraction
-    if extradata.len() < 2 {
+/// Splits packed Vorbis header extradata into its three constituent header
+/// packets: identification, comment, and setup.
+///
+/// Vorbis always has exactly three header packets (Vorbis I spec §4.2.1,
+/// "Header decode and decode setup"), each beginning with a 1-byte packet
+/// type (`1`/`3`/`5`) followed by the 6-byte `"vorbis"` magic. Ogg itself
+/// frames each as its own page/packet, but outside of Ogg page framing
+/// (e.g. as a single `StreamInfo::codec_params.extradata` blob handed to
+/// this muxer) the three packets need their own container-level framing to
+/// know where one ends and the next begins. Two such framings are actually
+/// produced elsewhere in this crate and are both handled here, tried in
+/// order:
+///
+/// 1. **Xiph-laced framing** — populated by
+///    `crate::demux::matroska::mod` from the raw Matroska `CodecPrivate`
+///    element, which is the format the Matroska/WebM spec mandates for
+///    `A_VORBIS` tracks (and the same convention FFmpeg's own
+///    `AVCodecContext.extradata` uses for Vorbis): a leading
+///    `packet_count - 1` byte (always `2` for Vorbis's fixed three
+///    packets), followed by 2 Xiph-laced lengths — each a run of `0xFF`
+///    continuation bytes plus a final byte `< 0xFF` — for the first two
+///    packets, followed by all three raw packets concatenated back to
+///    back (the third packet's length is implied by whatever remains).
+///    This is the same lacing scheme
+///    `crate::demux::matroska::parser::parse_xiph_lacing` reads for
+///    Matroska Block lacing.
+/// 2. **Length-prefixed framing** — populated by
+///    `crate::demux::ogg::mod::OggDemuxer` for its own round-trip use: no
+///    leading count byte, just `[u16 LE len][packet]` repeated for each
+///    header (`[u16 LE len0][packet0][u16 LE len1][packet1][u16 LE
+///    len2][packet2]` for Vorbis's three packets).
+///
+/// A candidate split — from either framing — is accepted only once all
+/// three resulting packets have been confirmed to start with their
+/// expected packet-type byte and the `"vorbis"` magic; a split that landed
+/// on the right byte ranges by pure coincidence without the right framing
+/// is never honored. Returns `None` if neither framing produces a
+/// validated split.
+fn split_vorbis_headers(extradata: &[u8]) -> Option<[Vec<u8>; 3]> {
+    split_vorbis_headers_xiph_laced(extradata)
+        .or_else(|| split_vorbis_headers_length_prefixed(extradata))
+}
+
+/// Parses the Matroska/WebM/FFmpeg-style Xiph-laced framing. See
+/// [`split_vorbis_headers`] for the exact byte layout.
+fn split_vorbis_headers_xiph_laced(extradata: &[u8]) -> Option<[Vec<u8>; 3]> {
+    let (&packet_count_minus_one, rest) = extradata.split_first()?;
+    if packet_count_minus_one != 2 {
         return None;
     }
 
-    // Try to find the setup header (packet type 5)
-    let mut offset = 0;
-    while offset < extradata.len() {
-        if extradata[offset] == 5 && offset + 7 <= extradata.len() {
-            // Check for "vorbis" magic
-            if &extradata[offset + 1..offset + 7] == b"vorbis" {
-                return Some(extradata[offset..].to_vec());
+    let mut offset = 0usize;
+    let mut lengths = [0usize; 2];
+    for length in &mut lengths {
+        let mut total = 0usize;
+        loop {
+            let byte = *rest.get(offset)?;
+            offset += 1;
+            total = total.checked_add(usize::from(byte))?;
+            if byte != 0xFF {
+                break;
             }
         }
-        offset += 1;
+        *length = total;
     }
 
-    None
+    let payload = rest.get(offset..)?;
+    let comment_end = lengths[0].checked_add(lengths[1])?;
+    let id_header = payload.get(..lengths[0])?;
+    let comment_header = payload.get(lengths[0]..comment_end)?;
+    let setup_header = payload.get(comment_end..)?;
+
+    validate_vorbis_headers(id_header, comment_header, setup_header)
+}
+
+/// Parses this crate's own `OggDemuxer` length-prefixed framing. See
+/// [`split_vorbis_headers`] for the exact byte layout.
+fn split_vorbis_headers_length_prefixed(extradata: &[u8]) -> Option<[Vec<u8>; 3]> {
+    let mut offset = 0usize;
+    let mut headers: [&[u8]; 3] = [&[], &[], &[]];
+    for header in &mut headers {
+        let len_bytes = extradata.get(offset..offset + 2)?;
+        let len = usize::from(u16::from_le_bytes([len_bytes[0], len_bytes[1]]));
+        offset += 2;
+        *header = extradata.get(offset..offset + len)?;
+        offset += len;
+    }
+    // Vorbis extradata carries exactly 3 packets; leftover trailing bytes
+    // mean this wasn't actually 3-packet length-prefixed Vorbis framing, so
+    // the parse is rejected rather than silently ignoring the remainder.
+    if offset != extradata.len() {
+        return None;
+    }
+
+    validate_vorbis_headers(headers[0], headers[1], headers[2])
+}
+
+/// Confirms `id`/`comment`/`setup` each begin with their expected Vorbis
+/// packet-type byte (`1`/`3`/`5`) and the `"vorbis"` magic, per the Vorbis I
+/// spec's common header packet framing (§4.2.1). Returns the three packets
+/// (owned) only once all three check out.
+fn validate_vorbis_headers(id: &[u8], comment: &[u8], setup: &[u8]) -> Option<[Vec<u8>; 3]> {
+    for (header, expected_type) in [(id, 1u8), (comment, 3u8), (setup, 5u8)] {
+        if header.len() < 7 || header[0] != expected_type || &header[1..7] != b"vorbis" {
+            return None;
+        }
+    }
+    Some([id.to_vec(), comment.to_vec(), setup.to_vec()])
+}
+
+/// Extracts the Vorbis setup header (packet type 5) from packed extradata.
+///
+/// See [`split_vorbis_headers`] for the exact three-header framing this
+/// recognizes. Returns `None` if `extradata` is not validly-framed packed
+/// Vorbis header data, rather than guessing at a byte range.
+fn extract_vorbis_setup(extradata: &[u8]) -> Option<Vec<u8>> {
+    split_vorbis_headers(extradata).map(|[_id, _comment, setup]| setup)
 }
 
 /// Builds a FLAC header marker.
@@ -700,6 +796,220 @@ mod tests {
         stream.codec_params.sample_rate = Some(48000);
         stream.codec_params.channels = Some(2);
         stream
+    }
+
+    fn create_vorbis_stream(extradata: Vec<u8>) -> StreamInfo {
+        let mut stream = StreamInfo::new(0, CodecId::Vorbis, Rational::new(1, 44100));
+        stream.codec_params.sample_rate = Some(44100);
+        stream.codec_params.channels = Some(2);
+        stream.codec_params.extradata = Some(Bytes::from(extradata));
+        stream
+    }
+
+    // ─── Vorbis header packing test helpers ────────────────────────────────
+
+    /// Encodes `len` as a Xiph-laced length: a run of `0xFF` continuation
+    /// bytes plus a final byte `< 0xFF` — the inverse of the decode loop in
+    /// `split_vorbis_headers_xiph_laced`.
+    fn xiph_lace_len(mut len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        while len >= 0xFF {
+            out.push(0xFF);
+            len -= 0xFF;
+        }
+        out.push(len as u8);
+        out
+    }
+
+    /// Packs three header packets using the Matroska/WebM/FFmpeg-style
+    /// Xiph-laced framing `split_vorbis_headers_xiph_laced` parses.
+    fn pack_vorbis_headers_xiph(id: &[u8], comment: &[u8], setup: &[u8]) -> Vec<u8> {
+        let mut out = vec![2u8]; // packet_count - 1 == 2 (three packets)
+        out.extend(xiph_lace_len(id.len()));
+        out.extend(xiph_lace_len(comment.len()));
+        out.extend_from_slice(id);
+        out.extend_from_slice(comment);
+        out.extend_from_slice(setup);
+        out
+    }
+
+    /// Packs three header packets using this crate's own `OggDemuxer`-style
+    /// length-prefixed framing `split_vorbis_headers_length_prefixed` parses.
+    fn pack_vorbis_headers_length_prefixed(id: &[u8], comment: &[u8], setup: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for header in [id, comment, setup] {
+            out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+            out.extend_from_slice(header);
+        }
+        out
+    }
+
+    /// A minimal but spec-shaped synthetic Vorbis identification packet:
+    /// packet type 1 + `"vorbis"` magic + placeholder id-header fields.
+    fn synthetic_id_header() -> Vec<u8> {
+        let mut h = vec![1u8];
+        h.extend_from_slice(b"vorbis");
+        h.extend_from_slice(&[0u8; 16]);
+        h
+    }
+
+    /// A minimal synthetic Vorbis comment packet (type 3) of adjustable size.
+    fn synthetic_comment_header(padding: usize) -> Vec<u8> {
+        let mut h = vec![3u8];
+        h.extend_from_slice(b"vorbis");
+        h.extend(vec![0u8; padding]);
+        h
+    }
+
+    /// A minimal synthetic Vorbis setup packet (type 5) of adjustable size.
+    fn synthetic_setup_header(padding: usize) -> Vec<u8> {
+        let mut h = vec![5u8];
+        h.extend_from_slice(b"vorbis");
+        h.extend(vec![0xCDu8; padding]);
+        h
+    }
+
+    #[test]
+    fn test_split_vorbis_headers_xiph_laced_round_trip() {
+        let id = synthetic_id_header();
+        let comment = synthetic_comment_header(5);
+        let setup = synthetic_setup_header(40);
+        let packed = pack_vorbis_headers_xiph(&id, &comment, &setup);
+
+        let split = split_vorbis_headers(&packed).expect("valid xiph-laced framing must split");
+        assert_eq!(split[0], id);
+        assert_eq!(split[1], comment);
+        assert_eq!(split[2], setup);
+    }
+
+    #[test]
+    fn test_split_vorbis_headers_xiph_laced_multi_byte_length() {
+        // A 300-byte comment header forces the Xiph-lacing continuation
+        // byte (0xFF) to actually be exercised, not just a single length
+        // byte (300 = 255 + 45, encoded as [0xFF, 45]).
+        let id = synthetic_id_header();
+        let comment = synthetic_comment_header(300 - 7); // total packet len 300
+        assert_eq!(comment.len(), 300);
+        let setup = synthetic_setup_header(10);
+        let packed = pack_vorbis_headers_xiph(&id, &comment, &setup);
+
+        let split = split_vorbis_headers(&packed).expect("multi-byte xiph-laced length must split");
+        assert_eq!(split[1], comment);
+        assert_eq!(split[2], setup);
+    }
+
+    #[test]
+    fn test_split_vorbis_headers_length_prefixed_round_trip() {
+        let id = synthetic_id_header();
+        let comment = synthetic_comment_header(12);
+        let setup = synthetic_setup_header(64);
+        let packed = pack_vorbis_headers_length_prefixed(&id, &comment, &setup);
+
+        let split =
+            split_vorbis_headers(&packed).expect("valid length-prefixed framing must split");
+        assert_eq!(split[0], id);
+        assert_eq!(split[1], comment);
+        assert_eq!(split[2], setup);
+    }
+
+    #[test]
+    fn test_extract_vorbis_setup_matches_split_for_both_framings() {
+        let id = synthetic_id_header();
+        let comment = synthetic_comment_header(5);
+        let setup = synthetic_setup_header(30);
+
+        let xiph_packed = pack_vorbis_headers_xiph(&id, &comment, &setup);
+        assert_eq!(extract_vorbis_setup(&xiph_packed), Some(setup.clone()));
+
+        let length_prefixed_packed = pack_vorbis_headers_length_prefixed(&id, &comment, &setup);
+        assert_eq!(extract_vorbis_setup(&length_prefixed_packed), Some(setup));
+    }
+
+    #[test]
+    fn test_extract_vorbis_setup_empty_extradata() {
+        assert_eq!(extract_vorbis_setup(&[]), None);
+    }
+
+    #[test]
+    fn test_extract_vorbis_setup_rejects_wrong_packet_count() {
+        // packet_count - 1 must read back as 2 for Vorbis's fixed three
+        // headers; a value of 1 (claiming only two packets) must not parse.
+        let mut bogus = vec![1u8];
+        bogus.extend(xiph_lace_len(5));
+        bogus.extend_from_slice(&synthetic_id_header());
+        assert_eq!(split_vorbis_headers_xiph_laced(&bogus), None);
+        assert_eq!(extract_vorbis_setup(&bogus), None);
+    }
+
+    #[test]
+    fn test_extract_vorbis_setup_rejects_truncated_length_prefix() {
+        // A Xiph-laced length whose continuation run never terminates
+        // (runs off the end of the buffer) must not panic and must parse
+        // to `None`.
+        let truncated = vec![2u8, 0xFF, 0xFF, 0xFF];
+        assert_eq!(split_vorbis_headers_xiph_laced(&truncated), None);
+        assert_eq!(extract_vorbis_setup(&truncated), None);
+    }
+
+    #[test]
+    fn test_extract_vorbis_setup_rejects_lengths_overrunning_buffer() {
+        // Declares an id-header length (200) far larger than the actual
+        // remaining payload — must not panic on out-of-bounds slicing.
+        let mut bogus = vec![2u8, 200, 5];
+        bogus.extend_from_slice(&[0u8; 10]);
+        assert_eq!(split_vorbis_headers_xiph_laced(&bogus), None);
+        assert_eq!(extract_vorbis_setup(&bogus), None);
+    }
+
+    #[test]
+    fn test_extract_vorbis_setup_rejects_bad_magic() {
+        // Byte-correct lengths, but the "setup" packet doesn't actually
+        // start with the vorbis magic — must be rejected, not returned as
+        // if it were a real setup header.
+        let id = synthetic_id_header();
+        let comment = synthetic_comment_header(4);
+        let mut corrupt_setup = synthetic_setup_header(10);
+        corrupt_setup[1] = b'X'; // corrupt the "vorbis" magic
+        let packed = pack_vorbis_headers_xiph(&id, &comment, &corrupt_setup);
+        assert_eq!(extract_vorbis_setup(&packed), None);
+    }
+
+    #[test]
+    fn test_extract_vorbis_setup_rejects_length_prefixed_trailing_garbage() {
+        let id = synthetic_id_header();
+        let comment = synthetic_comment_header(5);
+        let setup = synthetic_setup_header(5);
+        let mut packed = pack_vorbis_headers_length_prefixed(&id, &comment, &setup);
+        packed.push(0xFF); // trailing byte that belongs to no packet
+        assert_eq!(split_vorbis_headers_length_prefixed(&packed), None);
+    }
+
+    #[tokio::test]
+    async fn test_muxer_writes_vorbis_setup_page_from_packed_extradata() {
+        let id = synthetic_id_header();
+        let comment = synthetic_comment_header(4);
+        let setup = synthetic_setup_header(50);
+        let extradata = pack_vorbis_headers_xiph(&id, &comment, &setup);
+
+        let sink = MemorySource::new_writable(8192);
+        let config = MuxerConfig::new();
+        let mut muxer = OggMuxer::new(sink, config);
+
+        let vorbis = create_vorbis_stream(extradata);
+        muxer.add_stream(vorbis).expect("operation should succeed");
+        muxer
+            .write_header()
+            .await
+            .expect("operation should succeed");
+
+        let written = muxer.sink().written_data();
+        let found = written
+            .windows(setup.len())
+            .any(|window| window == setup.as_slice());
+        assert!(
+            found,
+            "the exact setup header bytes must appear in the written Ogg header pages"
+        );
     }
 
     #[test]

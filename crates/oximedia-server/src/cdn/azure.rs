@@ -1,26 +1,30 @@
 //! Azure Blob Storage CDN upload endpoint.
 //!
-//! Azure block-blob uploads use a stage-blocks-then-commit pattern.
-//! Each block is 5 MiB; block IDs are base64-encoded sequential integers.
-//! The full commit list is sent once all blocks are staged.
-//!
 //! Uploads are proxied through the `oximedia-storage`
 //! [`AzureStorage`](oximedia_storage::azure::AzureStorage) backend, which
 //! implements the full [`CloudStorage`](oximedia_storage::CloudStorage) trait
-//! (block-blob staging, deletes, prefix listing).
+//! and owns the block-blob staging/commit wire protocol (Put Block / Put Block
+//! List) as well as Shared Key authentication.
+//!
+//! ## Feature gating — no silent no-ops
 //!
 //! The real network backend is enabled by the `cdn-azure` Cargo feature, which
-//! transitively turns on `oximedia-storage/azure`.  When the feature is
-//! disabled the uploader keeps a pure-Rust, log-only fallback that synthesises
-//! object URLs without performing any network I/O.
+//! transitively turns on `oximedia-storage/azure`.  **When the feature is
+//! disabled every remote operation returns [`CdnError::FeatureDisabled`]**
+//! naming the missing feature; nothing is uploaded, deleted or listed, and no
+//! blob URL is synthesised for a blob that was never uploaded.
+//!
+//! [`AzureCdnUploader::object_url`] still computes the URL a blob *would* have,
+//! but it is an explicit, side-effect-free address calculation.
 
 use crate::cdn::s3::CdnError;
 use crate::cdn::CdnConfig;
 use crate::error::ServerResult;
-use bytes::Bytes;
 use std::path::Path;
 use tracing::info;
 
+#[cfg(feature = "cdn-azure")]
+use bytes::Bytes;
 #[cfg(feature = "cdn-azure")]
 use oximedia_storage::{
     azure::AzureStorage, CloudStorage, ListOptions, UnifiedConfig, UploadOptions,
@@ -28,19 +32,16 @@ use oximedia_storage::{
 #[cfg(feature = "cdn-azure")]
 use std::sync::Arc;
 
-/// Azure block-blob chunk size used by the log-only fallback for observability
-/// logging (≤ 100 MiB per Azure spec; we use 5 MiB).  The real backend manages
-/// its own block size internally, so this constant is only needed when the
-/// `cdn-azure` feature is off.
-#[cfg(not(feature = "cdn-azure"))]
-const BLOCK_SIZE: usize = 5 * 1024 * 1024; // 5 MiB
+/// Name of the Cargo feature that enables the real Azure backend.
+pub const AZURE_FEATURE: &str = "cdn-azure";
 
 /// Azure Blob Storage CDN uploader.
 ///
 /// Implements the same interface as [`super::s3::S3CdnUploader`].  Under the
 /// `cdn-azure` feature every operation performs real network I/O through
-/// `AzureStorage` (`oximedia_storage::azure::AzureStorage`, requires the `azure` feature on `oximedia-storage`); otherwise the
-/// uploader falls back to a pure-Rust log-only path.
+/// `AzureStorage` (`oximedia_storage::azure::AzureStorage`, requires the
+/// `azure` feature on `oximedia-storage`); without it every operation fails
+/// with [`CdnError::FeatureDisabled`].
 pub struct AzureCdnUploader {
     /// Azure storage account name.
     account: String,
@@ -51,9 +52,13 @@ pub struct AzureCdnUploader {
     /// Base path within the container.
     base_path: String,
 
+    /// Public delivery domain, used in place of the raw blob endpoint when
+    /// [`CdnConfig::enable_cdn`] is set and a domain is configured.
+    cdn_domain: Option<String>,
+
     /// Real Azure backend (present only when the `cdn-azure` feature is enabled).
     #[cfg(feature = "cdn-azure")]
-    backend: Option<Arc<AzureStorage>>,
+    backend: Arc<AzureStorage>,
 }
 
 impl AzureCdnUploader {
@@ -62,9 +67,8 @@ impl AzureCdnUploader {
     /// For Azure, `config.bucket` is the container name, `config.region` is the
     /// storage account name, and `config.secret_key` is the account access key.
     ///
-    /// Under the `cdn-azure` feature this constructs a real
-    /// `AzureStorage` (`oximedia_storage::azure::AzureStorage`, requires the `azure` feature on `oximedia-storage`) client; the
-    /// account key is required for that path.
+    /// Under the `cdn-azure` feature this constructs a real `AzureStorage`
+    /// client; the account key is required for that path.
     ///
     /// # Errors
     ///
@@ -79,6 +83,7 @@ impl AzureCdnUploader {
         info!(
             account = %account,
             container = %config.bucket,
+            live = cfg!(feature = "cdn-azure"),
             "AzureCdnUploader: initialising"
         );
 
@@ -89,30 +94,33 @@ impl AzureCdnUploader {
             let storage = AzureStorage::new(unified)
                 .await
                 .map_err(|e| CdnError::Storage(e.to_string()))?;
-            Some(Arc::new(storage))
+            Arc::new(storage)
         };
 
         Ok(Self {
             account,
             container: config.bucket.clone(),
             base_path: config.base_path.clone(),
+            cdn_domain: if config.enable_cdn {
+                config.cdn_domain.clone().filter(|d| !d.is_empty())
+            } else {
+                None
+            },
             #[cfg(feature = "cdn-azure")]
             backend,
         })
     }
 
-    /// Build the blob URL for a key.
-    fn url(&self, key: &str) -> String {
-        format!(
-            "https://{}.blob.core.windows.net/{}/{}/{}",
-            self.account, self.container, self.base_path, key
-        )
+    /// Whether this uploader is backed by a real Azure client.
+    ///
+    /// `false` on builds without the `cdn-azure` feature; every remote
+    /// operation then returns [`CdnError::FeatureDisabled`].
+    #[must_use]
+    pub const fn is_live(&self) -> bool {
+        cfg!(feature = "cdn-azure")
     }
 
     /// Prefix `key` with the configured base path to form the full blob name.
-    ///
-    /// Only used by the real `cdn-azure` backend path.
-    #[cfg(feature = "cdn-azure")]
     fn object_key(&self, key: &str) -> String {
         if self.base_path.is_empty() {
             key.to_string()
@@ -121,64 +129,29 @@ impl AzureCdnUploader {
         }
     }
 
-    /// Base64-encode an integer block ID (zero-padded to 8 chars for uniform length).
+    /// Computes the public URL a blob with `key` would have.
     ///
-    /// Used only by the log-only fallback; the real backend generates its own
-    /// block IDs.
-    #[cfg(not(feature = "cdn-azure"))]
-    fn block_id(idx: usize) -> String {
-        use std::io::Write as _;
-        let raw = format!("{idx:08}");
-        let mut encoded = String::new();
-        let b64 = {
-            let mut buf = Vec::new();
-            write!(buf, "{raw}").ok();
-            // Simple base64 without an external crate: encode each byte triplet
-            let input = raw.as_bytes();
-            let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            for chunk in input.chunks(3) {
-                let b0 = chunk[0] as usize;
-                let b1 = if chunk.len() > 1 {
-                    chunk[1] as usize
-                } else {
-                    0
-                };
-                let b2 = if chunk.len() > 2 {
-                    chunk[2] as usize
-                } else {
-                    0
-                };
-                let idx0 = b0 >> 2;
-                let idx1 = ((b0 & 0x03) << 4) | (b1 >> 4);
-                let idx2 = ((b1 & 0x0f) << 2) | (b2 >> 6);
-                let idx3 = b2 & 0x3f;
-                encoded.push(table[idx0] as char);
-                encoded.push(table[idx1] as char);
-                if chunk.len() > 1 {
-                    encoded.push(table[idx2] as char);
-                } else {
-                    encoded.push('=');
-                }
-                if chunk.len() > 2 {
-                    encoded.push(table[idx3] as char);
-                } else {
-                    encoded.push('=');
-                }
-            }
-            buf
-        };
-        let _ = b64;
-        encoded
+    /// Pure address calculation: performs no I/O and makes no claim that the
+    /// blob exists.
+    #[must_use]
+    pub fn object_url(&self, key: &str) -> String {
+        let path = self.object_key(key);
+        match &self.cdn_domain {
+            Some(domain) => format!("https://{}/{}", domain.trim_end_matches('/'), path),
+            None => format!(
+                "https://{}.blob.core.windows.net/{}/{}",
+                self.account, self.container, path
+            ),
+        }
     }
 
     /// Upload a local file to Azure Blob Storage.
     ///
-    /// For files > 5 MiB, block-blob staging is used (stage + commit).
-    ///
     /// # Errors
     ///
-    /// Returns [`CdnError::InvalidKey`] for an empty key, [`CdnError::Io`] if
-    /// the file cannot be read, or [`CdnError::Storage`] if the upload fails.
+    /// Returns [`CdnError::InvalidKey`] for an empty key, [`CdnError::Storage`]
+    /// if the upload fails, or [`CdnError::FeatureDisabled`] on builds without
+    /// the `cdn-azure` feature.
     pub async fn upload(
         &self,
         local_path: &Path,
@@ -189,9 +162,9 @@ impl AzureCdnUploader {
         }
 
         #[cfg(feature = "cdn-azure")]
-        if let Some(backend) = &self.backend {
+        {
             let object_key = self.object_key(key);
-            backend
+            self.backend
                 .upload_file(&object_key, local_path, UploadOptions::default())
                 .await
                 .map_err(|e| CdnError::Storage(e.to_string()))?;
@@ -202,22 +175,26 @@ impl AzureCdnUploader {
                 path = %local_path.display(),
                 "AzureCdnUploader: file upload complete"
             );
-            return Ok(self.url(key));
+            Ok(self.object_url(key))
         }
 
-        let data = tokio::fs::read(local_path).await?;
-        self.upload_bytes(&data, key).await
+        // No feature: fail before touching the file.
+        #[cfg(not(feature = "cdn-azure"))]
+        {
+            let _ = local_path;
+            Err(CdnError::FeatureDisabled {
+                operation: "Azure CDN file upload",
+                feature: AZURE_FEATURE,
+            })
+        }
     }
 
     /// Upload raw bytes to Azure Blob Storage.
     ///
-    /// Under the `cdn-azure` feature the bytes are streamed to the
-    /// `AzureStorage` (`oximedia_storage::azure::AzureStorage`, requires the `azure` feature on `oximedia-storage`) backend, which
-    /// performs block-blob staging and commit.
-    ///
     /// # Errors
     ///
-    /// Returns [`CdnError::InvalidKey`] or [`CdnError::Storage`].
+    /// Returns [`CdnError::InvalidKey`], [`CdnError::Storage`], or
+    /// [`CdnError::FeatureDisabled`].
     pub async fn upload_bytes(
         &self,
         data: &[u8],
@@ -228,12 +205,15 @@ impl AzureCdnUploader {
         }
 
         #[cfg(feature = "cdn-azure")]
-        if let Some(backend) = &self.backend {
+        {
             let object_key = self.object_key(key);
             let size = data.len() as u64;
             let bytes = Bytes::copy_from_slice(data);
-            let stream = futures::stream::once(async move { Ok(bytes) });
-            backend
+            let stream =
+                futures::stream::once(
+                    async move { Ok::<Bytes, oximedia_storage::StorageError>(bytes) },
+                );
+            self.backend
                 .upload_stream(
                     &object_key,
                     Box::pin(stream),
@@ -249,78 +229,72 @@ impl AzureCdnUploader {
                 bytes = data.len(),
                 "AzureCdnUploader: byte upload complete"
             );
-            return Ok(self.url(key));
+            Ok(self.object_url(key))
         }
 
-        // Pure-Rust log-only fallback (no `cdn-azure` feature).
         #[cfg(not(feature = "cdn-azure"))]
         {
-            if data.len() > BLOCK_SIZE {
-                let mut block_ids: Vec<String> = Vec::new();
-                for (i, chunk) in data.chunks(BLOCK_SIZE).enumerate() {
-                    let block_id = Self::block_id(i);
-                    info!(
-                        account = %self.account,
-                        container = %self.container,
-                        key = %key,
-                        block_id = %block_id,
-                        block_bytes = chunk.len(),
-                        "AzureCdnUploader: Put Block"
-                    );
-                    block_ids.push(block_id);
-                }
-                info!(
-                    account = %self.account,
-                    container = %self.container,
-                    key = %key,
-                    block_count = block_ids.len(),
-                    "AzureCdnUploader: Put Block List / commit"
-                );
-            } else {
-                info!(
-                    account = %self.account,
-                    container = %self.container,
-                    key = %key,
-                    bytes = data.len(),
-                    "AzureCdnUploader: Put Block Blob"
-                );
-            }
+            let _ = data;
+            Err(CdnError::FeatureDisabled {
+                operation: "Azure CDN upload",
+                feature: AZURE_FEATURE,
+            })
         }
-
-        Ok(self.url(key))
     }
 
     /// Generates a SAS URL for a blob.
     ///
+    /// Delegates to the storage backend's real Shared Access Signature
+    /// implementation.
+    ///
     /// # Errors
     ///
-    /// Returns an error if URL generation fails.
+    /// Returns [`CdnError::InvalidKey`], [`CdnError::Storage`] if signing
+    /// fails, or [`CdnError::FeatureDisabled`] on builds without the
+    /// `cdn-azure` feature (an unsigned URL would not be a SAS URL).
     pub async fn sas_url(
         &self,
         key: &str,
-        _expires_in_secs: u64,
+        expires_in_secs: u64,
     ) -> std::result::Result<String, CdnError> {
         if key.is_empty() {
             return Err(CdnError::InvalidKey("Key must not be empty".to_string()));
         }
-        Ok(self.url(key))
+
+        #[cfg(feature = "cdn-azure")]
+        {
+            let object_key = self.object_key(key);
+            self.backend
+                .generate_presigned_url(&object_key, expires_in_secs)
+                .await
+                .map_err(|e| CdnError::Storage(e.to_string()))
+        }
+
+        #[cfg(not(feature = "cdn-azure"))]
+        {
+            let _ = expires_in_secs;
+            Err(CdnError::FeatureDisabled {
+                operation: "Azure SAS URL generation",
+                feature: AZURE_FEATURE,
+            })
+        }
     }
 
     /// Deletes a blob.
     ///
     /// # Errors
     ///
-    /// Returns [`CdnError::InvalidKey`] for an empty key or
-    /// [`CdnError::Storage`] if the delete request fails.
+    /// Returns [`CdnError::InvalidKey`], [`CdnError::Storage`], or
+    /// [`CdnError::FeatureDisabled`].
     pub async fn delete(&self, key: &str) -> std::result::Result<(), CdnError> {
         if key.is_empty() {
             return Err(CdnError::InvalidKey("Key must not be empty".to_string()));
         }
 
         #[cfg(feature = "cdn-azure")]
-        if let Some(backend) = &self.backend {
+        {
             let object_key = self.object_key(key);
-            backend
+            self.backend
                 .delete_object(&object_key)
                 .await
                 .map_err(|e| CdnError::Storage(e.to_string()))?;
@@ -330,11 +304,16 @@ impl AzureCdnUploader {
                 key = %object_key,
                 "AzureCdnUploader: delete complete"
             );
-            return Ok(());
+            Ok(())
         }
 
-        info!(account = %self.account, container = %self.container, key = %key, "AzureCdnUploader: delete");
-        Ok(())
+        #[cfg(not(feature = "cdn-azure"))]
+        {
+            Err(CdnError::FeatureDisabled {
+                operation: "Azure CDN delete",
+                feature: AZURE_FEATURE,
+            })
+        }
     }
 
     /// Lists blobs with a prefix.
@@ -343,12 +322,15 @@ impl AzureCdnUploader {
     ///
     /// # Errors
     ///
-    /// Returns [`CdnError::Storage`] if the listing request fails.
+    /// Returns [`CdnError::Storage`] if the listing request fails, or
+    /// [`CdnError::FeatureDisabled`] on builds without the `cdn-azure` feature
+    /// (an empty list would falsely claim the container holds no such blobs).
     pub async fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, CdnError> {
         #[cfg(feature = "cdn-azure")]
-        if let Some(backend) = &self.backend {
+        {
             let full_prefix = self.object_key(prefix);
-            let result = backend
+            let result = self
+                .backend
                 .list_objects(ListOptions {
                     prefix: Some(full_prefix),
                     ..ListOptions::default()
@@ -363,90 +345,78 @@ impl AzureCdnUploader {
                 count = keys.len(),
                 "AzureCdnUploader: list complete"
             );
-            return Ok(keys);
+            Ok(keys)
         }
 
-        info!(account = %self.account, container = %self.container, prefix = %prefix, "AzureCdnUploader: list");
-        Ok(Vec::new())
+        #[cfg(not(feature = "cdn-azure"))]
+        {
+            let _ = prefix;
+            Err(CdnError::FeatureDisabled {
+                operation: "Azure CDN listing",
+                feature: AZURE_FEATURE,
+            })
+        }
     }
 }
 
-// ── Legacy wrapper kept for backwards compatibility with CdnUploader ─────────
+#[cfg(all(test, not(feature = "cdn-azure")))]
+mod tests {
+    use super::*;
+    use crate::cdn::CdnBackend;
 
-/// Low-level Azure uploader used by the live-ingest `CdnUploader`.
-#[allow(dead_code)]
-pub struct AzureUploader {
-    /// Container name.
-    container: String,
+    fn azure_config() -> CdnConfig {
+        CdnConfig {
+            backend: CdnBackend::Azure,
+            bucket: "mycontainer".to_string(),
+            region: "myaccount".to_string(),
+            access_key: String::new(),
+            secret_key: "YWNjb3VudGtleQ==".to_string(),
+            base_path: "assets".to_string(),
+            public: true,
+            enable_cdn: false,
+            cdn_domain: None,
+            project_id: None,
+        }
+    }
 
-    /// Base path.
-    base_path: String,
-}
-
-impl AzureUploader {
-    /// Creates a new Azure uploader.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if initialization fails.
-    pub async fn new(config: &CdnConfig) -> ServerResult<Self> {
-        info!(
-            "Initializing Azure uploader for container: {}",
-            config.bucket
+    #[cfg(not(feature = "cdn-azure"))]
+    #[tokio::test]
+    async fn object_url_uses_blob_endpoint() {
+        let uploader = AzureCdnUploader::new(&azure_config()).await.expect("init");
+        assert_eq!(
+            uploader.object_url("blobs/a.mp4"),
+            "https://myaccount.blob.core.windows.net/mycontainer/assets/blobs/a.mp4"
         );
-        Ok(Self {
-            container: config.bucket.clone(),
-            base_path: config.base_path.clone(),
-        })
+        assert!(!uploader.is_live());
     }
 
-    /// Uploads data to Azure Blob Storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if upload fails.
-    pub async fn upload(&self, key: &str, data: Bytes) -> ServerResult<()> {
-        info!(
-            "Uploading to Azure: {}/{} ({} bytes)",
-            self.container,
-            key,
-            data.len()
+    #[cfg(not(feature = "cdn-azure"))]
+    #[tokio::test]
+    async fn upload_bytes_is_honest_error_without_feature() {
+        let uploader = AzureCdnUploader::new(&azure_config()).await.expect("init");
+        let err = uploader
+            .upload_bytes(b"blob", "blobs/small.mp4")
+            .await
+            .expect_err("must not claim success without cdn-azure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cdn-azure"),
+            "error must name the feature: {msg}"
         );
-        Ok(())
+        assert!(
+            !msg.contains("blob.core.windows.net"),
+            "error must not hand back a blob URL: {msg}"
+        );
     }
 
-    /// Generates a SAS URL for a blob.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if URL generation fails.
-    #[allow(dead_code)]
-    pub async fn sas_url(&self, key: &str, _expires_in: u64) -> ServerResult<String> {
-        Ok(format!(
-            "https://{}.blob.core.windows.net/{}/{}",
-            "account", self.container, key
-        ))
-    }
-
-    /// Deletes a blob.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if deletion fails.
-    #[allow(dead_code)]
-    pub async fn delete(&self, key: &str) -> ServerResult<()> {
-        info!("Deleting from Azure: {}/{}", self.container, key);
-        Ok(())
-    }
-
-    /// Lists blobs with a prefix.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if listing fails.
-    #[allow(dead_code)]
-    pub async fn list(&self, prefix: &str) -> ServerResult<Vec<String>> {
-        info!("Listing Azure blobs with prefix: {}", prefix);
-        Ok(Vec::new())
+    #[cfg(not(feature = "cdn-azure"))]
+    #[tokio::test]
+    async fn sas_url_is_honest_error_without_feature() {
+        let uploader = AzureCdnUploader::new(&azure_config()).await.expect("init");
+        let err = uploader
+            .sas_url("blobs/a.mp4", 3600)
+            .await
+            .expect_err("unsigned URL is not a SAS URL");
+        assert!(err.to_string().contains("cdn-azure"));
     }
 }

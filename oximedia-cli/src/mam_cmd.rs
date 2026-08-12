@@ -39,10 +39,21 @@ pub enum MamCommand {
         #[arg(long)]
         recursive: bool,
 
-        /// Generate proxy files for previews (not implemented yet: warns and
-        /// proceeds; use `oximedia proxy generate` instead)
+        /// Generate a real proxy file for each ingested asset via
+        /// `oximedia_proxy::ProxyGenerator`, the same real generator behind
+        /// `oximedia proxy generate`. Only decodable input classes have a
+        /// real encode target today: Y4M (raw video -> MJPEG-in-Matroska)
+        /// and WAV (raw PCM audio -> FLAC). Any other format produces a
+        /// visible per-file warning and the asset is still cataloged, just
+        /// without a proxy -- never a silently-skipped or fabricated one.
         #[arg(long)]
         generate_proxy: bool,
+
+        /// Output directory for generated proxies (only used with
+        /// `--generate-proxy`). Defaults to a `proxies/` directory next to
+        /// the catalog file.
+        #[arg(long)]
+        proxy_dir: Option<PathBuf>,
 
         /// Probe each file and store technical metadata (container format,
         /// codec, dimensions, duration) on the asset record
@@ -176,6 +187,11 @@ struct AssetRecord {
     ingested_at: String,
     checksum: String,
     metadata: HashMap<String, String>,
+    /// Path to a real generated proxy file (`--generate-proxy`), if one was
+    /// produced for this asset. `serde(default)` keeps catalogs written
+    /// before this field existed loadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_path: Option<String>,
 }
 
 /// A named collection of assets.
@@ -329,26 +345,17 @@ pub async fn handle_mam_command(command: MamCommand, json_output: bool) -> Resul
             collection,
             recursive,
             generate_proxy,
+            proxy_dir,
             extract_metadata,
         } => {
-            // No proxy-output policy (directory, codec, naming) exists on the
-            // ingest surface yet, so proxy generation cannot take real effect
-            // here; warn instead of silently dropping the request.
-            // TODO(0.2.x): wire `oximedia_proxy::ProxyGenerator` into ingest
-            // once a --proxy-dir/--proxy-codec surface is designed (the
-            // standalone `oximedia proxy generate` path is already real).
-            if generate_proxy {
-                eprintln!(
-                    "warning: --generate-proxy is not implemented for `mam ingest` yet and is \
-                     ignored; use `oximedia proxy generate` instead"
-                );
-            }
             run_ingest(
                 &input,
                 &catalog,
                 &tags,
                 &collection,
                 recursive,
+                generate_proxy,
+                proxy_dir.as_deref(),
                 extract_metadata,
                 json_output,
             )
@@ -479,6 +486,152 @@ fn extract_asset_metadata(path: &std::path::Path, record: &mut AssetRecord) -> R
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Proxy generation (real, for decodable input classes only)
+// ---------------------------------------------------------------------------
+//
+// `oximedia_proxy::ProxyGenerator` ultimately runs every input through
+// `oximedia_transcode`'s frame-level engine, whose real audio/video codec
+// dispatch (`frame_level::parse_audio_target`/`parse_video_target`) accepts
+// only a small set of codecs and containers -- see that module for the
+// authoritative list. Two consequences shape what follows:
+//
+// - `ProxyGenerationSettings`'s own `default()`/named presets all choose
+//   `aac`/`opus` as the audio codec, and `parse_audio_target` rejects both
+//   unconditionally (Opus is untrustworthy; AAC is patent-encumbered and not
+//   implemented) *before* the pipeline even inspects the input file. Reusing
+//   those presets here would make every ingest proxy request fail --
+//   settings below are built by hand with codecs the real dispatch accepts.
+// - `ProxyEncoder::encode` only forwards `codec`/`audio_codec`/
+//   `use_hw_accel` to the transcode pipeline; `scale_factor`/`bitrate`/
+//   `quality_preset` are not applied. This ingest surface therefore does
+//   not expose `--proxy-resolution`/`--proxy-quality` flags, which would
+//   otherwise silently do nothing.
+//
+// Only two input classes have a real, honest proxy target given the above:
+// Y4M (raw video, re-encoded to MJPEG in Matroska -- MJPEG has a real
+// encoder) and WAV (raw PCM audio, re-encoded to FLAC -- lossless, real,
+// and genuinely smaller than raw PCM). Every other format is refused with a
+// per-format message naming the detected magic bytes.
+
+/// The two input classes this ingest surface can genuinely proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyInputClass {
+    /// YUV4MPEG2 raw video (magic `"YUV4MPEG2"`).
+    Y4m,
+    /// RIFF/WAVE raw PCM audio (magic `"RIFF"`/`"RF64"`).
+    Wav,
+}
+
+/// Sniff the leading bytes of `path` to decide which (if any) real proxy
+/// path applies. Mirrors the magic-byte checks `decode_helper`/
+/// `frame_harness` already use elsewhere in this CLI, rather than trusting
+/// the file extension.
+fn sniff_proxy_input_class(path: &std::path::Path) -> Result<Option<ProxyInputClass>> {
+    use std::io::Read;
+
+    let mut buf = [0u8; 12];
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let n = file
+        .read(&mut buf)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let head = &buf[..n];
+
+    if head.starts_with(b"YUV4MPEG2") {
+        Ok(Some(ProxyInputClass::Y4m))
+    } else if head.starts_with(b"RIFF") || head.starts_with(b"RF64") {
+        Ok(Some(ProxyInputClass::Wav))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Real `ProxyGenerationSettings` for each supported input class, built by
+/// hand rather than via a preset (see the module note above for why).
+fn proxy_settings_for(class: ProxyInputClass) -> oximedia_proxy::ProxyGenerationSettings {
+    match class {
+        ProxyInputClass::Y4m => oximedia_proxy::ProxyGenerationSettings {
+            // Not applied by `ProxyEncoder::encode` (see module note); 1.0
+            // is the honest value since no scaling actually happens.
+            scale_factor: 1.0,
+            codec: "mjpeg".to_string(),
+            // Required to be > 0 by `ProxyGenerationSettings::validate`;
+            // not itself applied.
+            bitrate: 2_000_000,
+            // Y4M carries no audio track; "copy" keeps the pipeline from
+            // trying (and failing) to re-encode a stream that isn't there.
+            audio_codec: "copy".to_string(),
+            audio_bitrate: 0,
+            preserve_frame_rate: true,
+            preserve_timecode: true,
+            preserve_metadata: true,
+            container: "mkv".to_string(),
+            use_hw_accel: false,
+            threads: 0,
+            quality_preset: "medium".to_string(),
+        },
+        ProxyInputClass::Wav => oximedia_proxy::ProxyGenerationSettings {
+            scale_factor: 1.0,
+            // WAV carries no video track; "copy" is the video no-op.
+            codec: "copy".to_string(),
+            bitrate: 1,
+            audio_codec: "flac".to_string(),
+            audio_bitrate: 0,
+            preserve_frame_rate: true,
+            preserve_timecode: true,
+            preserve_metadata: true,
+            container: "flac".to_string(),
+            use_hw_accel: false,
+            threads: 0,
+            quality_preset: "lossless".to_string(),
+        },
+    }
+}
+
+/// Real proxy generation for one asset. Returns the proxy file path on
+/// success.
+///
+/// Delegates to `oximedia_proxy::ProxyGenerator` -- the same real generator
+/// `oximedia proxy generate` uses -- with settings hand-built for the
+/// sniffed input class (see the module note above). Errors propagate to the
+/// caller; no placeholder file is ever written.
+async fn generate_asset_proxy(
+    input_path: &std::path::Path,
+    proxy_dir: &std::path::Path,
+    class: ProxyInputClass,
+) -> Result<std::path::PathBuf> {
+    use oximedia_proxy::ProxyGenerator;
+
+    std::fs::create_dir_all(proxy_dir)
+        .with_context(|| format!("Failed to create proxy directory: {}", proxy_dir.display()))?;
+
+    let stem = input_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "asset".to_string());
+    let ext = match class {
+        ProxyInputClass::Y4m => "mkv",
+        ProxyInputClass::Wav => "flac",
+    };
+    let proxy_path = proxy_dir.join(format!("{stem}_proxy.{ext}"));
+
+    let settings = proxy_settings_for(class);
+    let generator = ProxyGenerator::new();
+    generator
+        .generate_with_settings(input_path, &proxy_path, settings)
+        .await
+        .with_context(|| {
+            format!(
+                "Proxy generation failed for {} -> {}",
+                input_path.display(),
+                proxy_path.display()
+            )
+        })?;
+
+    Ok(proxy_path)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_ingest(
     inputs: &[PathBuf],
@@ -486,12 +639,26 @@ async fn run_ingest(
     tags: &Option<String>,
     collection: &Option<String>,
     recursive: bool,
+    generate_proxy: bool,
+    proxy_dir: Option<&std::path::Path>,
     extract_metadata: bool,
     json_output: bool,
 ) -> Result<()> {
     let mut db = load_catalog(catalog)?;
     let tag_list = parse_tags(tags);
     let mut ingested: Vec<AssetRecord> = Vec::new();
+
+    // Default proxy output directory: `proxies/` next to the catalog file.
+    let resolved_proxy_dir: std::path::PathBuf = proxy_dir.map_or_else(
+        || {
+            catalog
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("proxies")
+        },
+        std::path::Path::to_path_buf,
+    );
 
     // Collect all files
     let mut files: Vec<PathBuf> = Vec::new();
@@ -545,12 +712,49 @@ async fn run_ingest(
             ingested_at: now_iso8601(),
             checksum,
             metadata: HashMap::new(),
+            proxy_path: None,
         };
 
         // --extract-metadata: probe the container for real and store what it
         // reports (codec, dimensions, duration, container format).
         if extract_metadata {
             extract_asset_metadata(file_path, &mut record)?;
+        }
+
+        // --generate-proxy: real proxy generation for decodable input
+        // classes (Y4M/WAV); a visible per-file warning for anything else,
+        // never a silent skip or a fabricated proxy path.
+        if generate_proxy {
+            match sniff_proxy_input_class(file_path)? {
+                Some(class) => {
+                    match generate_asset_proxy(file_path, &resolved_proxy_dir, class).await {
+                        Ok(proxy_path) => {
+                            if !json_output && !crate::progress::is_quiet() {
+                                println!(
+                                    "  {} {} -> {}",
+                                    "Proxy:".cyan(),
+                                    file_path.display(),
+                                    proxy_path.display()
+                                );
+                            }
+                            record.proxy_path = Some(proxy_path.to_string_lossy().to_string());
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: proxy generation failed for {}: {e:#}",
+                                file_path.display()
+                            );
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "warning: --generate-proxy has no real target for {} (only Y4M and \
+                         WAV input are supported today); cataloging without a proxy",
+                        file_path.display()
+                    );
+                }
+            }
         }
 
         ingested.push(record.clone());
@@ -581,11 +785,12 @@ async fn run_ingest(
                 "filename": a.filename,
                 "size_bytes": a.size_bytes,
                 "format": a.format,
+                "proxy_path": a.proxy_path,
             })).collect::<Vec<_>>(),
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "MAM Ingest".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Catalog:", catalog.display());
@@ -956,7 +1161,7 @@ async fn run_export(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "MAM Export".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Output:", output.display());
@@ -1035,7 +1240,7 @@ async fn run_tag(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "MAM Tag".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Modified assets:", modified_count);
@@ -1103,6 +1308,7 @@ mod tests {
                 ingested_at: "1234567890".to_string(),
                 checksum: "abcdef0123456789".to_string(),
                 metadata: HashMap::new(),
+                proxy_path: None,
             }],
             collections: vec![CollectionRecord {
                 name: "dailies".to_string(),
@@ -1188,6 +1394,7 @@ mod tests {
             ingested_at: ingested_at.to_string(),
             checksum: id.to_string(),
             metadata: HashMap::new(),
+            proxy_path: None,
         };
 
         let db = CatalogDb {
@@ -1277,6 +1484,7 @@ mod tests {
             ingested_at: now_iso8601(),
             checksum: "x".to_string(),
             metadata: HashMap::new(),
+            proxy_path: None,
         };
 
         extract_asset_metadata(&wav_path, &mut record).expect("probe must succeed");
@@ -1288,5 +1496,267 @@ mod tests {
         );
 
         std::fs::remove_file(&wav_path).ok();
+    }
+
+    // ── --generate-proxy: real proxy generation for Y4M/WAV ────────────────
+
+    /// Build a minimal single-frame 4:2:0 Y4M clip in memory.
+    fn make_test_y4m(width: u32, height: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("YUV4MPEG2 W{width} H{height} C420jpeg\n").as_bytes());
+        buf.extend_from_slice(b"FRAME\n");
+        buf.extend(std::iter::repeat_n(126u8, (width * height) as usize));
+        let chroma_w = width.div_ceil(2);
+        let chroma_h = height.div_ceil(2);
+        buf.extend(std::iter::repeat_n(
+            128u8,
+            (chroma_w * chroma_h) as usize * 2,
+        ));
+        buf
+    }
+
+    /// Build a minimal valid WAV file (real sine samples, not silence).
+    fn make_test_wav(sample_rate: u32, num_samples: u32) -> Vec<u8> {
+        let bits_per_sample: u16 = 16;
+        let byte_rate = sample_rate * u32::from(bits_per_sample / 8);
+        let data_size = num_samples * u32::from(bits_per_sample / 8);
+        let mut buf = Vec::with_capacity(44 + data_size as usize);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&(36 + data_size).to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        buf.extend_from_slice(&1u16.to_le_bytes()); // mono
+        buf.extend_from_slice(&sample_rate.to_le_bytes());
+        buf.extend_from_slice(&byte_rate.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&bits_per_sample.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_size.to_le_bytes());
+        for i in 0..num_samples {
+            let t = i as f32 / sample_rate as f32;
+            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            let pcm = (sample * 20000.0) as i16;
+            buf.extend_from_slice(&pcm.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn test_sniff_proxy_input_class_y4m() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_mam_sniff_test.y4m");
+        std::fs::write(&path, make_test_y4m(4, 4)).expect("write y4m");
+
+        assert_eq!(
+            sniff_proxy_input_class(&path).expect("sniff must succeed"),
+            Some(ProxyInputClass::Y4m)
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_sniff_proxy_input_class_wav() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_mam_sniff_test.wav");
+        std::fs::write(&path, make_test_wav(8000, 80)).expect("write wav");
+
+        assert_eq!(
+            sniff_proxy_input_class(&path).expect("sniff must succeed"),
+            Some(ProxyInputClass::Wav)
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_sniff_proxy_input_class_unrecognized_is_none() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_mam_sniff_test.bin");
+        std::fs::write(&path, b"not a known media magic").expect("write file");
+
+        assert_eq!(
+            sniff_proxy_input_class(&path).expect("sniff must succeed"),
+            None
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_run_ingest_generates_real_y4m_proxy() {
+        let dir = std::env::temp_dir().join("oximedia_mam_ingest_proxy_y4m");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let input = dir.join("clip.y4m");
+        std::fs::write(&input, make_test_y4m(16, 16)).expect("write y4m fixture");
+        let catalog = dir.join("catalog.json");
+        let proxy_dir = dir.join("proxies");
+
+        run_ingest(
+            std::slice::from_ref(&input),
+            &catalog,
+            &None,
+            &None,
+            false,
+            true,
+            Some(&proxy_dir),
+            false,
+            true,
+        )
+        .await
+        .expect("ingest with a real Y4M proxy target must succeed");
+
+        let db = load_catalog(&catalog).expect("load catalog");
+        assert_eq!(db.assets.len(), 1);
+        let proxy_path = db.assets[0]
+            .proxy_path
+            .as_ref()
+            .expect("Y4M input must produce a real proxy path");
+        let proxy_path = std::path::PathBuf::from(proxy_path);
+        assert!(
+            proxy_path.exists(),
+            "the proxy file itself must really exist on disk: {}",
+            proxy_path.display()
+        );
+        assert!(
+            std::fs::metadata(&proxy_path).expect("stat proxy").len() > 0,
+            "the proxy file must not be empty"
+        );
+        assert_eq!(proxy_path.extension().and_then(|e| e.to_str()), Some("mkv"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_run_ingest_generates_real_wav_proxy() {
+        let dir = std::env::temp_dir().join("oximedia_mam_ingest_proxy_wav");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let input = dir.join("clip.wav");
+        std::fs::write(&input, make_test_wav(44_100, 4410)).expect("write wav fixture");
+        let catalog = dir.join("catalog.json");
+        let proxy_dir = dir.join("proxies");
+
+        run_ingest(
+            std::slice::from_ref(&input),
+            &catalog,
+            &None,
+            &None,
+            false,
+            true,
+            Some(&proxy_dir),
+            false,
+            true,
+        )
+        .await
+        .expect("ingest with a real WAV proxy target must succeed");
+
+        let db = load_catalog(&catalog).expect("load catalog");
+        assert_eq!(db.assets.len(), 1);
+        let proxy_path = db.assets[0]
+            .proxy_path
+            .as_ref()
+            .expect("WAV input must produce a real proxy path");
+        let proxy_path = std::path::PathBuf::from(proxy_path);
+        assert!(
+            proxy_path.exists(),
+            "the proxy file itself must really exist on disk: {}",
+            proxy_path.display()
+        );
+        assert!(
+            std::fs::metadata(&proxy_path).expect("stat proxy").len() > 0,
+            "the proxy file must not be empty"
+        );
+        assert_eq!(
+            proxy_path.extension().and_then(|e| e.to_str()),
+            Some("flac")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_run_ingest_unsupported_format_warns_and_still_catalogs() {
+        let dir = std::env::temp_dir().join("oximedia_mam_ingest_proxy_unsupported");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let input = dir.join("clip.bin");
+        std::fs::write(&input, b"not a real media file at all").expect("write fixture");
+        let catalog = dir.join("catalog.json");
+        let proxy_dir = dir.join("proxies");
+
+        run_ingest(
+            std::slice::from_ref(&input),
+            &catalog,
+            &None,
+            &None,
+            false,
+            true,
+            Some(&proxy_dir),
+            false,
+            true,
+        )
+        .await
+        .expect("an unsupported proxy format must not fail the whole ingest");
+
+        let db = load_catalog(&catalog).expect("load catalog");
+        assert_eq!(
+            db.assets.len(),
+            1,
+            "the asset must still be cataloged even without a proxy"
+        );
+        assert!(
+            db.assets[0].proxy_path.is_none(),
+            "no proxy path may be fabricated for an unsupported format"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_run_ingest_default_proxy_dir_is_next_to_catalog() {
+        let dir = std::env::temp_dir().join("oximedia_mam_ingest_proxy_default_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let input = dir.join("clip.y4m");
+        std::fs::write(&input, make_test_y4m(8, 8)).expect("write y4m fixture");
+        let catalog = dir.join("catalog.json");
+
+        run_ingest(
+            std::slice::from_ref(&input),
+            &catalog,
+            &None,
+            &None,
+            false,
+            true,
+            None, // no --proxy-dir: must default to <catalog_parent>/proxies
+            false,
+            true,
+        )
+        .await
+        .expect("ingest must succeed");
+
+        let expected_dir = dir.join("proxies");
+        assert!(
+            expected_dir.is_dir(),
+            "default proxy dir must be created next to the catalog: {}",
+            expected_dir.display()
+        );
+
+        let db = load_catalog(&catalog).expect("load catalog");
+        let proxy_path = db.assets[0]
+            .proxy_path
+            .as_ref()
+            .expect("must have generated a proxy");
+        assert!(
+            std::path::PathBuf::from(proxy_path).starts_with(&expected_dir),
+            "proxy must land under the default proxies/ dir, got: {proxy_path}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

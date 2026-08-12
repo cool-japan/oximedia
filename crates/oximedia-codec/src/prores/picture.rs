@@ -24,7 +24,7 @@
 //!  └────────────────────────┘
 //! ```
 //!
-//! Each slice starts with a 6 (8 for 4444 + alpha) byte header:
+//! Each slice starts with an 8 (10 for 4444 + alpha) byte header:
 //!
 //! ```text
 //!  slice_header_size   : 4 bits (high nibble of byte 0)
@@ -54,7 +54,7 @@ pub struct PictureHeader {
 /// Parsed slice header.
 #[derive(Debug, Clone, Copy)]
 pub struct SliceHeader {
-    /// Header length in bytes (typically 6, or 8 for 4444 + alpha).
+    /// Header length in bytes (typically 8, or 10 for 4444 + alpha).
     pub header_size: u8,
     /// Quantization scale (1–224) applied to this slice's coefficients.
     pub quant_scale: u8,
@@ -122,7 +122,13 @@ pub fn parse_slice_header(
     payload: &[u8],
     has_alpha: bool,
 ) -> Result<(SliceHeader, &[u8]), FrameError> {
-    let min_size = if has_alpha { 8 } else { 6 };
+    // Fixed fields read below always span header_size(1) + quant_scale(1) +
+    // luma/cb/cr_data_size(2 each) = 8 bytes, plus alpha_data_size(2) when
+    // `has_alpha` -- 10 bytes. (A previous `6` / `8` version of this guard
+    // was two bytes short of the unconditional `payload[6]`/`payload[7]`
+    // reads below, so a 6- or 7-byte no-alpha slice would pass the guard
+    // and then index out of bounds.)
+    let min_size = if has_alpha { 10 } else { 8 };
     if payload.len() < min_size {
         return Err(FrameError::Truncated {
             context: "slice header",
@@ -132,24 +138,18 @@ pub fn parse_slice_header(
     }
     // High nibble of byte 0 is slice_header_size (in bytes / 1).
     let header_size = payload[0] >> 4;
-    // ProRes quant_scale is 1..=224. An out-of-range value no longer crashes
-    // the dequantiser (it now computes in i64 and saturates to i32), so the
-    // strict range check is deferred to avoid rejecting streams whose exact
-    // valid range is unverified.
-    // TODO(0.2.x): enforce quant_scale in 1..=224 once a FrameError string
-    // variant exists and the valid encoder range is confirmed.
+    // ProRes quant_scale is 1..=224 (RDD 36 §6.5.3). An out-of-range value
+    // no longer crashes the dequantiser (it now computes in i64 and
+    // saturates to i32), but it is still bitstream corruption: reject it
+    // honestly rather than silently dequantizing with a meaningless scale.
     let quant_scale = payload[1];
+    if quant_scale == 0 || quant_scale > 224 {
+        return Err(FrameError::BadQuantScale(quant_scale));
+    }
     let luma_data_size = u16::from_be_bytes([payload[2], payload[3]]);
     let cb_data_size = u16::from_be_bytes([payload[4], payload[5]]);
     let cr_data_size = u16::from_be_bytes([payload[6], payload[7]]);
     let (alpha_data_size, hdr_bytes) = if has_alpha {
-        if payload.len() < 10 {
-            return Err(FrameError::Truncated {
-                context: "slice header alpha size",
-                needed: 10,
-                available: payload.len(),
-            });
-        }
         (Some(u16::from_be_bytes([payload[8], payload[9]])), 10usize)
     } else {
         (None, 8usize)
@@ -241,6 +241,72 @@ mod tests {
     #[test]
     fn slice_header_truncated_errors() {
         assert!(parse_slice_header(&[0u8; 4], false).is_err());
+    }
+
+    /// Regression: `parse_slice_header` unconditionally reads `payload[6]`
+    /// and `payload[7]` (`cr_data_size`) even without alpha, so the
+    /// truncation guard must require 8 bytes minimum, not 6 -- a 6- or
+    /// 7-byte no-alpha slice must return `Truncated`, never index out of
+    /// bounds. Reachable from a malformed slice-size table entry in
+    /// `decoder.rs::decode_picture`.
+    #[test]
+    fn slice_header_six_or_seven_bytes_no_alpha_errors_not_panics() {
+        for len in [6usize, 7] {
+            let buf = vec![0x80u8, 1, 0, 0, 0, 0, 0, 0];
+            let err = parse_slice_header(&buf[..len], false).unwrap_err();
+            assert!(
+                matches!(err, FrameError::Truncated { .. }),
+                "{len}-byte no-alpha slice header must be Truncated, got {err:?}"
+            );
+        }
+    }
+
+    /// Same regression for the alpha path: `payload[8]`/`payload[9]`
+    /// (`alpha_data_size`) require 10 bytes minimum, not 8.
+    #[test]
+    fn slice_header_eight_or_nine_bytes_with_alpha_errors_not_panics() {
+        for len in [8usize, 9] {
+            let buf = vec![0xA0u8, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+            let err = parse_slice_header(&buf[..len], true).unwrap_err();
+            assert!(
+                matches!(err, FrameError::Truncated { .. }),
+                "{len}-byte alpha slice header must be Truncated, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slice_header_rejects_quant_scale_zero() {
+        let buf = slice_header_bytes(0, 200, 100, 100, None);
+        let err = parse_slice_header(&buf, false).unwrap_err();
+        assert!(
+            matches!(err, FrameError::BadQuantScale(0)),
+            "quant_scale=0 must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn slice_header_accepts_quant_scale_one() {
+        let buf = slice_header_bytes(1, 200, 100, 100, None);
+        let (s, _) = parse_slice_header(&buf, false).expect("quant_scale=1 is the lower bound");
+        assert_eq!(s.quant_scale, 1);
+    }
+
+    #[test]
+    fn slice_header_accepts_quant_scale_224() {
+        let buf = slice_header_bytes(224, 200, 100, 100, None);
+        let (s, _) = parse_slice_header(&buf, false).expect("quant_scale=224 is the upper bound");
+        assert_eq!(s.quant_scale, 224);
+    }
+
+    #[test]
+    fn slice_header_rejects_quant_scale_225() {
+        let buf = slice_header_bytes(225, 200, 100, 100, None);
+        let err = parse_slice_header(&buf, false).unwrap_err();
+        assert!(
+            matches!(err, FrameError::BadQuantScale(225)),
+            "quant_scale=225 must be rejected, got {err:?}"
+        );
     }
 
     #[test]

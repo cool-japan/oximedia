@@ -1,6 +1,7 @@
 //! Transcoding engine for real-time stream processing.
 
 use crate::error::{ServerError, ServerResult};
+use crate::ingest_depacketizer::{sniff_ingest_codec, IngestCodec};
 use crate::transcode::AbrLadder;
 use oximedia_net::rtmp::MediaPacket;
 use parking_lot::RwLock;
@@ -175,24 +176,51 @@ impl TranscodeEngine {
     ///
     /// # Errors
     ///
-    /// Real-time transcoding on ingest requires a persistent, per-stream
-    /// decode -> scale -> encode graph that carries codec state across
-    /// packets (keyed by stream, one encoder per ABR rung). That graph is
-    /// not yet wired here, so — rather than silently returning `Ok(())` and
-    /// fabricating a "transcode happened" — this returns an honest error.
-    /// The ingest caller is expected to degrade to stream-copy (pass-through)
-    /// when it sees this error, so no transcode is ever falsely claimed.
-    // TODO(0.2.x): implement a real per-stream transcode pipeline — resolve
-    // the `TranscodeJob` for the packet's stream, feed the packet into a live
+    /// Always returns an error: no real-time ingest transcode exists for any
+    /// codec OxiMedia accepts, and the reason differs per codec, so the
+    /// packet's codec is resolved first and named in the message. The ingest
+    /// caller is expected to degrade to stream-copy (pass-through), so no
+    /// transcode is ever falsely claimed.
+    ///
+    /// The per-codec blockers, as verified against the actual codec
+    /// implementations:
+    ///
+    /// * **AV1 / VP9** — decode is keyframe-only (no inter-frame decode) and
+    ///   the encoders do not produce valid bitstreams, so neither half of a
+    ///   decode → encode graph exists.
+    /// * **Opus** — neither the encoder nor the decoder is trustworthy, so a
+    ///   re-encode would silently corrupt the audio.
+    /// * **FLAC** — decode is real, but there is no ABR ladder for lossless
+    ///   audio; re-encoding it gains nothing and is not wired.
+    // TODO(0.2.x): once inter-frame decode and a real encoder exist for a
+    // patent-free codec, implement the per-stream pipeline here — resolve the
+    // `TranscodeJob` for the packet's stream, feed the packet into a live
     // decode -> ABR-scale -> encode graph (reuse oximedia-transcode), and emit
-    // the encoded output on each quality level's `output_rxs` channel. Until
-    // then this path is honestly unimplemented.
-    pub async fn process_packet(&self, _packet: &MediaPacket) -> ServerResult<()> {
-        Err(ServerError::TranscodingFailed(
-            "real-time ingest transcoding is not implemented; caller must \
-             stream-copy (pass-through) this packet"
+    // the encoded output on each quality level's `output_rxs` channel.
+    pub async fn process_packet(&self, packet: &MediaPacket) -> ServerResult<()> {
+        let reason = match sniff_ingest_codec(packet) {
+            Ok(IngestCodec::Av1) => "real-time transcode of AV1 ingest is not implemented: \
+                 AV1 inter-frame decode is unavailable (keyframe-only) and the AV1 encoder \
+                 does not emit a valid bitstream; caller must stream-copy"
                 .to_string(),
-        ))
+            Ok(IngestCodec::Vp9) => "real-time transcode of VP9 ingest is not implemented: \
+                 VP9 inter-frame decode is unavailable (keyframe-only) and the VP9 encoder \
+                 does not emit a valid bitstream; caller must stream-copy"
+                .to_string(),
+            Ok(IngestCodec::Opus) => "real-time transcode of Opus ingest is not implemented: \
+                 neither the Opus encoder nor the Opus decoder is trustworthy, so a \
+                 re-encode would corrupt the audio; caller must stream-copy"
+                .to_string(),
+            Ok(IngestCodec::Flac) => "real-time transcode of FLAC ingest is not implemented: \
+                 FLAC decode is real but no lossless ABR ladder is wired; caller must \
+                 stream-copy"
+                .to_string(),
+            Err(e) => format!(
+                "real-time ingest transcoding is not implemented and the packet's codec \
+                 could not be resolved ({e}); caller must stream-copy this packet"
+            ),
+        };
+        Err(ServerError::TranscodingFailed(reason))
     }
 
     /// Starts transcoding for a stream.

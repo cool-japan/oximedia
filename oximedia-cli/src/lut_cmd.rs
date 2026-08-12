@@ -257,26 +257,35 @@ async fn convert_lut(
         return Ok(());
     }
 
-    println!("{}", "LUT Convert".green().bold());
-    println!("  Input:         {} (cube)", input.display());
-    println!("  Output:        {}", output.display());
-    println!("  Target format: {}", format.cyan());
-    println!("  Grid size:     {}", lut.size());
+    let quiet = crate::progress::is_quiet();
+    if !quiet {
+        println!("{}", "LUT Convert".green().bold());
+        println!("  Input:         {} (cube)", input.display());
+        println!("  Output:        {}", output.display());
+        println!("  Target format: {}", format.cyan());
+        println!("  Grid size:     {}", lut.size());
+    }
 
     // For cube-to-cube, write the parsed LUT back out directly
     if fmt_lower == "cube" {
         lut.to_file(output)
             .with_context(|| format!("Failed to write LUT: {}", output.display()))?;
-        println!("{} Written: {}", "✓".green(), output.display());
+        if !quiet {
+            println!("{} Written: {}", "✓".green(), output.display());
+        }
     } else {
-        println!(
-            "{} Format '{}' serialiser is planned; cube output written as intermediate.",
-            "Note:".yellow(),
-            format
-        );
+        if !quiet {
+            println!(
+                "{} Format '{}' serialiser is planned; cube output written as intermediate.",
+                "Note:".yellow(),
+                format
+            );
+        }
         lut.to_file(output)
             .with_context(|| format!("Failed to write LUT: {}", output.display()))?;
-        println!("{} Written (cube): {}", "✓".green(), output.display());
+        if !quiet {
+            println!("{} Written (cube): {}", "✓".green(), output.display());
+        }
     }
 
     Ok(())
@@ -322,12 +331,14 @@ async fn generate_lut(output: &PathBuf, size: Option<u32>, json_output: bool) ->
         return Ok(());
     }
 
-    println!("{}", "LUT Generate".green().bold());
-    println!("  Output:  {}", output.display());
-    println!("  Size:    {}x{}x{}", grid, grid, grid);
-    println!("  Entries: {}", lut.entry_count());
-    println!("  Type:    {}", "identity (no colour change)".cyan());
-    println!("{} Written: {}", "✓".green(), output.display());
+    if !crate::progress::is_quiet() {
+        println!("{}", "LUT Generate".green().bold());
+        println!("  Output:  {}", output.display());
+        println!("  Size:    {}x{}x{}", grid, grid, grid);
+        println!("  Entries: {}", lut.entry_count());
+        println!("  Type:    {}", "identity (no colour change)".cyan());
+        println!("{} Written: {}", "✓".green(), output.display());
+    }
 
     Ok(())
 }

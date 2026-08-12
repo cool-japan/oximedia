@@ -44,8 +44,16 @@
 
 pub mod api;
 pub mod assets;
+// Real asset-source resolution for missing job dependencies (local/file:///
+// http(s):// via reqwest), used by `pipeline::Pipeline::resolve_dependencies`.
+// Internal: kept crate-private (its `AssetSource` type is reached via
+// `Pipeline::add_asset_source`, not directly).
+mod asset_fetch;
 pub mod budget;
 pub mod cache;
+// Per-rendered-frame SHA-256 checksums for corruption detection, used by
+// `pipeline::Pipeline`'s frame verification.
+pub mod checksum;
 pub mod cloud;
 pub mod coordinator;
 pub mod cost;
@@ -56,15 +64,24 @@ pub mod dependency;
 pub mod distribution;
 pub mod error;
 pub mod events;
+// Shared image decode + pixel-format normalization for rendered frames,
+// used by both `output_assembly` and `quality_metrics`. Internal.
+mod frame_decode;
 pub mod health;
 pub mod job;
 pub mod load_balancer;
 pub mod monitoring;
+// Real output assembly (MJPEG-in-AVI / Y4M muxing via oximedia-container),
+// used by `pipeline::Pipeline::assemble_output`. Internal.
+mod output_assembly;
 pub mod pipeline;
 pub mod plugin;
 pub mod pool;
 pub mod preview;
 pub mod progress;
+// Real PSNR/SSIM/blockiness/blur quality metrics via oximedia-quality, used
+// by `pipeline::Pipeline::calculate_quality_metrics`. Internal.
+mod quality_metrics;
 pub mod recovery;
 pub mod reporting;
 pub mod scheduler;

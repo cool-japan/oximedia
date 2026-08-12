@@ -41,12 +41,20 @@ pub(crate) fn init_logging(verbose: u8, quiet: bool, log_format: LogFormat) -> R
 
     match log_format {
         LogFormat::Plain => {
+            // Logs are diagnostic output, not program output: write them to
+            // stderr so they never interleave with stdout results (`--json`
+            // / `--ndjson` payloads, probe data, ...). `tracing_subscriber`'s
+            // default writer is stdout, which would otherwise corrupt any
+            // `--json` command whose call graph logs during execution (e.g.
+            // `distributed start-coordinator`'s background coordinator
+            // server logs real `info!` lines while running).
             let subscriber = FmtSubscriber::builder()
                 .with_max_level(level)
                 .with_target(false)
                 .with_thread_ids(false)
                 .with_file(false)
                 .with_line_number(false)
+                .with_writer(std::io::stderr)
                 .compact()
                 .finish();
 
@@ -54,11 +62,13 @@ pub(crate) fn init_logging(verbose: u8, quiet: bool, log_format: LogFormat) -> R
                 .context("Failed to set tracing subscriber")?;
         }
         LogFormat::Json => {
+            // Same reasoning as the `Plain` arm above: logs go to stderr.
             let subscriber = tracing_subscriber::fmt()
                 .json()
                 .with_current_span(false)
                 .with_span_list(false)
                 .with_max_level(level)
+                .with_writer(std::io::stderr)
                 .finish();
 
             tracing::subscriber::set_global_default(subscriber)

@@ -51,7 +51,7 @@ pub fn temporal_median(
 
             temporal_median_plane(
                 &planes,
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,
@@ -145,7 +145,7 @@ pub fn weighted_temporal_median(
 
             weighted_temporal_median_plane(
                 &planes,
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,

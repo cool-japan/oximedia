@@ -1,0 +1,48 @@
+# VP8 bitstream dictionary for fuzzing (vp8_decoder target).
+#
+# Every token below is copied verbatim from real bytes in the checked-in
+# conformance fixtures at
+# crates/oximedia-codec/src/vp8/dec/testdata/*.frame*.bin (see that
+# directory's README.md for exact provenance: ffmpeg 7.1.1 + libvpx 1.15.2
+# encodes, bit-exact vs libvpx's own reconstruction) -- nothing here is an
+# invented byte pattern.
+#
+# RFC 6386 SS9.1: the 3-byte uncompressed frame tag is a little-endian 24-bit
+# field: bit 0 = frame_type (0 = key, 1 = inter), bits 1-3 = version, bit 4 =
+# show_frame, bits 5-23 = first_partition_size. A key frame's tag is followed
+# by the 3-byte start code and 4 bytes of width/height (14 bits each + 2-bit
+# scale).
+
+# --- Start code (RFC 6386 SS9.1): every key frame, all 5 fixture streams ---
+"\x9d\x01\x2a"
+
+# --- Key frame tags (3 bytes) ---
+# p5basic.frame0.bin / refswap.frame0.bin: version=0, show=1
+"\xb0\x31\x00"
+# splitmv.frame0.bin: version=0, show=1 (100x64, non-macroblock-aligned width)
+"\xb0\x12\x00"
+# segdelta.frame0.bin: version=0, show=1, segmentation + per-segment quantiser deltas
+"\x70\x0c\x00"
+# refswap_er.frame0.bin: version=0, show=1, refresh_entropy_probs=0 (error-resilient)
+"\x30\x32\x00"
+
+# --- Inter frame tags (3 bytes) ---
+# p5basic.frame1.bin: ordinary shown P frame, LAST-only
+"\xf1\x07\x00"
+# refswap.frame1.bin: HIDDEN altref (show_frame=0, refresh_alternate_frame=1)
+"\xa1\x10\x00"
+# refswap.frame15.bin: refresh_golden_frame=1 AND copy_buffer_to_alternate=2 together
+"\xd1\x01\x00"
+
+# --- Full valid key-frame uncompressed header (tag + start code + dims) ---
+# p5basic.frame0.bin bytes 0-9: 96x64, scale=0/0. One atomic "valid header"
+# building block for the raw-input fuzzing mode.
+"\xb0\x31\x00\x9d\x01\x2a\x60\x00\x40\x00"
+
+# --- Dimension words (14-bit width/height + 2-bit scale, little-endian) ---
+# p5basic/refswap/segdelta/refswap_er: 96 wide
+"\x60\x00"
+# splitmv: 100 wide (not a multiple of the 16px macroblock size)
+"\x64\x00"
+# all 5 streams: 64 tall
+"\x40\x00"

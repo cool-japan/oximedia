@@ -1,15 +1,19 @@
-# Codec Status — OxiMedia 0.2.0
+# Codec Status — OxiMedia 0.2.1
 
 This document is the single source of truth for the honest status of every
 codec decoder in the `oximedia-codec` and `oximedia-audio` crates, and (as of
 0.1.9) for the cryptographic honesty of the networking (`oximedia-net`) and
 DRM (`oximedia-drm`) crates. It was originally produced by a static-analysis
 audit of the 0.1.5 source tree (0.1.7 stamp), was re-audited directly against
-the 0.1.9 source tree on 2026-07-08 (see "0.1.9 re-audit summary" below), and
-has now been **re-audited a third time, for AV1/VP9/VP8 specifically,
-against the 0.2.0 source tree on 2026-07-15** — every codec entry below was
-re-verified by reading the current module rather than trusting the prior
-text (see "0.2.0 re-audit summary" below for what changed). It is
+the 0.1.9 source tree on 2026-07-08 (see "0.1.9 re-audit summary" below), was
+**re-audited a third time, for AV1/VP9/VP8 specifically, against the 0.2.0
+source tree on 2026-07-15** — every codec entry below was re-verified by
+reading the current module rather than trusting the prior text (see "0.2.0
+re-audit summary" below for what changed) — and has now been **re-audited a
+fourth time, for VP8/VP9/FLAC/AVIF/Opus, against the 0.2.1 source tree on
+2026-08-12** (see "0.2.1 re-audit summary" below). Sections carrying an
+earlier date describe the tree as it stood on that date and are superseded,
+not rewritten, by the later summaries and by the per-codec entries. It is
 referenced from the top-level `README.md`, from
 `crates/oximedia-codec/README.md`, from `SECURITY.md` (crypto status table),
 and from `TODO.md`.
@@ -128,13 +132,85 @@ source in this pass.
   This document was not updated when that code shipped — flagged as
   cross-file drift in `TODO.md` — and is corrected below in the same pass
   as the AV1 update above.
+  **Note (0.2.1):** both module paths named in this bullet have since been
+  renamed — `vp9/kf/` → `vp9/dec/` and `vp8/keyframe/` → `vp8/dec/` — when
+  inter-frame decode landed in each. The 0.2.0-era sentence is kept as the
+  historical record; the current paths are in the per-codec entries below.
 - **The orphaned `av1/avif.rs`** (never declared as a module in
   `av1/mod.rs`, and a duplicate of the live `avif/mod.rs` AVIF
   implementation) **was deleted.** `avif/mod.rs::decode()` itself has
   **not** been wired to the new AV1 keyframe decoder and still returns an
   honest `Err` — see the AVIF entry below, unchanged by this audit.
+  **Note (0.2.1):** the second sentence no longer holds. `decode()` was
+  wired to the AV1 keyframe decoder in 0.2.1 and now produces real pixels
+  for 8-bit 4:2:0 colour items; see the revised AVIF entry below for the
+  two cases that still refuse honestly.
 - **All other codec entries below are unchanged from the 0.1.9 re-audit
   above** and were not re-verified in this pass.
+
+## 0.2.1 re-audit summary (VP8, VP9, FLAC, AVIF, Opus)
+
+- **VP8 inter-frame decode — promoted from Functional (keyframe/intra only)
+  to Verified.** The "What is missing (an honest
+  `CodecError::UnsupportedFeature`)" line of the previous VP8 entry no
+  longer applies: that error path is gone from `vp8/decoder.rs`, and inter
+  frames are decoded by `vp8/dec/inter.rs`'s `Vp8SequenceDecoder` (motion
+  vectors, per-macroblock prediction records, sub-pixel motion
+  compensation, and last/golden/altref management). Evidence is external
+  and multi-frame: five libvpx-encoded streams — 39 coded frames, of which
+  38 are shown (one is a hidden altref) — decode bit-exactly against libvpx's own
+  reconstruction, including a stream with a hidden (`show_frame == 0`)
+  altref frame and one with a non-macroblock-aligned width. The key-frame
+  path was re-verified unchanged (still bit-exact vs libwebp on its three
+  still-image vectors) after being rerouted through the same sequence
+  decoder. See the VP8 entry below.
+- **VP9 inter-frame and intra-only decode — promoted from Functional
+  (keyframe/intra only) to Verified.** Both honest-`Err` dispatch arms
+  named by the previous entry (`vp9/decoder.rs:91` intra-only,
+  `vp9/decoder.rs:102` inter) are gone from the source. The keyframe
+  module was renamed `vp9/kf/` → `vp9/dec/` and grew the full inter path
+  (cross-frame reference/probability state, MV reference scan, inter mode
+  and motion-vector entropy decode, eight-tap motion compensation,
+  compound prediction, backward probability adaptation). Evidence is
+  external and multi-frame: **10 of 10** non-deferred libvpx-encoded
+  streams decode bit-exactly through the public
+  `VideoDecoder::send_packet`/`receive_frame` API, with no `#[ignore]`, no
+  PSNR threshold and no skip. Two features remain deferred and refuse at a
+  pinned packet index rather than silently misdecoding: inter-frame
+  segmentation and reference scaling. See the VP9 entry below.
+- **FLAC in `oximedia-codec` — promoted to Verified, after the previous
+  label proved to be an overclaim.** The prior entry read "Functional /
+  Verified … Verified on internal round-trip fixtures". That was true only
+  of this crate's own output: fed a stock `ffmpeg`-produced FLAC file, the
+  decoder **panicked** (`attempt to shift left with overflow`), and the
+  encoder emitted a bitstream no other decoder could read — the two sides
+  were a self-consistent pair that could not interoperate with any real
+  FLAC. Both were rebuilt against RFC 9639 and are now verified in **both**
+  directions against `libFLAC`/`ffmpeg`. See the FLAC entry below.
+- **AVIF — promoted from Bitstream-parsing to Functional.**
+  `avif/mod.rs::decode()` is wired to the AV1 keyframe decoder and produces
+  real pixels; a real `ffmpeg`+libaom fixture decodes byte-identically to
+  ffmpeg's own dav1d decode. The AVIF `iloc` parser was also fixed — it
+  accepted only version 1 (which is what *this crate's* encoder writes),
+  so it would have rejected essentially every real-world AVIF file before
+  reaching AV1 decode at all. Alpha and >8-bit items still refuse
+  honestly. See the AVIF entry below.
+- **Opus in `oximedia-codec` — demoted from Functional (CELT + SILK +
+  Hybrid) to Bitstream-parsing, on empirical evidence.** The 0.1.9 re-audit
+  promoted this entry upward by *reading* `opus/silk_decoder.rs` and
+  confirming it was wired; no real libopus-encoded packet was ever fed
+  through it in that audit. Doing so in 0.2.1 gives: 26 real libopus CELT
+  packets decode to `Ok` with **0 non-zero samples out of 49,920** (i.e.
+  silence), and real SILK packets produce out-of-range output (max abs
+  4.0) at 960 samples/frame regardless of the configured rate. The encoder
+  is worse than untested — it emits a TOC byte that misdescribes its own
+  payload (0x1c, claiming SILK/NB/60 ms for a CELT/FB/20 ms frame). Under
+  this document's own taxonomy, "returns empty/constant data" is
+  Bitstream-parsing. Every wired consumer of Opus in the workspace now
+  refuses with an honest `Err` rather than passing the silence on. This
+  concerns `crates/oximedia-codec/src/opus/` only; `oximedia-audio` has a
+  separate implementation that was not part of this audit. See the Opus
+  entry below.
 
 ## Taxonomy
 
@@ -195,55 +271,138 @@ OxiMedia classifies each decoder with one of four honesty labels.
   issue #9. *(Audited against 0.2.0 source on 2026-07-15 — see "0.2.0
   re-audit summary" above.)*
 
-### VP9 — Functional (keyframe/intra only)
+### VP9 — Verified (key frames, intra-only **and** inter frames, bit-exact vs libvpx)
 
-- **Module:** `crates/oximedia-codec/src/vp9/` (keyframe pipeline:
-  `vp9/kf/` — `booldec`, `hdr`, `itx`, `lf`, `pred`, `recon`, `scan`,
-  `tables`).
-- **Current state (0.2.0):** keyframe/intra ✓ — 8-bit 4:2:0, bit-exact vs
-  libvpx; inter not yet (honest `Err`) (mirrors the `lib.rs` Codec Feature
-  Matrix row). The `kf` module is an exact port of libvpx's intra decode
-  path (boolean/range decoder, inverse DCT/ADST transforms, the lossless
-  4×4 Walsh-Hadamard transform, loop filter, and the tile/partition/block
-  decode driver); `vp9/decoder.rs` dispatches keyframes to
-  `kf::decode_keyframe` (`vp9/decoder.rs:112`). Verified bit-exact against
-  `ffmpeg`/libvpx reference decodes of real encoder output (tests in
-  `vp9/kf/mod.rs`: lossless 64×64, CRF 128×128, odd 76×42 crop, and
-  512×64 with two tile columns, all `*_bit_exact_vs_libvpx`).
-- **What is missing (each an honest `CodecError::UnsupportedFeature`):**
-  inter-frame decode (`vp9/decoder.rs:102`) — motion-vector/ref-frame
-  syntax, eighth-pel motion compensation with the four interp filter sets,
-  compound prediction, backward probability adaptation; intra-only frames
-  (`vp9/decoder.rs:91`) — same pixel path as keyframes but requires
-  inter-frame context tracking first; profiles 1–3 (`vp9/kf/mod.rs:47`) —
-  4:2:2 / 4:4:4 subsampling and 10/12-bit depths.
-- **Effort to close the inter gap:** large.
-- **Target:** 0.2.x. *(Audited against 0.2.0 source on 2026-07-15.)*
+- **Module:** `crates/oximedia-codec/src/vp9/dec/` (renamed from `vp9/kf/`
+  when inter decode landed): `booldec`, `hdr`, `itx`, `lf`, `pred`,
+  `recon`, `scan`, `tables` (the intra pipeline) plus `state`, `refs`,
+  `counts`, `adapt`, `predctx`, `mvref`, `modeinfo`, `mc`, `interpred`,
+  `tables_inter` (the inter pipeline).
+- **Current state (0.2.1):** all three frame types decode to pixels —
+  key frames, intra-only frames, and inter frames. The intra pipeline is
+  unchanged from 0.2.0 (boolean/range decoder, inverse DCT/ADST, the
+  lossless 4×4 Walsh-Hadamard transform, loop filter, tile/partition/block
+  driver). The inter path adds: persistent cross-frame state (four frame
+  probability contexts, an 8-slot MI-aligned reference DPB carrying per-MI
+  motion-vector grids, loop-filter-delta and segmentation inheritance),
+  the `find_mv_refs` candidate scan with sign-bias flipping and temporal
+  candidates, inter mode / reference-frame / motion-vector entropy decode
+  (including sub-8×8 and the `use_mv_hp` gate), the `vpx_convolve8` eight-tap
+  motion-compensation family across the four interpolation filter sets,
+  compound prediction, whole-superblock prediction before the residual
+  loop, backward probability adaptation, `show_existing_frame` redisplay,
+  and superframe (hidden-frame) unpacking. Every function is a port of
+  libvpx **v1.15.2** with per-function `file:line` citations.
+- **Verification tier — verified, against libvpx, multi-frame, through the
+  public API:** **10 of 10** non-deferred conformance streams decode
+  bit-exactly via `VideoDecoder::send_packet` / `receive_frame`, with
+  **0 `#[ignore]`, 0 PSNR thresholds and 0 skips**:
 
-### VP8 — Functional (keyframe/intra only)
+  | stream | dims | coded/shown | what it pins |
+  |---|---|---|---|
+  | `p9still` | 76×42 | 8/8 | static content; backward adaptation across 8 frames |
+  | `p9basic` | 76×42 | 8/8 | ordinary LAST-referencing P frames |
+  | `p9er` | 76×42 | 8/8 | `error_resilient` (adaptation structurally off) |
+  | `p9hp` | 76×42 | 8/8 | high-precision (⅛-pel) motion vectors |
+  | `p9tc` | 512×64 | 5/5 | two tile columns |
+  | `p9alt` | 128×128 | 8/8 | a hidden ALTREF **sub-frame** inside the packet-1 superframe (decodes, refreshes slot 2, emits nothing); the only native fixture with `sign_bias` flips, and 33 of its blocks measurably decode as two-reference compound |
+  | `compound` | 96×64 | 13 coded / 12 shown | a second, independent hidden-ARF stream whose hidden sub-frame sits on a *different* `frame_context_idx` than the shown chain, so it pins per-index context save/load too (52 measured compound blocks) |
+  | `switch` | 100×68 | 10/10 | more than one interpolation filter, and the only fixture with a partial last superblock row **and** column (`mi_rows = (68+7)>>3 = 9`) |
+  | `p9sef` | 76×42 | 2/2 | `show_existing_frame` redisplay |
+  | `p9io` | 352×288 | intra-only + SEF | intra-only frame decode |
 
-- **Module:** `crates/oximedia-codec/src/vp8/` (keyframe pipeline:
-  `vp8/keyframe/` — `bool_decoder`, `header`, `loopfilter`, `predict`,
-  `tables`, `transform`).
-- **Current state (0.2.0):** keyframe/intra ✓ — full RFC 6386 pipeline;
-  inter not yet (honest `Err`) (mirrors the `lib.rs` Codec Feature Matrix
-  row). The full RFC 6386 §11–§15 intra pipeline (macroblock mode parsing,
-  DCT coefficient token decode, dequantise/inverse-transform, intra
-  prediction, in-loop deblocking filter), ported from the pre-existing,
-  production-verified `oximedia-image` WebP/VP8 still-image decoder (a
-  lossy WebP image *is* a single VP8 key frame); `vp8/decoder.rs`
-  dispatches keyframes to `keyframe::decode_keyframe`
-  (`vp8/decoder.rs:134`). The old constant-128 Y-plane fill and the "In a
-  full implementation, we would decode the actual pixel data here" comment
-  are gone. Verified bit-exact against libwebp (`dwebp -yuv`) reference
-  output on real libwebp/libvpx encodes
-  (`crates/oximedia-codec/tests/vp8_real_bitstream.rs`).
-- **What is missing (an honest `CodecError::UnsupportedFeature`):**
-  inter-frame decode (`vp8/decoder.rs:119`) — motion-vector entropy decode
-  (RFC 6386 §16–§18), quarter-pel motion compensation, and
-  last/golden/altref reference-frame management.
-- **Effort to close the inter gap:** medium.
-- **Target:** 0.2.x. *(Audited against 0.2.0 source on 2026-07-15.)*
+  Suite: `src/vp9/dec/inter_fixture_tests.rs` for the nine inter streams and
+  `src/vp9/decoder.rs`'s test module for `p9io`; fixture provenance and the
+  exact `ffmpeg`/libvpx commands: `src/vp9/dec/testdata/RECIPE.md` and
+  `RECIPE-p9io.md`. The
+  gate carries its own anti-vacuity test
+  (`the_gate_is_not_vacuous_a_planted_mismatch_is_reported`) and a coverage
+  assertion (`the_corpus_genuinely_exercises_the_inter_machinery`), which
+  harvests the decoder's own symbol counters across the corpus and enforces
+  floors on each: compound (two-reference) blocks **and** the `comp_ref`
+  reads that select their references, all four inter modes
+  (NEARESTMV/NEARMV/ZEROMV/NEWMV), both intra and inter blocks *inside*
+  inter frames, genuine per-block filter choice on SWITCHABLE frames (not
+  always landing on EIGHTTAP), non-zero motion vectors in each component
+  separately and together, and the ⅛-pel high-precision bit actually being
+  read. Its point is that a stream may *permit* a feature in its headers
+  without any block exercising it — the floors are on decoded symbols, not
+  on header flags.
+- **What is still missing (each an honest
+  `CodecError::UnsupportedFeature`, refused at a *pinned packet index* so
+  that a break earlier in the stream cannot masquerade as the expected
+  deferral):**
+  - **Inter-frame segmentation** — `read_inter_segment_id` and the
+    predicted segment map. Fixture `p9seg` is committed: its key frame
+    (which uses intra segmentation, and works) decodes bit-exactly, then
+    packet 1 refuses by name.
+  - **Reference scaling** — the scale factors and `vpx_scaled_2d` path
+    used when a reference frame's dimensions differ from the current
+    frame's. Fixture `scaled` is committed: packets 0–5 (96×64, five real
+    inter frames) decode bit-exactly, then packet 6 refuses naming
+    `96x64` vs `64x48`.
+  - **Profiles 1–3** — 4:2:2 / 4:4:4 subsampling and 10/12-bit depths
+    (`vp9/dec/mod.rs:102`).
+- **Effort to close the two deferrals:** small–medium each (both are
+  scoped, both already have a committed real-bitstream gate fixture
+  waiting).
+- **Target:** 0.2.x. *(Inter and intra-only decode landed and audited
+  against 0.2.1 source on 2026-08-12.)*
+
+### VP8 — Verified (key frames **and** inter frames, bit-exact vs libvpx)
+
+- **Module:** `crates/oximedia-codec/src/vp8/dec/` (`bool_decoder`,
+  `header`, `state`, `mode`, `mv`, `mc`, `refs`, `inter`, `residual`,
+  `recon`, `predict`, `loopfilter`, `filter`, `tables`, `tables_inter`,
+  `transform`).
+- **Current state (0.2.1):** both frame types decode to pixels. Key frames
+  run the RFC 6386 §11–§15 intra pipeline (macroblock mode parsing, DCT
+  token decode, dequantise/inverse-transform, intra prediction, in-loop
+  deblocking), ported from the production-verified `oximedia-image`
+  WebP/VP8 still-image decoder. Inter frames add the §16 per-macroblock
+  prediction records (including the §16.3 near-MV survey), §17 motion-vector
+  entropy decode, §18 sub-pixel motion compensation (six-tap and bilinear,
+  with the version-3 full-pel-chroma rule), §9.7–§9.8 last/golden/altref
+  management with the reference decoder's sequential (non-swap) update
+  order, and the §9.9 `refresh_entropy_probs` snapshot/restore — which also
+  closed a latent key-frame gap, since that bit is coded for both frame
+  types. `vp8/decoder.rs` routes every frame through
+  `dec::Vp8SequenceDecoder`.
+- **Verification tier — verified, against libvpx, multi-frame:** five
+  libvpx-encoded streams decode **bit-exactly**, every shown frame, all
+  three planes, against libvpx's own reconstruction of the same bytes:
+  `p5basic` (5 frames, LAST-only P frames, inherited loop-filter deltas),
+  `refswap` (19 coded / 18 shown, a genuine hidden altref frame, altref
+  sign bias, and a `refresh_golden` + `copy_buffer_to_alternate=2` frame),
+  `refswap_er` (5, `refresh_entropy_probs = 0` on every frame),
+  `splitmv` (5, 100x64 — a non-macroblock-aligned width — with a strong
+  diagonal pan), `segdelta` (5, segmentation with per-segment quantiser
+  deltas). Suite: `src/vp8/dec/inter_fixture_tests.rs`; fixture provenance
+  and the exact ffmpeg/libvpx commands: `src/vp8/dec/testdata/README.md`.
+  Key frames additionally stay bit-exact against libwebp (`dwebp -yuv`) on
+  three still-image vectors (`tests/vp8_real_bitstream.rs`).
+- **Hidden frames:** a frame with `show_frame == 0` is decoded and updates
+  the reference buffers, but is never emitted — `send_packet` returns
+  `Ok(())` and queues nothing, so a packet-in/frame-out loop legitimately
+  sees fewer frames than packets. No placeholder frame is fabricated.
+- **Known bounded gap (documented, not silently clamped):** motion
+  compensation validates every read against the reference surface's 32-pixel
+  replicated border. Non-`SPLITMV` vectors are clamped during decode to at
+  most 16 pixels beyond the frame edge, so with the six-tap reach they stay
+  within 19 of 32; `SPLITMV` sub-vectors are deliberately **not** re-clamped
+  (RFC 6386 §18.1), so a pathological stream can point further out than the
+  border covers. That is reported as `CodecError::InvalidBitstream` rather
+  than silently clamped or read out of bounds; accepting it would mean a
+  wider margin or `build_mc_border`-style edge emulation. No stream in the
+  conformance set triggers it.
+- **What is still missing:** nothing in the RFC 6386 decode path that the
+  five conformance streams exercise. Not covered by a fixture (so: parsed
+  and implemented, but unproven): bitstream versions 1–3 (bilinear /
+  full-pel profiles — libvpx emits version 0 for every stream here), and
+  multi-token-partition **inter** frames (the 4-partition key frame in
+  `tests/vp8_fixtures/` covers the partition setup itself).
+- **Target:** 0.2.x. *(Inter decode landed and audited against 0.2.1 source
+  on 2026-08-11.)*
 
 ### Theora — Functional
 
@@ -272,36 +431,80 @@ OxiMedia classifies each decoder with one of four honesty labels.
   yet exercised by round-trip tests).
 - **Target:** 0.1.7 (promoted from Bitstream-parsing to Functional).
 
-### AVIF — Bitstream-parsing
+### AVIF — Functional (8-bit 4:2:0 colour items, via the AV1 keyframe decoder)
 
-- **Module:** `crates/oximedia-codec/src/avif/`
-- **Current state (re-checked 2026-07-15):** `decode()` validates the
-  ISOBMFF container (signature, `meta`/`iloc` structure, `mdat` extents,
-  via `extract_av1_payload`) and then returns an honest
-  `CodecError::UnsupportedFeature` (`avif/mod.rs:249`) — it never
-  fabricates pixels. An earlier revision returned the raw AV1 bitstream in
-  the `y_plane` field as if it were decoded pixels; that misleading
-  behaviour has been removed (the module doc records this), and this
-  entry's previous text describing it was stale. What works today:
-  `AvifDecoder::probe` (dimensions, bit depth, colour metadata, alpha
-  presence) and `AvifDecoder::extract_av1_payload` (raw AV1 OBU
-  bitstream(s), honestly labelled as encoded data).
-- **What is missing:** wiring `decode()` to the new AV1 keyframe/intra
-  decoder (`av1/kf/`, shipped 0.2.0 — see the AV1 entry above); recorded
-  as a 0.2.x follow-up in `TODO.md`'s "Deferred (0.2.x)" section. Initial
-  scope would match the AV1 decoder (8-bit 4:2:0 profile 0).
-- **Effort:** small–medium (the AV1 keyframe decoder now exists; the
-  remaining work is the decode wiring plus still-image scope handling).
-- **Target:** 0.2.x (follows the shipped AV1 keyframe decoder).
+- **Module:** `crates/oximedia-codec/src/avif/` — `mod.rs` (public API +
+  `probe`), `container.rs` (ISOBMFF/`meta`/`iloc` parsing), `decode.rs`
+  (AV1-backed pixel decode, compiled only under the `av1` feature).
+- **Current state (0.2.1):** `decode()` produces real pixels. It validates
+  the ISOBMFF container, extracts the AV1 OBU payload(s), and feeds them
+  through `crate::av1::Av1Decoder` — the same keyframe/intra decoder that
+  is bit-exact against dav1d/aomdec (see the AV1 entry above). Scope
+  therefore matches that decoder exactly: **8-bit 4:2:0**. The
+  `#[cfg(not(feature = "av1"))]` build keeps an honest
+  `CodecError::UnsupportedFeature` rather than a second, weaker code path.
+  The earlier revision that returned the raw AV1 bitstream in the
+  `y_plane` field as if it were decoded pixels remains gone.
+- **Verification:** `testdata/color_only.avif` (a real `ffmpeg` + libaom
+  encode) decodes **byte-identically** to ffmpeg's own dav1d decode of the
+  same file, Y/U/V planes compared in full against the committed
+  `color_only_ref.yuv`. Regeneration commands are in `testdata/README.md`.
+- **Fixed in the same pass — a parser bug that would have rejected almost
+  every real file:** the `iloc` reader accepted only box **version 1**,
+  which is what *this crate's own* AVIF encoder writes. Real-world
+  encoders (`ffmpeg`, libaom) write **version 0**, which has no
+  `construction_method` field. Every such file was refused before AV1
+  decode was ever reached. Both versions are now parsed, through a
+  bounds-checked reader that returns `Err` rather than panicking on
+  truncated or fuzzed input (two truncation-fuzz tests pin this).
+- **What still refuses honestly** (each an
+  `CodecError::UnsupportedFeature`, each with a committed fixture proving
+  it is a refusal and not a crash or a fabrication):
+  - **Alpha** — `testdata/with_alpha.avif`. Real-world AVIF encodes the
+    alpha auxiliary item as **monochrome** AV1 (`mono_chrome = 1`), which
+    the AV1 keyframe decoder does not implement. The colour and alpha
+    items are treated as inseparable: an image whose alpha cannot be
+    decoded is refused by name, never returned as if it were opaque.
+  - **10/12-bit** — `testdata/color_10bit.avif`, refused through the same
+    AV1 gate, which also proves the *colour* path propagates the AV1
+    decoder's honest errors rather than only the alpha path.
+  - `iloc` version ≥ 2, non-file `construction_method`, multi-extent
+    items, and non-zero `base_offset_size`.
+- **Effort to promote to Verified / close the gaps:** the remaining AVIF
+  work is not AVIF work — alpha needs AV1 monochrome and the 10-bit
+  fixture needs the AV1 high-bit-depth pipeline, both tracked under AV1.
+- **Target:** 0.2.x for alpha/high-bit-depth, following AV1.
 
-### WebP — Functional (VP8L lossless only)
+### WebP — Functional (VP8L lossless + VP8 lossy)
 
 - **Module:** `crates/oximedia-codec/src/webp/`
 - **Current state:** VP8L (lossless) decoder is real and self-consistent.
-  VP8 lossy WebP decoder is not present — only a lossy encoder module exists.
-- **What is missing:** a lossy VP8 WebP decoder. Blocked on VP8 decoder.
-- **Effort:** large (follows VP8).
-- **Target:** 0.2.0+.
+  VP8 lossy decode is now wired too (0.2.1,
+  `crates/oximedia-codec/src/webp/vp8_decoder.rs`, `vp8` feature): a lossy
+  WebP's `VP8 ` chunk is a VP8 key frame (RFC 6386), so this module parses
+  the RIFF container with the existing `WebPContainer::parse` and calls the
+  already-shipped, bit-exact `vp8::decode_keyframe` — no new VP8 decoding
+  was written. Verified bit-exact against the `dwebp -yuv` reference on the
+  3 real-bitstream vectors in `tests/vp8_fixtures/` (grad32 32x32, tex48x40
+  48x40, and a 4-partition libvpx 48x48 key frame), each wrapped in a
+  hand-built RIFF container in `tests/webp_vp8_lossy.rs`; that claim is
+  bounded by those vectors, the same way the underlying VP8 decoder's
+  bit-exactness claim is. The no-alpha path returns native YUV 4:2:0 (not
+  converted to RGB) so it stays pixel-identical to that reference; an
+  extended-format (`VP8X`+`ALPH`+`VP8 `) file promotes the output to
+  RGBA32 by decoding the alpha chunk and converting YUV->RGB.
+  `ImageDecoder::decode_webp` (`crates/oximedia-codec/src/image.rs`, which
+  already dispatched lossy WebP to a `Vp8Decoder` call since 0.1.2 but had
+  no test coverage) now delegates to this module instead of duplicating the
+  call, so there is one lossy-decode implementation, not two.
+- **What is missing:** VP8L-compressed `ALPH` alpha
+  (`AlphaCompression::WebPLossless` in `webp/alpha.rs`) still returns an
+  honest `CodecError::UnsupportedFeature` — that boundary predates this
+  change and is unrelated to the VP8 decode wiring; only the uncompressed
+  alpha mode (all four spatial filters) is decoded.
+- **Effort:** small (done, 0.2.1) for the VP8 wiring; small for the
+  remaining VP8L-compressed-alpha gap, whenever it is picked up.
+- **Target:** 0.2.1 (VP8 wiring shipped); VP8L-compressed alpha 0.2.x+.
 
 ### MJPEG — Functional
 
@@ -623,12 +826,42 @@ OxiMedia classifies each decoder with one of four honesty labels.
 - **Effort:** specialist.
 - **Target:** 0.2.0+.
 
-### Opus — Functional (CELT + SILK + Hybrid)
+### Opus — Bitstream-parsing (decode returns silence / out-of-range output on real packets)
 
-- **Module:** `crates/oximedia-codec/src/opus/`
-- **Current state (status corrected upward on the 0.1.9 re-audit — the prior
-  "CELT only" text was stale):** all three Opus layers now have real, wired
-  decode paths.
+- **Module:** `crates/oximedia-codec/src/opus/` (this entry does **not**
+  cover `oximedia-audio`, which carries a separate implementation that has
+  not been re-audited).
+- **Headline (0.2.1, empirical):** this codec is **not usable in either
+  direction**, and the previous "Functional" label was reached by reading
+  the source rather than by decoding a real file.
+  - **Decode, fed 26 real libopus-encoded CELT packets:** returns `Ok` with
+    **0 non-zero samples out of 49,920** — i.e. digital silence, which this
+    document's taxonomy classifies as Bitstream-parsing ("returns
+    empty/constant data"), not Functional.
+  - **Decode, fed real libopus SILK packets:** produces out-of-range values
+    (max abs 4.0, outside the ±1.0 a normalised sample may take) and emits
+    960 samples per frame regardless of the configured 16 kHz rate.
+  - **Encode:** emits a TOC byte that misdescribes its own payload — `0x1c`
+    claims SILK/NB/60 ms for what is a CELT/FB/20 ms frame — so a
+    conformant decoder reads 2880 samples where 960 were encoded. Where
+    sample counts do line up, decoded energy and correlation with the input
+    are both 0.0.
+  - Consequently **every wired consumer refuses rather than passing the
+    output on**: `oximedia-videoip` returns an honest `Err` for Opus in
+    both directions; `oximedia-normalize`'s batch path sniffs `OpusHead`
+    and errors with text naming the silence problem;
+    `oximedia-transcode`'s frame-level path keeps Opus disabled
+    (`frame_level.rs:128`, `audio_adapters.rs:369`).
+- **Why the 0.1.9 entry said otherwise:** that re-audit corrected the entry
+  *upward* from "CELT only" after confirming that a normative SILK decoder
+  existed and was genuinely dispatched to. That much is still true — the
+  code below is real, wired code, not a stub — but "wired" was mistaken for
+  "correct". No libopus-encoded fixture was fed through it in that pass.
+  The structural description that follows is retained because it remains an
+  accurate account of *what is implemented*; it is the output that is
+  wrong.
+- **What is implemented (retained from the 0.1.9 audit, structure only):**
+  all three Opus layers have real, wired decode paths.
   - **CELT** (`opus/celt.rs`): real MDCT / pitch / band decode, unchanged
     since 0.1.7.
   - **SILK** (`opus/silk_decoder.rs` + `opus/silk.rs` + `opus/silk_ltp.rs` +
@@ -657,23 +890,65 @@ OxiMedia classifies each decoder with one of four honesty labels.
     comfort-noise suppression on the *encoder* side (`opus/encoder.rs`,
     `dtx_silence_frames`) is real and separately wired, and is not part of
     decode.
-- **What is missing for Verified:** no bit-exact conformance test exists yet
-  against real libopus-encoded `.opus` fixtures or RFC 6716 test vectors —
-  current coverage is internal round-trip / self-consistency only, the same
-  caveat carried by the other Functional-tier codecs below.
-- **Effort to promote to Verified:** medium (libopus / opus-tools reference
-  fixture corpus; official RFC 6716 test vectors).
-- **Target:** SILK/Hybrid decode already shipped (pre-0.1.9); conformance
-  fixtures 0.2.0+.
+- **Why the existing tests did not catch this:** coverage is internal
+  round-trip and self-consistency only (~82 unit/integration tests across
+  the SILK modules). A self-consistent encoder/decoder pair agreeing with
+  each other proves nothing about either one's conformance — the same class
+  of blind spot that the FLAC codec turned out to have, and that its
+  rebuild (below) closed by testing against `libFLAC`/`ffmpeg` instead.
+- **⚠️ Provenance of the numbers above, so this entry is not promoted back
+  by another source-reading pass:** they were **measured during the 0.2.1
+  audit with an ad-hoc harness, and no committed fixture reproduces them.**
+  No `.opus` fixture exists in the tree. What *is* committed is the
+  consequence, not the measurement: tests such as
+  `oximedia-videoip`'s `opus_fails_honestly_in_both_directions` assert that
+  the wired surfaces **refuse**, and that the refusal message names the TOC
+  defect — they do not decode a real packet and check for silence. A future
+  auditor must therefore re-measure against real libopus output before
+  changing this label in either direction, exactly as the 0.1.9 pass should
+  have done and did not. Committing a small libopus fixture that pins the
+  silence would close this hole and is the cheapest guard available.
+- **Effort to fix:** large / specialist. This is not a wiring gap; it needs
+  a decoder debugged against libopus output packet-by-packet, plus an
+  encoder rebuilt against RFC 6716 §3.1 (TOC) and validated by libopus
+  decoding it. A libopus / opus-tools reference fixture corpus and the
+  official RFC 6716 test vectors are prerequisites, not follow-ups.
+- **Target:** 0.2.x+ (unscheduled — see `TODO.md`'s "Deferred (0.2.x)").
 
-### FLAC — Functional / Verified
+### FLAC — Verified (RFC 9639, both directions, vs libFLAC/ffmpeg)
 
-- **Module:** `crates/oximedia-codec/src/flac/`
-- **Current state:** Real `decode_frame` with subframe / LPC decode, CRC-16
-  verification, round-trip tests. Treated as Functional for public-codec
-  parity and "Verified" on internal round-trip fixtures.
-- **Effort to promote to externally-Verified:** small (reference encoder
-  fixture suite).
+- **Module:** `crates/oximedia-codec/src/flac/` — `bitio.rs`, `frame.rs`,
+  `subframe.rs`, `residual.rs`, `lpc.rs`, `rice.rs`, `encoder.rs`,
+  `decoder.rs`. (`crates/oximedia-audio/src/flac/` is a **separate**
+  implementation and was not touched or audited in this pass.)
+- **Current state (0.2.1):** encoder and decoder were both **rebuilt** to
+  RFC 9639 and are verified in both directions against external tools:
+  this crate decodes stock `ffmpeg`/`libFLAC` output sample-exactly, and
+  `flac -t`/`ffmpeg` validate this crate's output sample-exactly.
+  `tests/flac_external.rs` **degrades loudly, not silently**: when a binary
+  is missing it prints an explicit `PARTIAL: … not on PATH` line for the
+  check it could not run, rather than passing quietly as if it had. In the
+  0.2.1 verification environment `flac`, `ffmpeg` and `metaflac` were all
+  present and all checks genuinely ran (0.224 s / 0.296 s / 0.732 s), so
+  this promotion rests on external comparisons that actually executed — but
+  a CI host without those binaries will report PARTIAL, and that output must
+  be read rather than assumed green. Constant, fixed, LPC and verbatim
+  subframes, all four stereo decorrelation modes, both residual coding
+  methods with escaped partitions, and wasted-bits handling are covered.
+- **What the previous "Functional / Verified" label was hiding:** the two
+  sides were a self-consistent toy pair. Fed a stock `ffmpeg`-produced
+  FLAC file the decoder **panicked** (`attempt to shift left with
+  overflow`), and essentially every field was mis-laid-out relative to the
+  spec — subframe header written as a whole byte rather than 1+6+1 bits,
+  LPC coded as the reserved `01xxxxxx` type, Rice unary inverted
+  (ones-then-zero; the spec is zeros-then-one), block size stored without
+  its `-1`, sample rate hard-coded, bit-depth nibble landing on a reserved
+  code for 16-bit. The LPC round-trip break was structural rather than a
+  bug: the encoder computed residuals from **float** coefficients while the
+  decoder dequantised and rounded, which can never be lossless. Both sides
+  now use identical `i64` accumulation with the quantised coefficients that
+  are actually written.
+- **Effort:** none outstanding for the covered scope.
 
 ### ALAC — Functional (encoder + decoder, patent-free Apple Lossless)
 
@@ -724,6 +999,42 @@ OxiMedia classifies each decoder with one of four honesty labels.
   processing / VBR / ID3. Decoder-only; MP3 encoding is still on the
   red-list (Fraunhofer). MP3 decoding patents expired in 2017.
 - **Effort to promote to Verified:** medium.
+
+### AAC — decode: not implemented (returns error); planned via external extension
+
+- **Module:** `crates/oximedia-audio/src/aac.rs` (note: lives in
+  `oximedia-audio`, not `oximedia-codec`).
+- **Current state:** **Bitstream-parsing only.** `AdtsHeader::parse` is a real
+  ADTS transport-header parser (sync word, MPEG version, profile, sampling
+  frequency index, channel configuration, frame length, CRC flag), and
+  `AacObjectType` carries the ISO 14496-3 object-type ids. There is **no
+  decoder**: no spectral (Huffman) decode, no inverse quantisation, no
+  filterbank, no SBR/PS. `AacDecoder::send_packet` and
+  `AacDecoder::receive_frame` fail closed with
+  `AudioError::UnsupportedFormat("AAC decoding is not implemented …")`;
+  `send_packet` first records the stream's sample rate / channel layout from
+  the ADTS header so inspection still works.
+- **Honesty fix (0.2.1):** the previous revision returned `Ok(AudioFrame)`
+  whose samples came from reinterpreting raw payload bit-patterns as 4-bit
+  quantised coefficients through a stub IMDCT — audio unrelated to the encoded
+  content — and reported `CodecId::Mp3` as its codec. Both are removed.
+  `oximedia_core::CodecId::Aac` now exists as an *identification-only* variant,
+  so `AacDecoder` implements `AudioDecoder` again with `codec() ->
+  CodecId::Aac`; every decode entry point still fails closed.
+  `CodecId::Aac` is deliberately unreachable from `FromStr` (`"aac"`,
+  `"mp4a"`, `"aac-lc"`, `"he-aac"` all return `Err`) so no name-driven code
+  path can select it, and the MP4/Matroska demuxer whitelists are unchanged —
+  they still reject `mp4a` tracks with `PatentViolation`.
+- **What is missing:** everything below the transport layer — AAC-LC spectral
+  decode (scalefactors, Huffman codebooks, TNS, M/S and intensity stereo,
+  PNS), the IMDCT filterbank with window-shape/sequence switching, and
+  optionally SBR (HE-AAC v1) and PS (HE-AAC v2).
+- **Plan:** real AAC decode is expected to arrive through a separate platform
+  **extension crate** (for example AudioToolbox on macOS via `objc2`), not as
+  an in-tree pure-Rust decoder. Patents are not the blocker — the
+  Fraunhofer/Via Licensing AAC patents expired in April 2023 — engineering
+  effort is.
+- **Effort for an in-tree pure-Rust decoder:** specialist.
 
 ## Network & DRM crypto status
 

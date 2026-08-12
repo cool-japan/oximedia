@@ -88,6 +88,9 @@ mod audiopost_wasm;
 mod auto_wasm;
 /// Batch processing utilities for the browser.
 mod batch_wasm;
+/// Synchronous single-poll driver for `MemorySource`-backed async futures
+/// (see module docs for the soundness argument).
+mod block_on;
 /// In-memory LRU cache for browser-side use.
 mod cache_wasm;
 /// Color calibration for the browser.
@@ -102,6 +105,9 @@ mod colormgmt_wasm;
 /// Delivery conformance checking for the browser.
 mod conform_wasm;
 mod container;
+/// Conversions from `oximedia_container`'s real demux types to this
+/// crate's local `src/container.rs` mirror types.
+mod container_bridge;
 mod convert;
 mod convert_wasm;
 /// Media deduplication utilities for the browser.

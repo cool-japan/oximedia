@@ -220,6 +220,19 @@ impl EbuR128Compliance {
 }
 
 /// EBU R128 meter with program type awareness.
+///
+/// # Accuracy
+///
+/// This meter is an **approximation** layered on the block-based
+/// [`crate::gating`] / [`crate::lkfs`] pipeline via [`LoudnessMeter`]. It adds
+/// program-type awareness (typical LRA ranges) on top, but it is *not*
+/// validated against the EBU Tech 3342 reference signals and its gating does
+/// not implement the ITU-R BS.1771 two-stage algorithm exactly.
+///
+/// For measurements that must be standards-accurate — integrated loudness,
+/// LRA, or true peak that will be reported or used to drive normalisation —
+/// use [`crate::ebu_r128_impl::EbuR128Meter`], which is what the crate root
+/// re-exports as `oximedia_metering::EbuR128Meter`.
 pub struct EbuR128Meter {
     meter: LoudnessMeter,
     program_type: ProgramType,

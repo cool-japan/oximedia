@@ -3,7 +3,7 @@
 use crate::{
     comment::{Comment, CommentPriority, CommentStatus},
     error::{ReviewError, ReviewResult},
-    AnnotationType, CommentId, SessionId, User, UserRole,
+    AnnotationType, CommentId, User, UserRole,
 };
 use chrono::Utc;
 
@@ -18,10 +18,8 @@ use chrono::Utc;
 ///
 /// Returns error if reply cannot be added.
 pub async fn add_reply(parent_id: CommentId, text: &str) -> ReviewResult<CommentId> {
-    let reply_id = CommentId::new();
-    let now = Utc::now();
-
-    // Create default author
+    // Default author; real callers that have an authenticated user should
+    // use `add_reply_with_author` instead.
     let author = User {
         id: "system".to_string(),
         name: "System".to_string(),
@@ -29,26 +27,14 @@ pub async fn add_reply(parent_id: CommentId, text: &str) -> ReviewResult<Comment
         role: UserRole::Reviewer,
     };
 
-    let _reply = Comment {
-        id: reply_id,
-        session_id: SessionId::new(), // In real implementation, get from parent
-        frame: 0,                     // In real implementation, get from parent
-        text: text.to_string(),
-        annotation_type: AnnotationType::General,
-        author,
-        status: CommentStatus::Open,
-        priority: CommentPriority::Normal,
-        parent_id: Some(parent_id),
-        created_at: now,
-        updated_at: now,
-        resolved_at: None,
-        resolved_by: None,
-    };
-
-    Ok(reply_id)
+    add_reply_with_author(parent_id, text, author).await
 }
 
 /// Add a reply with author information.
+///
+/// `session_id` and `frame` are inherited from the parent comment (a reply
+/// necessarily belongs to the same session and frame as its parent), so the
+/// parent must already exist.
 ///
 /// # Arguments
 ///
@@ -58,19 +44,23 @@ pub async fn add_reply(parent_id: CommentId, text: &str) -> ReviewResult<Comment
 ///
 /// # Errors
 ///
-/// Returns error if reply cannot be added.
+/// Returns [`crate::error::ReviewError::CommentNotFound`] if `parent_id`
+/// does not identify an existing comment.
 pub async fn add_reply_with_author(
     parent_id: CommentId,
     text: &str,
     author: User,
 ) -> ReviewResult<CommentId> {
+    let store = crate::store::default_store().await?;
+    let parent = store.get_comment(parent_id).await?;
+
     let reply_id = CommentId::new();
     let now = Utc::now();
 
-    let _reply = Comment {
+    let reply = Comment {
         id: reply_id,
-        session_id: SessionId::new(),
-        frame: 0,
+        session_id: parent.session_id,
+        frame: parent.frame,
         text: text.to_string(),
         annotation_type: AnnotationType::General,
         author,
@@ -83,6 +73,7 @@ pub async fn add_reply_with_author(
         resolved_by: None,
     };
 
+    store.insert_comment(&reply).await?;
     Ok(reply_id)
 }
 
@@ -96,10 +87,8 @@ pub async fn add_reply_with_author(
 ///
 /// Returns error if replies cannot be retrieved.
 pub async fn get_replies(parent_id: CommentId) -> ReviewResult<Vec<Comment>> {
-    // In a real implementation, this would query the database
-
-    let _ = parent_id;
-    Ok(Vec::new())
+    let store = crate::store::default_store().await?;
+    store.list_replies(parent_id).await
 }
 
 /// Count replies to a comment.
@@ -140,10 +129,8 @@ pub async fn has_replies(comment_id: CommentId) -> ReviewResult<bool> {
 ///
 /// Returns error if deletion fails.
 pub async fn delete_all_replies(parent_id: CommentId) -> ReviewResult<()> {
-    // In a real implementation, this would delete all replies
-
-    let _ = parent_id;
-    Ok(())
+    let store = crate::store::default_store().await?;
+    store.delete_replies(parent_id).await
 }
 
 /// Validate that a reply can be added.
@@ -163,17 +150,33 @@ pub fn validate_reply(parent_status: CommentStatus) -> ReviewResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionId;
+
+    async fn create_test_parent() -> CommentId {
+        let session_id = SessionId::new();
+        crate::comment::add::add_comment(session_id, 100, "Parent comment", AnnotationType::Issue)
+            .await
+            .expect("parent comment creation should succeed")
+    }
 
     #[tokio::test]
     async fn test_add_reply() {
-        let parent_id = CommentId::new();
+        let parent_id = create_test_parent().await;
         let result = add_reply(parent_id, "Test reply").await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_add_reply_with_author() {
+    async fn test_add_reply_not_found_is_honest_error() {
+        // A parent that was never created must not silently succeed.
         let parent_id = CommentId::new();
+        let result = add_reply(parent_id, "Test reply").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_add_reply_with_author() {
+        let parent_id = create_test_parent().await;
         let author = User {
             id: "user-1".to_string(),
             name: "Test User".to_string(),
@@ -186,17 +189,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reply_inherits_session_and_frame_from_parent() {
+        let session_id = SessionId::new();
+        let parent_id = crate::comment::add::add_comment(
+            session_id,
+            42,
+            "Parent comment",
+            AnnotationType::Issue,
+        )
+        .await
+        .expect("parent comment creation should succeed");
+
+        let reply_id = add_reply(parent_id, "Test reply")
+            .await
+            .expect("reply should succeed");
+
+        let replies = get_replies(parent_id).await.expect("list should succeed");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].id, reply_id);
+        assert_eq!(replies[0].session_id, session_id);
+        assert_eq!(replies[0].frame, 42);
+        assert_eq!(replies[0].parent_id, Some(parent_id));
+    }
+
+    #[tokio::test]
     async fn test_get_replies() {
-        let parent_id = CommentId::new();
+        let parent_id = create_test_parent().await;
         let result = get_replies(parent_id).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_count_replies() {
-        let parent_id = CommentId::new();
-        let result = count_replies(parent_id).await;
-        assert!(result.is_ok());
+        let parent_id = create_test_parent().await;
+        assert_eq!(count_replies(parent_id).await.expect("should succeed"), 0);
+
+        add_reply(parent_id, "Reply 1")
+            .await
+            .expect("reply should succeed");
+        add_reply(parent_id, "Reply 2")
+            .await
+            .expect("reply should succeed");
+        assert_eq!(count_replies(parent_id).await.expect("should succeed"), 2);
+        assert!(has_replies(parent_id).await.expect("should succeed"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_replies() {
+        let parent_id = create_test_parent().await;
+        add_reply(parent_id, "Reply 1")
+            .await
+            .expect("reply should succeed");
+        add_reply(parent_id, "Reply 2")
+            .await
+            .expect("reply should succeed");
+        assert_eq!(count_replies(parent_id).await.expect("should succeed"), 2);
+
+        delete_all_replies(parent_id)
+            .await
+            .expect("delete should succeed");
+        assert_eq!(count_replies(parent_id).await.expect("should succeed"), 0);
     }
 
     #[test]

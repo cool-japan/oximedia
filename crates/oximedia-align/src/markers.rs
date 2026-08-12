@@ -791,18 +791,19 @@ pub fn cluster_markers(markers: &[SyncMarker], max_gap_frames: usize) -> Vec<Vec
     sorted.sort_by_key(|m| m.frame);
 
     let mut clusters: Vec<Vec<SyncMarker>> = Vec::new();
+    let mut last_frame = sorted[0].frame;
     let mut current: Vec<SyncMarker> = vec![sorted[0].clone()];
 
     for m in sorted.into_iter().skip(1) {
-        // SAFETY: current always contains at least one element (seeded with sorted[0] above)
-        let last_frame = current
-            .last()
-            .expect("current cluster is always non-empty")
-            .frame;
+        // `last_frame` is tracked alongside `current` instead of re-derived
+        // via `current.last()`, so there is no panic path if `current` were
+        // ever empty.
         if m.frame.saturating_sub(last_frame) <= max_gap_frames {
+            last_frame = m.frame;
             current.push(m);
         } else {
             clusters.push(current);
+            last_frame = m.frame;
             current = vec![m];
         }
     }

@@ -580,16 +580,12 @@ struct StabilizeSummary {
 /// Decode a Y4M clip, stabilise it with the `oximedia-stabilize` offline
 /// multi-pass pipeline, and re-encode the result as Y4M.
 ///
-/// # Pipeline
-///
-/// 1. Demux the input `.y4m` into a list of raw planar-YUV frames.
-/// 2. Extract the luma (Y) plane of every frame and hand it to the
-///    `oximedia-stabilize` offline multi-pass stabiliser, which performs
-///    multi-pass analysis, feature-based motion estimation, trajectory
-///    smoothing and frame warping.
-/// 3. Apply the *same* per-frame stabilisation transforms to the chroma
-///    planes (scaled for chroma subsampling) so colour tracks the luma.
-/// 4. Mux the warped planes back into a Y4M stream.
+/// Both halves are the shared frame harness: [`crate::frame_harness::process_clip`]
+/// runs the Y4M demux → operation → mux path (stabilisation needs the whole
+/// clip, because the motion trajectory is global), and
+/// [`crate::frame_harness::ops::stabilize_clip`] is the operation itself —
+/// multi-pass analysis, feature-based motion estimation, trajectory smoothing
+/// and per-plane warping.
 ///
 /// # Errors
 ///
@@ -599,381 +595,41 @@ fn stabilize_video_y4m(
     input: &std::path::Path,
     output: &std::path::Path,
 ) -> Result<StabilizeSummary> {
-    use oximedia_container::demux::y4m::Y4mDemuxer;
-    use oximedia_container::mux::y4m::Y4mMuxerBuilder;
-
-    // --- 1. Read and demux the input clip --------------------------------
-    let raw = std::fs::read(input)
-        .with_context(|| format!("Failed to read input: {}", input.display()))?;
-    let input_size = raw.len() as u64;
-
-    if !raw.starts_with(b"YUV4MPEG2") {
-        anyhow::bail!(
-            "restore-video --mode stabilize requires an uncompressed YUV4MPEG2 (.y4m) \
-             input, because stabilisation re-encodes every frame. '{}' is not a Y4M file. \
-             Convert it first (e.g. `oximedia transcode -i input.mp4 output.y4m`).",
-            input.display()
-        );
-    }
-
-    let mut demuxer = Y4mDemuxer::new(std::io::Cursor::new(raw.as_slice()))
-        .map_err(|e| anyhow::anyhow!("Failed to parse Y4M header: {e}"))?;
-
-    let header = demuxer.header().clone();
-    let width = header.width;
-    let height = header.height;
-    let chroma = header.chroma;
-
-    let frames_raw = demuxer
-        .read_all_frames()
-        .map_err(|e| anyhow::anyhow!("Failed to read Y4M frames: {e}"))?;
-
-    if frames_raw.is_empty() {
-        anyhow::bail!(
-            "Y4M input '{}' contains no frames; nothing to stabilise.",
-            input.display()
-        );
-    }
-
-    let layout = ChromaLayout::for_chroma(chroma, width, height).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Y4M chroma format '{}' is not supported by the stabilise pipeline",
-            chroma
-        )
+    // The harness is geometry-agnostic, so the clip's dimensions are captured
+    // as it passes through the operation rather than by decoding it twice.
+    //
+    // `restore video --mode stabilize` has no CLI flags of its own for
+    // stabilisation parameters (unlike `oximedia stabilize`, which threads
+    // --mode/--quality/--smoothing/--zoom through `stabilize_clip`'s config
+    // parameter), so this reconstructs the fixed offline configuration that
+    // used to be hard-coded inside `stabilize_clip` itself: affine motion,
+    // balanced quality, 0.85 smoothing, zoom optimisation off (this restore
+    // path predates zoom being wired up at all, so leaving it off preserves
+    // this command's exact prior behaviour).
+    let config = oximedia_stabilize::StabilizeConfig::new()
+        .with_mode(oximedia_stabilize::StabilizationMode::Affine)
+        .with_quality(oximedia_stabilize::QualityPreset::Balanced)
+        .with_smoothing_strength(0.85)
+        .with_zoom_optimization(false);
+    let geometry = std::cell::Cell::new((0u32, 0u32));
+    let stats = crate::frame_harness::process_clip(STABILIZE_OP, input, output, |clip| {
+        geometry.set((clip.width(), clip.height()));
+        crate::frame_harness::ops::stabilize_clip(clip, &config)
     })?;
-
-    // --- 2. Stabilise -----------------------------------------------------
-    let stabilized = stabilize_planar_frames(&frames_raw, &layout)?;
-
-    // --- 3. Re-encode as Y4M ---------------------------------------------
-    let mut out_buf: Vec<u8> = Vec::with_capacity(raw.len());
-    {
-        let mut muxer = Y4mMuxerBuilder::new(width, height)
-            .fps(header.fps_num.max(1), header.fps_den.max(1))
-            .chroma(chroma)
-            .interlace(header.interlace)
-            .aspect_ratio(header.par_num, header.par_den)
-            .build(&mut out_buf)
-            .map_err(|e| anyhow::anyhow!("Failed to create Y4M muxer: {e}"))?;
-        for frame in &stabilized {
-            muxer
-                .write_frame(frame)
-                .map_err(|e| anyhow::anyhow!("Failed to write stabilised frame: {e}"))?;
-        }
-        muxer
-            .finish()
-            .map_err(|e| anyhow::anyhow!("Failed to finalise Y4M output: {e}"))?;
-    }
-
-    std::fs::write(output, &out_buf)
-        .with_context(|| format!("Failed to write output: {}", output.display()))?;
-
-    // Count how many frame-data bytes actually changed, so callers (and tests)
-    // can confirm that stabilisation altered the picture.
-    let bytes_changed = frames_raw
-        .iter()
-        .zip(stabilized.iter())
-        .map(|(a, b)| a.iter().zip(b.iter()).filter(|(x, y)| x != y).count() as u64)
-        .sum();
+    let (width, height) = geometry.get();
 
     Ok(StabilizeSummary {
         width,
         height,
-        frame_count: stabilized.len(),
-        input_size,
-        output_size: out_buf.len() as u64,
-        bytes_changed,
+        frame_count: stats.frame_count,
+        input_size: stats.bytes_in,
+        output_size: stats.bytes_out,
+        bytes_changed: stats.bytes_changed,
     })
 }
 
-/// Plane geometry of a Y4M frame for a particular chroma subsampling.
-#[derive(Debug, Clone, Copy)]
-struct ChromaLayout {
-    /// Luma plane width.
-    luma_w: usize,
-    /// Luma plane height.
-    luma_h: usize,
-    /// Chroma plane width (0 if there are no chroma planes).
-    chroma_w: usize,
-    /// Chroma plane height (0 if there are no chroma planes).
-    chroma_h: usize,
-    /// Whether the frame carries a full-resolution alpha plane.
-    has_alpha: bool,
-}
-
-impl ChromaLayout {
-    /// Derive the plane layout for a Y4M chroma format and frame size.
-    ///
-    /// Returns `None` for chroma formats this pipeline does not handle.
-    fn for_chroma(
-        chroma: oximedia_container::demux::y4m::Y4mChroma,
-        width: u32,
-        height: u32,
-    ) -> Option<Self> {
-        use oximedia_container::demux::y4m::Y4mChroma;
-        let luma_w = width as usize;
-        let luma_h = height as usize;
-        let (chroma_w, chroma_h, has_alpha) = match chroma {
-            Y4mChroma::C420jpeg | Y4mChroma::C420mpeg2 | Y4mChroma::C420paldv => {
-                ((luma_w + 1) / 2, (luma_h + 1) / 2, false)
-            }
-            Y4mChroma::C422 => ((luma_w + 1) / 2, luma_h, false),
-            Y4mChroma::C444 => (luma_w, luma_h, false),
-            Y4mChroma::C444alpha => (luma_w, luma_h, true),
-            Y4mChroma::Mono => (0, 0, false),
-        };
-        Some(Self {
-            luma_w,
-            luma_h,
-            chroma_w,
-            chroma_h,
-            has_alpha,
-        })
-    }
-
-    /// Total bytes in one packed planar frame.
-    const fn frame_size(&self) -> usize {
-        self.luma_w * self.luma_h
-            + 2 * self.chroma_w * self.chroma_h
-            + if self.has_alpha {
-                self.luma_w * self.luma_h
-            } else {
-                0
-            }
-    }
-}
-
-/// Stabilise a sequence of packed planar-YUV frames.
-///
-/// The luma plane drives the `oximedia-stabilize` offline multi-pass pipeline;
-/// the resulting per-frame transforms are then applied to every plane so the
-/// chroma (and optional alpha) channels stay registered with the luma.
-fn stabilize_planar_frames(frames_raw: &[Vec<u8>], layout: &ChromaLayout) -> Result<Vec<Vec<u8>>> {
-    use oximedia_stabilize::motion::estimate::MotionEstimator;
-    use oximedia_stabilize::motion::tracker::MotionTracker;
-    use oximedia_stabilize::motion::trajectory::Trajectory;
-    use oximedia_stabilize::multipass::analyze::MultipassAnalyzer;
-    use oximedia_stabilize::smooth::filter::TrajectorySmoother;
-    use oximedia_stabilize::transform::calculate::{StabilizationTransform, TransformCalculator};
-    use oximedia_stabilize::warp::apply::FrameWarper;
-    use oximedia_stabilize::{Frame, QualityPreset, StabilizationMode, StabilizeConfig};
-    use scirs2_core::ndarray::Array2;
-
-    let expected = layout.frame_size();
-    for (i, f) in frames_raw.iter().enumerate() {
-        if f.len() != expected {
-            anyhow::bail!(
-                "Y4M frame {i} has {} bytes, expected {expected} for the declared geometry",
-                f.len()
-            );
-        }
-    }
-
-    // ----- Build oximedia-stabilize luma frames --------------------------
-    let luma_frames: Vec<Frame> = frames_raw
-        .iter()
-        .enumerate()
-        .map(|(i, raw)| -> Result<Frame> {
-            let luma = &raw[..layout.luma_w * layout.luma_h];
-            let data = Array2::from_shape_vec((layout.luma_h, layout.luma_w), luma.to_vec())
-                .map_err(|e| anyhow::anyhow!("Failed to build luma array for frame {i}: {e}"))?;
-            Ok(Frame::new(
-                layout.luma_w,
-                layout.luma_h,
-                i as f64 / 30.0,
-                data,
-            ))
-        })
-        .collect::<Result<_>>()?;
-
-    // ----- Offline multi-pass stabilisation pipeline ---------------------
-    // This mirrors `oximedia_stabilize::Stabilizer::stabilize`, but keeps the
-    // intermediate per-frame transforms so they can be re-applied to the
-    // chroma planes. The `StabilizeConfig` here selects affine motion with
-    // multi-pass analysis enabled (the offline, highest-quality path).
-    let config = StabilizeConfig::new()
-        .with_mode(StabilizationMode::Affine)
-        .with_quality(QualityPreset::Balanced)
-        .with_smoothing_strength(0.85);
-    config
-        .validate()
-        .map_err(|e| anyhow::anyhow!("Invalid stabilisation configuration: {e}"))?;
-
-    // Pass 1 — analyse the whole clip up front (multi-pass / offline).
-    let analyzer = MultipassAnalyzer::new();
-    let analysis = analyzer
-        .analyze(&luma_frames)
-        .map_err(|e| anyhow::anyhow!("Multi-pass analysis failed: {e}"))?;
-    // Use the analysis to pick the smoothing window, exactly as the offline
-    // stabiliser does when adapting to the detected motion profile.
-    let smoothing_window = analysis
-        .recommended_window_size
-        .max(config.quality.smoothing_window())
-        .max(1);
-
-    // Pass 2 — feature tracking + motion estimation + smoothing + warp.
-    let transforms: Vec<StabilizationTransform> = {
-        let mut tracker = MotionTracker::new(config.feature_count);
-        match tracker.track(&luma_frames) {
-            Ok(tracks) => {
-                let estimator = MotionEstimator::new(config.mode);
-                let models = estimator
-                    .estimate(&tracks, luma_frames.len())
-                    .map_err(|e| anyhow::anyhow!("Motion estimation failed: {e}"))?;
-                let trajectory = Trajectory::from_models(&models)
-                    .map_err(|e| anyhow::anyhow!("Trajectory build failed: {e}"))?;
-                let mut smoother =
-                    TrajectorySmoother::new(smoothing_window, config.smoothing_strength);
-                let smoothed = smoother
-                    .smooth(&trajectory)
-                    .map_err(|e| anyhow::anyhow!("Trajectory smoothing failed: {e}"))?;
-                let calculator = TransformCalculator::new();
-                calculator
-                    .calculate(&trajectory, &smoothed)
-                    .map_err(|e| anyhow::anyhow!("Transform calculation failed: {e}"))?
-            }
-            Err(oximedia_stabilize::StabilizeError::InsufficientFeatures { .. }) => {
-                // Featureless footage (e.g. flat colour): nothing to correct,
-                // fall back to identity transforms so the clip passes through.
-                (0..luma_frames.len())
-                    .map(StabilizationTransform::identity)
-                    .collect()
-            }
-            Err(e) => return Err(anyhow::anyhow!("Motion tracking failed: {e}")),
-        }
-    };
-
-    if transforms.len() != frames_raw.len() {
-        anyhow::bail!(
-            "stabiliser produced {} transforms for {} frames",
-            transforms.len(),
-            frames_raw.len()
-        );
-    }
-
-    // ----- Warp every plane with the per-frame transforms ----------------
-    let warper = FrameWarper::new();
-    let mut out_frames: Vec<Vec<u8>> = Vec::with_capacity(frames_raw.len());
-
-    for (raw, transform) in frames_raw.iter().zip(transforms.iter()) {
-        let mut out = vec![0u8; expected];
-        let mut offset = 0usize;
-
-        // Luma plane — full-resolution transform.
-        warp_plane(
-            &warper,
-            &raw[offset..offset + layout.luma_w * layout.luma_h],
-            layout.luma_w,
-            layout.luma_h,
-            transform,
-            1.0,
-            &mut out[offset..offset + layout.luma_w * layout.luma_h],
-        )?;
-        offset += layout.luma_w * layout.luma_h;
-
-        // Chroma planes — translation scaled by the subsampling ratio.
-        if layout.chroma_w > 0 && layout.chroma_h > 0 {
-            let plane_len = layout.chroma_w * layout.chroma_h;
-            let scale_x = layout.chroma_w as f64 / layout.luma_w.max(1) as f64;
-            let scale_y = layout.chroma_h as f64 / layout.luma_h.max(1) as f64;
-            // Average ratio keeps the helper's single-scale model simple while
-            // remaining exact for 4:2:0 / 4:2:2 / 4:4:4 (uniform per axis).
-            let chroma_scale = (scale_x + scale_y) / 2.0;
-            for _ in 0..2 {
-                warp_plane(
-                    &warper,
-                    &raw[offset..offset + plane_len],
-                    layout.chroma_w,
-                    layout.chroma_h,
-                    transform,
-                    chroma_scale,
-                    &mut out[offset..offset + plane_len],
-                )?;
-                offset += plane_len;
-            }
-        }
-
-        // Alpha plane (C444alpha) — full-resolution, same transform as luma.
-        if layout.has_alpha {
-            let plane_len = layout.luma_w * layout.luma_h;
-            warp_plane(
-                &warper,
-                &raw[offset..offset + plane_len],
-                layout.luma_w,
-                layout.luma_h,
-                transform,
-                1.0,
-                &mut out[offset..offset + plane_len],
-            )?;
-        }
-
-        out_frames.push(out);
-    }
-
-    Ok(out_frames)
-}
-
-/// Warp a single 8-bit plane with one stabilisation transform.
-///
-/// `translation_scale` rescales the transform's translation component so that
-/// a luma-derived transform can be applied to a subsampled chroma plane.
-fn warp_plane(
-    warper: &oximedia_stabilize::warp::apply::FrameWarper,
-    src: &[u8],
-    plane_w: usize,
-    plane_h: usize,
-    transform: &oximedia_stabilize::transform::calculate::StabilizationTransform,
-    translation_scale: f64,
-    dst: &mut [u8],
-) -> Result<()> {
-    use oximedia_stabilize::transform::calculate::StabilizationTransform;
-    use oximedia_stabilize::Frame;
-    use scirs2_core::ndarray::Array2;
-
-    if plane_w == 0 || plane_h == 0 {
-        return Ok(());
-    }
-
-    let data = Array2::from_shape_vec((plane_h, plane_w), src.to_vec())
-        .map_err(|e| anyhow::anyhow!("Failed to build plane array ({plane_w}x{plane_h}): {e}"))?;
-    // The warper copies `timestamp` straight through and does not use it in
-    // the warp math, so any value is fine for this throwaway single-frame call.
-    let frame = Frame::new(plane_w, plane_h, 0.0, data);
-
-    // Rotation and scale are dimensionless and apply unchanged at any
-    // resolution; only the translation must be rescaled for chroma planes.
-    let plane_transform = StabilizationTransform {
-        dx: transform.dx * translation_scale,
-        dy: transform.dy * translation_scale,
-        angle: transform.angle,
-        scale: transform.scale,
-        frame_index: transform.frame_index,
-        confidence: transform.confidence,
-    };
-
-    let warped = warper
-        .warp(
-            std::slice::from_ref(&frame),
-            std::slice::from_ref(&plane_transform),
-        )
-        .map_err(|e| anyhow::anyhow!("Frame warp failed: {e}"))?;
-    let warped_frame = warped
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Frame warp returned no frame"))?;
-
-    // Copy the warped plane back out in row-major order.
-    let warped_bytes: Vec<u8> = warped_frame.data.iter().copied().collect();
-    if warped_bytes.len() != dst.len() {
-        anyhow::bail!(
-            "warped plane has {} bytes, expected {}",
-            warped_bytes.len(),
-            dst.len()
-        );
-    }
-    dst.copy_from_slice(&warped_bytes);
-    Ok(())
-}
+/// Operation label used in the frame harness's error messages.
+const STABILIZE_OP: &str = "restore-video --mode stabilize";
 
 /// Run the `restore analyze` subcommand.
 pub async fn run_restore_analyze(opts: RestoreAnalyzeOptions, json_output: bool) -> Result<()> {
@@ -1813,8 +1469,12 @@ mod tests {
     }
 
     /// `ChromaLayout` computes correct plane sizes for the common Y4M formats.
+    ///
+    /// The type now lives in the shared frame harness; this test keeps
+    /// covering the geometry the stabilise path depends on.
     #[test]
     fn test_chroma_layout_plane_sizes() {
+        use crate::frame_harness::ChromaLayout;
         use oximedia_container::demux::y4m::Y4mChroma;
 
         let l420 = ChromaLayout::for_chroma(Y4mChroma::C420jpeg, 64, 48).expect("420 layout");

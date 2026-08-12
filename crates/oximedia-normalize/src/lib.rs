@@ -374,6 +374,16 @@ pub enum NormalizeError {
     #[error("Audio codec error: {0}")]
     AudioCodec(#[from] oximedia_audio::error::AudioError),
 
+    /// Codec error from `oximedia-codec` (e.g. FLAC decode/encode failure).
+    #[error("Codec error: {0}")]
+    Codec(#[from] oximedia_codec::error::CodecError),
+
+    /// Input format is recognized but not supported by this pipeline (e.g. an
+    /// in-tree decoder that has been empirically shown untrustworthy, or a
+    /// format for which no decoder is wired into batch normalization).
+    #[error("Unsupported input format: {0}")]
+    UnsupportedFormat(String),
+
     /// Metadata error.
     #[error("Metadata error: {0}")]
     MetadataError(String),

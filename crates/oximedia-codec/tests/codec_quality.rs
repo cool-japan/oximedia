@@ -241,14 +241,22 @@ fn flac_lossless_audio_roundtrip() {
     use oximedia_codec::flac::{FlacConfig, FlacDecoder, FlacEncoder};
 
     let sample_rate = 44100u32;
-    let channels = 1u8;
+    let channels = 2u8;
     let bits_per_sample = 16u8;
 
-    // Generate a short silence block.  Silence (all zeros) is the simplest
-    // possible FLAC frame: all residuals are zero, so encoding and decoding
-    // must be exact regardless of LPC order or quantization.
-    let samples_per_channel = 256usize;
-    let samples: Vec<i32> = vec![0i32; samples_per_channel];
+    // A real signal, not just silence: a two-tone stereo mix exercises LPC
+    // fitting, residual partitioning and inter-channel decorrelation.  FLAC is
+    // lossless, so the decoded samples must be identical, not merely close.
+    let samples_per_channel = 4000usize;
+    let samples: Vec<i32> = (0..samples_per_channel * channels as usize)
+        .map(|i| {
+            let s = (i / channels as usize) as f64;
+            let c = (i % channels as usize) as f64;
+            let t = s / f64::from(sample_rate);
+            ((t * (440.0 + c) * std::f64::consts::TAU).sin() * 18000.0
+                + (t * 1731.0 * std::f64::consts::TAU).sin() * 6000.0) as i32
+        })
+        .collect();
 
     let config = FlacConfig {
         sample_rate,
@@ -262,34 +270,33 @@ fn flac_lossless_audio_roundtrip() {
     let (_, frames) = encoder.encode(&samples).expect("FLAC encode");
     assert!(!frames.is_empty(), "FLAC must produce at least one frame");
 
-    // Build complete stream: header + frame bytes
+    // Build complete stream: header + frame bytes, then finalise STREAMINFO.
     let mut stream = header;
     for frame in &frames {
         stream.extend_from_slice(&frame.data);
     }
+    stream[..42].copy_from_slice(&encoder.finalized_stream_header());
 
-    // Verify the stream is non-trivial (has some content)
+    // Compression must actually happen on a tonal signal.
+    let raw_bytes = samples.len() * 2;
     assert!(
-        stream.len() > 42,
-        "FLAC stream must contain header + frame data"
+        stream.len() < raw_bytes,
+        "FLAC must compress: {} coded vs {raw_bytes} raw bytes",
+        stream.len()
     );
 
-    // Decode
+    // Decode and require exact equality — lossless means lossless.
     let mut decoder = FlacDecoder::new();
     let decoded_samples = decoder.decode_stream(&stream).expect("FLAC decode");
-
-    // Silence must decode as silence — all samples must be 0.
-    assert!(
-        !decoded_samples.is_empty(),
-        "FLAC decoder must produce at least one sample"
+    assert_eq!(
+        decoded_samples.len(),
+        samples.len(),
+        "FLAC must decode every sample"
     );
-    let decoded_silence = &decoded_samples[..samples_per_channel.min(decoded_samples.len())];
-    for (i, &s) in decoded_silence.iter().enumerate() {
-        assert_eq!(
-            s, 0,
-            "FLAC silence must decode as silence at sample {i}: got {s}"
-        );
-    }
+    assert_eq!(
+        decoded_samples, samples,
+        "FLAC round-trip must be sample-exact"
+    );
 }
 
 // =============================================================================
@@ -416,15 +423,17 @@ fn avif_encode_decode_produces_valid_container() {
     assert_eq!(&avif_bytes[4..8], b"ftyp", "first box must be ftyp");
     assert_eq!(&avif_bytes[8..12], b"avif", "major brand must be avif");
 
-    // Honest-decode policy: full AVIF decode requires AV1 pixel
-    // reconstruction, which is not yet implemented — decode() must say so
-    // instead of returning raw AV1 bytes disguised as pixels.
-    let decode_err = AvifDecoder::decode(&avif_bytes)
-        .expect_err("AVIF decode must fail honestly until AV1 reconstruction lands");
-    assert!(
-        decode_err.to_string().contains("not yet implemented"),
-        "decode error must state the limitation, got: {decode_err}"
-    );
+    // Honest-decode policy: AvifEncoder writes a structurally valid
+    // container but only a placeholder AV1 payload (sequence header, no
+    // coded frame — see the `avif` module docs), so decode() cannot
+    // produce real pixels from its own output. It must fail honestly
+    // (real AV1 decode reports "no frame"; without the `av1` cargo
+    // feature, "unsupported feature") rather than returning raw AV1 bytes
+    // disguised as pixels. Real AV1-backed decode of an actual encoded
+    // AV1 keyframe is covered by the fixture-based tests in
+    // `avif::mod::tests` (`crates/oximedia-codec/src/avif/testdata/`).
+    let _decode_err = AvifDecoder::decode(&avif_bytes)
+        .expect_err("AVIF decode of a placeholder-only payload must fail honestly");
 
     // Metadata and the raw AV1 OBU remain available through the
     // honestly-named APIs.

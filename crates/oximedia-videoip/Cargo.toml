@@ -18,7 +18,11 @@ workspace = true
 [dependencies]
 # Workspace dependencies
 oximedia-core = { workspace = true }
-oximedia-codec = { workspace = true, default-features = true }
+# Real VP8/VP9/AV1 *decoders* (see src/codec.rs for the per-codec evidence).
+# `opus` is deliberately NOT enabled: oximedia-codec's Opus encoder mislabels
+# its packets and its Opus decoder returns silence for real libopus CELT
+# packets, so this crate refuses Opus in both directions rather than wiring it.
+oximedia-codec = { workspace = true, features = ["av1", "vp8", "vp9"] }
 oximedia-net = { workspace = true }
 oximedia-monitor = { workspace = true }
 oximedia-timecode = { workspace = true }

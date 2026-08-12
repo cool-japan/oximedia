@@ -1,0 +1,81 @@
+# COOLJAPAN policy: banned crates for oximedia.
+#
+# Adapted from the oxifont/oxitext deny.toml baseline (see
+# ~/.claude/CLAUDE.md's "Dependency Replacements" table).
+[bans]
+deny = [
+    { name = "freetype-sys" },
+    { name = "fontconfig-sys" },
+    { name = "harfbuzz-sys" },
+    { name = "brotli" },
+    { name = "ring" },
+    # Upstream quick-xml replaced by oxixml-quickxml-compat (COOLJAPAN Pure
+    # Rust Policy); the workspace-level dependency is a `package = "oxixml-quickxml-compat"`
+    # rename, so no wrapper exceptions are needed here.
+    { name = "quick-xml", reason = "replaced by oxixml-quickxml-compat (see workspace Cargo.toml)" },
+    # Documented exception: three existing image/vector-graphics ingress
+    # chains reach `flate2` today, all through non-oximedia crates:
+    #   - oximedia-codec, oximedia-forensics (via image) -> png -> flate2
+    #   - oximedia-image (widely depended on), oximedia-forensics (via
+    #     image) -> tiff -> flate2
+    #   - oximedia-graphics -> resvg -> usvg -> flate2
+    # Naming their direct parents as wrappers lets these existing,
+    # non-oximedia-authored ingresses through while keeping the ban fully
+    # active for any *new* direct dependency on flate2 (including from
+    # oximedia crates themselves).
+    { name = "flate2", wrappers = ["png", "tiff", "usvg"], reason = "existing PNG/TIFF/SVG decode ingress via png/tiff/usvg -> flate2 (see oximedia-codec, oximedia-image, oximedia-forensics, oximedia-graphics); ban stays active for any new direct ingress" },
+    # flate2's own pure-Rust DEFLATE backend, and also a direct dependency
+    # of `png` itself (for APNG/interlaced paths) -- only reachable
+    # through the two exceptions named above.
+    { name = "miniz_oxide", wrappers = ["flate2", "png"], reason = "png/flate2's pure-Rust deflate backend, reached only via the documented flate2 exception above" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# MPL-2.0 is intentionally NOT in the global allow list above (its
+# per-file copyleft terms warrant case-by-case review); each real
+# ingress is exempted individually below instead of admitting MPL-2.0
+# workspace-wide.
+[[licenses.exceptions]]
+# Direct, non-optional dependency of oximedia-cli (colored terminal
+# output, used across ~87 files) -- do not attempt to remove, just
+# except it.
+allow = ["MPL-2.0"]
+crate = "colored"
+
+[[licenses.exceptions]]
+# dirs-sys <- dirs <- oximedia-cli, oximedia-gpu (XDG/platform user
+# config & cache directory resolution).
+allow = ["MPL-2.0"]
+crate = "option-ext"
+
+[[licenses.exceptions]]
+# tokio-serial <- oximedia-automation (serial port I/O for
+# automation/device-control hardware backends).
+allow = ["MPL-2.0"]
+crate = "serialport"
+
+# fuchsia-cprng has no SPDX `license` field in its manifest, only a
+# `license-file` pointer; its LICENSE text is a plain BSD-3-Clause
+# grant (Fuchsia/Google). Reached via the old rand 0.6 chain:
+# oximedia-bench -> statistical -> rand -> rand_os -> fuchsia-cprng.
+[[licenses.clarify]]
+crate = "fuchsia-cprng"
+expression = "BSD-3-Clause"
+license-files = [
+    { path = "LICENSE", hash = 0xf04ece33 },
+]

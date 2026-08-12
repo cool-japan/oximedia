@@ -40,13 +40,37 @@ impl VideoFrame {
     }
 
     /// Allocate planes for the frame format.
+    ///
+    /// Row stride is normally the plane width (historical behavior,
+    /// preserved exactly for every pre-existing format to avoid a
+    /// regression). Two families instead consult
+    /// [`PixelFormat::stride_for_width`] so the buffer is sized correctly:
+    /// packed formats that pack more than one byte per pixel into a single
+    /// plane ([`PixelFormat::Yuyv422`] / [`PixelFormat::Uyvy422`], both
+    /// 2 bytes/pixel 4:2:2), and the interleaved-UV chroma plane of the
+    /// 8-bit semi-planar formats ([`PixelFormat::Nv12`] /
+    /// [`PixelFormat::Nv21`]), whose byte width is the full luma width --
+    /// sizing it from the chroma *pixel* dimensions under-allocated it 2x.
+    /// (The 16-bit semi-planar formats `P010`/`P016` still take the legacy
+    /// path: their planes were equally under-sized, but no in-tree consumer
+    /// allocates them yet and resizing them here would silently change any
+    /// downstream code that has compensated for the historical behaviour.)
     pub fn allocate(&mut self) {
         let plane_count = self.format.plane_count();
         self.planes.clear();
 
         for i in 0..plane_count {
             let (width, height) = self.plane_dimensions(i as usize);
-            let stride = width as usize;
+            let use_stride_table =
+                matches!(self.format, PixelFormat::Yuyv422 | PixelFormat::Uyvy422)
+                    || (matches!(self.format, PixelFormat::Nv12 | PixelFormat::Nv21) && i == 1);
+            let stride = if use_stride_table {
+                self.format
+                    .stride_for_width(self.width, i)
+                    .unwrap_or(width as usize)
+            } else {
+                width as usize
+            };
             let size = stride * height as usize;
             let data = vec![0u8; size];
 
@@ -60,6 +84,11 @@ impl VideoFrame {
     }
 
     /// Get plane dimensions.
+    ///
+    /// Dimensions are in pixels, not bytes — for packed multi-byte-per-pixel
+    /// formats (e.g. [`PixelFormat::Yuyv422`], [`PixelFormat::Uyvy422`]) the
+    /// extra bytes per pixel are accounted for in the plane's `stride`
+    /// (see [`Self::allocate`]), not in these dimensions.
     #[must_use]
     pub fn plane_dimensions(&self, plane_index: usize) -> (u32, u32) {
         let (h_ratio, v_ratio) = self.format.chroma_subsampling();
@@ -346,6 +375,77 @@ mod tests {
         // Y: 1920 * 1080, U: 960 * 540, V: 960 * 540
         assert_eq!(frame.planes[0].data.len(), 1920 * 1080);
         assert_eq!(frame.planes[1].data.len(), 960 * 540);
+    }
+
+    /// Regression: pre-existing formats must allocate identically to
+    /// before the packed-4:2:2 stride fix was introduced.
+    #[test]
+    fn test_frame_allocate_yuv420p_64x48_unchanged() {
+        let mut frame = VideoFrame::new(PixelFormat::Yuv420p, 64, 48);
+        frame.allocate();
+        assert_eq!(frame.planes.len(), 3);
+        assert_eq!(frame.planes[0].data.len(), 64 * 48); // 3072
+        assert_eq!(frame.planes[1].data.len(), 32 * 24); // 768
+        assert_eq!(frame.planes[2].data.len(), 32 * 24); // 768
+        assert_eq!(frame.planes[0].stride, 64);
+        assert_eq!(frame.planes[1].stride, 32);
+        assert_eq!(frame.planes[2].stride, 32);
+    }
+
+    /// Regression for the packed 4:2:2 allocation bug: the old
+    /// `stride = width` computation allocated half the bytes actually
+    /// needed (2 bytes/pixel packed into one plane).
+    #[test]
+    fn test_frame_allocate_yuyv422_packed_stride() {
+        let mut frame = VideoFrame::new(PixelFormat::Yuyv422, 64, 48);
+        frame.allocate();
+        assert_eq!(frame.planes.len(), 1);
+        assert_eq!(frame.planes[0].data.len(), 64 * 48 * 2);
+        assert_eq!(frame.planes[0].data.len(), 6144);
+        assert_eq!(frame.planes[0].stride, 128);
+        assert_eq!(
+            frame.size_bytes(),
+            PixelFormat::Yuyv422.frame_buffer_size(64, 48)
+        );
+    }
+
+    #[test]
+    fn test_frame_allocate_semi_planar_chroma_full_byte_width() {
+        // Regression: the interleaved UV plane of NV12/NV21 is `width` BYTES
+        // wide (2 components x width/2 samples) at half height. Sizing it
+        // from the chroma pixel dimensions under-allocated it 2x, which
+        // surfaced as malformed NV12 frames from oximedia-capture's mock
+        // backend (the only in-tree caller that allocates semi-planar
+        // frames through this path).
+        for format in [PixelFormat::Nv12, PixelFormat::Nv21] {
+            let mut frame = VideoFrame::new(format, 64, 48);
+            frame.allocate();
+            assert_eq!(frame.planes.len(), 2, "{format:?}");
+            // Luma: unchanged legacy sizing.
+            assert_eq!(frame.planes[0].stride, 64, "{format:?}");
+            assert_eq!(frame.planes[0].data.len(), 64 * 48, "{format:?}");
+            // Chroma: full luma byte width at half height.
+            assert_eq!(frame.planes[1].stride, 64, "{format:?}");
+            assert_eq!(frame.planes[1].data.len(), 64 * 24, "{format:?}");
+            assert_eq!(
+                frame.size_bytes(),
+                format.frame_buffer_size(64, 48),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_frame_allocate_uyvy422_packed_stride() {
+        let mut frame = VideoFrame::new(PixelFormat::Uyvy422, 64, 48);
+        frame.allocate();
+        assert_eq!(frame.planes.len(), 1);
+        assert_eq!(frame.planes[0].data.len(), 6144);
+        assert_eq!(frame.planes[0].stride, 128);
+        assert_eq!(
+            frame.size_bytes(),
+            PixelFormat::Uyvy422.frame_buffer_size(64, 48)
+        );
     }
 
     #[test]

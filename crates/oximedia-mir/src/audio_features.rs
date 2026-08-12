@@ -1,7 +1,15 @@
 //! Audio feature extraction for Music Information Retrieval.
 //!
-//! Provides MFCC coefficient accumulation, a simplified log-mel spectrogram
-//! computation, and chroma vector analysis.
+//! Provides MFCC coefficient accumulation, log-mel spectrogram computation,
+//! and chroma vector analysis.
+//!
+//! The log-mel spectrogram is computed by
+//! [`oximedia_audio::spectrum::compute_log_mel_spectrogram`], which runs a real
+//! windowed FFT (via `oxifft`) through a triangular mel filterbank; this module
+//! only reshapes the result. An earlier revision of
+//! [`compute_log_mel_spectrogram`] returned a tensor in which every mel bin of a
+//! frame held the same frame RMS — that placeholder shadowed the real
+//! implementation and has been removed.
 
 #![allow(dead_code)]
 
@@ -97,63 +105,90 @@ impl MfccCoeffs {
 
 // ── compute_log_mel_spectrogram ────────────────────────────────────────────────
 
-/// Compute a simplified log-mel spectrogram from a mono audio signal.
+/// Default FFT window size relative to the hop length.
 ///
-/// This is an energy-based approximation: the signal is split into overlapping
-/// frames, the RMS energy of each frame is computed, and the result is spread
-/// across `n_mels` mel bins using equal interpolation.
+/// A window of four hops gives the usual 75 % overlap used for music analysis.
+const DEFAULT_WINDOW_HOPS: usize = 4;
+
+/// Compute a log-mel spectrogram from a mono audio signal.
+///
+/// Delegates to [`oximedia_audio::spectrum::compute_log_mel_spectrogram`] with
+/// an FFT window of `4 × hop_length` (75 % overlap) and reshapes the row-major
+/// result into per-frame vectors. Use
+/// [`compute_log_mel_spectrogram_with_fft`] to choose the window size
+/// explicitly.
+///
+/// # Conventions
+///
+/// * Mel scale: **HTK** — `mel = 2595 · log₁₀(1 + f / 700)`.
+/// * Filterbank: `n_mels` triangular filters spanning 0 Hz … Nyquist, applied
+///   to the power spectrum `|X[k]|²` of a Hann-windowed frame; **not**
+///   Slaney-normalised (filters peak at 1.0, so wide high-frequency bands
+///   integrate more energy than narrow low-frequency ones).
+/// * Frames are centre-padded with `n_fft / 2` zeros at both ends.
+/// * Compression: `ln(energy + 1e-10)` (natural log).
 ///
 /// # Arguments
-/// * `samples`     – mono audio samples (f32, any range).
-/// * `sample_rate` – sample rate in Hz (used for documentation / future use).
-/// * `n_mels`      – number of mel filter banks.
+/// * `samples`     – mono audio samples (f32, nominally in `[-1.0, 1.0]`).
+/// * `sample_rate` – sample rate in Hz; calibrates the filterbank frequencies.
+/// * `n_mels`      – number of mel filterbank channels.
 /// * `hop_length`  – hop length between frames in samples.
 ///
 /// # Returns
 ///
-/// A `Vec<Vec<f32>>` with shape `[n_frames][n_mels]`, log-energy values.
+/// A `Vec<Vec<f32>>` with shape `[n_frames][n_mels]` of log-energy values, or
+/// an empty vector if any argument is degenerate.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
 pub fn compute_log_mel_spectrogram(
     samples: &[f32],
-    _sample_rate: u32,
+    sample_rate: u32,
     n_mels: usize,
     hop_length: usize,
 ) -> Vec<Vec<f32>> {
-    if samples.is_empty() || n_mels == 0 || hop_length == 0 {
+    compute_log_mel_spectrogram_with_fft(
+        samples,
+        sample_rate,
+        n_mels,
+        hop_length.saturating_mul(DEFAULT_WINDOW_HOPS),
+        hop_length,
+    )
+}
+
+/// Compute a log-mel spectrogram with an explicit FFT window size.
+///
+/// See [`compute_log_mel_spectrogram`] for the mel/filterbank conventions.
+///
+/// # Arguments
+/// * `samples`     – mono audio samples (f32).
+/// * `sample_rate` – sample rate in Hz.
+/// * `n_mels`      – number of mel filterbank channels.
+/// * `n_fft`       – FFT window size in samples.
+/// * `hop_length`  – hop length between frames in samples.
+///
+/// # Returns
+///
+/// A `Vec<Vec<f32>>` with shape `[n_frames][n_mels]`.
+#[must_use]
+pub fn compute_log_mel_spectrogram_with_fft(
+    samples: &[f32],
+    sample_rate: u32,
+    n_mels: usize,
+    n_fft: usize,
+    hop_length: usize,
+) -> Vec<Vec<f32>> {
+    if samples.is_empty() || n_mels == 0 || hop_length == 0 || n_fft == 0 {
         return Vec::new();
     }
 
-    let hop = hop_length;
-    let n_frames = if samples.len() >= hop {
-        (samples.len() - 1) / hop + 1
-    } else {
-        1
-    };
+    let flat = oximedia_audio::spectrum::compute_log_mel_spectrogram(
+        samples,
+        sample_rate,
+        n_mels,
+        n_fft,
+        hop_length,
+    );
 
-    let mut spectrogram = Vec::with_capacity(n_frames);
-
-    for frame_idx in 0..n_frames {
-        let start = frame_idx * hop;
-        let end = (start + hop).min(samples.len());
-        let frame = &samples[start..end];
-
-        // Compute RMS energy of the frame
-        let rms = if frame.is_empty() {
-            0.0f32
-        } else {
-            let sum_sq: f32 = frame.iter().map(|&s| s * s).sum();
-            (sum_sq / frame.len() as f32).sqrt()
-        };
-
-        let log_energy = (rms + 1e-9).ln();
-
-        // Spread the log energy across all mel bins (simplified approximation)
-        let mel_frame = vec![log_energy; n_mels];
-        spectrogram.push(mel_frame);
-    }
-
-    spectrogram
+    flat.chunks_exact(n_mels).map(<[f32]>::to_vec).collect()
 }
 
 // ── ChromaVector ──────────────────────────────────────────────────────────────
@@ -326,10 +361,120 @@ mod tests {
         let samples = vec![0.0f32; 512];
         let result = compute_log_mel_spectrogram(&samples, 44100, 10, 512);
         assert!(!result.is_empty());
-        // log(0 + 1e-9) < 0
+        // ln(0 + 1e-10) < 0
         for &v in &result[0] {
             assert!(v < 0.0);
         }
+    }
+
+    /// HTK mel scale, as used by the underlying filterbank.
+    fn hz_to_mel(hz: f64) -> f64 {
+        2595.0 * (1.0 + hz / 700.0).log10()
+    }
+
+    /// Index of the triangular filter whose centre is closest to `hz`.
+    ///
+    /// Filter `i` is centred on mel point `i + 1` of `n_mels + 2` equally
+    /// spaced points spanning 0 Hz … Nyquist.
+    fn expected_mel_bin(hz: f64, sample_rate: u32, n_mels: usize) -> usize {
+        let max_mel = hz_to_mel(f64::from(sample_rate) / 2.0);
+        let step = max_mel / (n_mels + 1) as f64;
+        let centre_index = hz_to_mel(hz) / step;
+        (centre_index.round() as usize)
+            .saturating_sub(1)
+            .min(n_mels - 1)
+    }
+
+    /// A 1 kHz sine must concentrate its energy in the mel band containing
+    /// 1 kHz and leave distant bands near the log-epsilon floor.
+    ///
+    /// Regression guard: the previous implementation filled every mel bin of a
+    /// frame with the same frame RMS, so this peak/floor structure was absent.
+    #[test]
+    fn test_log_mel_spectrogram_1khz_sine_peaks_in_correct_band() {
+        const SR: u32 = 16_000;
+        const N_MELS: usize = 40;
+        const HOP: usize = 160;
+        const TONE_HZ: f64 = 1000.0;
+
+        let samples: Vec<f32> = (0..SR)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * TONE_HZ * f64::from(i) / f64::from(SR)).sin() as f32
+            })
+            .collect();
+
+        let spec = compute_log_mel_spectrogram(&samples, SR, N_MELS, HOP);
+        assert!(!spec.is_empty(), "spectrogram must not be empty");
+        assert_eq!(spec[0].len(), N_MELS);
+
+        // Average over the steady-state middle of the signal.
+        let mid = &spec[spec.len() / 2];
+
+        let (peak_bin, &peak_val) = mid
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .expect("non-empty frame");
+
+        let expected_bin = expected_mel_bin(TONE_HZ, SR, N_MELS);
+        assert!(
+            peak_bin.abs_diff(expected_bin) <= 1,
+            "1 kHz peak landed in mel bin {peak_bin}, expected {expected_bin} \
+             (frame = {mid:?})"
+        );
+
+        // Bins far from the tone must hold essentially no energy. ln(1e-10) is
+        // the floor; require at least 40 dB (≈ 9.2 nats of ln-power) below the
+        // peak for every bin more than 5 bins away.
+        let floor_margin = 9.2_f32;
+        for (bin, &v) in mid.iter().enumerate() {
+            if bin.abs_diff(peak_bin) > 5 {
+                assert!(
+                    v < peak_val - floor_margin,
+                    "mel bin {bin} = {v:.3} is not ≥40 dB below the {peak_val:.3} peak"
+                );
+            }
+        }
+    }
+
+    /// Neighbouring frequencies must land in different mel bands — i.e. the
+    /// output actually depends on frequency, not just on frame energy.
+    #[test]
+    fn test_log_mel_spectrogram_tracks_frequency() {
+        const SR: u32 = 16_000;
+        const N_MELS: usize = 40;
+        const HOP: usize = 160;
+
+        let peak_bin_for = |freq: f64| -> usize {
+            let samples: Vec<f32> = (0..SR)
+                .map(|i| {
+                    (2.0 * std::f64::consts::PI * freq * f64::from(i) / f64::from(SR)).sin() as f32
+                })
+                .collect();
+            let spec = compute_log_mel_spectrogram(&samples, SR, N_MELS, HOP);
+            let mid = &spec[spec.len() / 2];
+            mid.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map_or(0, |(i, _)| i)
+        };
+
+        let low = peak_bin_for(300.0);
+        let high = peak_bin_for(4000.0);
+        assert!(
+            high > low,
+            "4 kHz must peak in a higher mel bin than 300 Hz (got {high} vs {low})"
+        );
+    }
+
+    /// The explicit-window entry point must honour its `n_fft` argument.
+    #[test]
+    fn test_log_mel_spectrogram_with_fft_shape() {
+        let samples = vec![0.05f32; 16_000];
+        let spec = compute_log_mel_spectrogram_with_fft(&samples, 16_000, 80, 400, 160);
+        // Centre padding: (16000 + 400 - 400) / 160 + 1 = 101 frames.
+        assert_eq!(spec.len(), 101);
+        assert_eq!(spec[0].len(), 80);
     }
 
     // ── ChromaVector ────────────────────────────────────────────────────────────

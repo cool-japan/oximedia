@@ -18,6 +18,21 @@
 //! For any other sample rate they are computed analytically from the analogue prototype
 //! via the bilinear transform with frequency pre-warping.
 //!
+//! # Channel summation
+//!
+//! ITU-R BS.1770-4 §2 defines loudness as
+//!
+//! ```text
+//! L = −0.691 + 10·log₁₀( Σ_ch G_ch · z_ch )
+//! ```
+//!
+//! where `z_ch` is the mean square of the K-weighted signal of channel `ch` and
+//! `G_ch` is that channel's weight (Table 2). The weighted channel powers are
+//! **summed**, never averaged: there is no division by the channel count or by
+//! the sum of the weights. Consequently a dual-mono stereo programme reads
+//! exactly 10·log₁₀(2) = 3.01 LU **above** the identical mono programme, which
+//! is the intended behaviour of the standard.
+//!
 //! # Gating
 //!
 //! Integrated loudness uses the two-stage gating algorithm of ITU-R BS.1771:
@@ -434,8 +449,12 @@ pub struct EbuR128Meter {
     /// One K-weighting filter per channel.
     k_filters: Vec<KWeightingFilter>,
 
-    /// Per-channel sample accumulator for the current 100 ms hop block.
-    hop_accumulator: Vec<f64>,
+    /// Weighted K-filtered energy accumulated over the current 100 ms hop.
+    ///
+    /// This is `Σ_frames Σ_ch G_ch · y_ch[n]²` — already summed across channels
+    /// per ITU-R BS.1770-4 §2, so dividing it by the hop length yields
+    /// `Σ_ch G_ch · z_ch` directly.
+    hop_energy: f64,
     /// Count of samples accumulated in the current hop.
     hop_count: usize,
     /// Size of a 100 ms hop in samples.
@@ -470,14 +489,12 @@ pub struct EbuR128Meter {
     /// Per-hop power values used to assemble 400 ms gating blocks (4 hops = 1 block).
     hop_powers: VecDeque<f64>,
 
-    /// True peak detector.
-    tp_detector: TruePeakDetector,
+    /// True peak detectors, one per channel (ITU-R BS.1770-4 §6: the reported
+    /// true peak is the maximum across all channels).
+    tp_detectors: Vec<TruePeakDetector>,
 
     /// Channel weighting factors per ITU-R BS.1770-4 Table 2.
     channel_weights: Vec<f64>,
-
-    /// Running sum of channel weights (used to normalise loudness).
-    weight_sum: f64,
 }
 
 impl EbuR128Meter {
@@ -502,13 +519,12 @@ impl EbuR128Meter {
         let short_term_cap_hops = 30; // 30 × 100 ms = 3 000 ms
 
         let channel_weights = Self::channel_weights(channels_usize);
-        let weight_sum: f64 = channel_weights.iter().sum();
 
         Self {
             sample_rate,
             channels,
             k_filters,
-            hop_accumulator: vec![0.0; channels_usize],
+            hop_energy: 0.0,
             hop_count: 0,
             hop_size,
             momentary_buf: VecDeque::new(),
@@ -523,9 +539,10 @@ impl EbuR128Meter {
             short_term_max: f64::NEG_INFINITY,
             gating_blocks: Vec::new(),
             hop_powers: VecDeque::new(),
-            tp_detector: TruePeakDetector::new(sample_rate),
+            tp_detectors: (0..channels_usize.max(1))
+                .map(|_| TruePeakDetector::new(sample_rate))
+                .collect(),
             channel_weights,
-            weight_sum,
         }
     }
 
@@ -542,17 +559,20 @@ impl EbuR128Meter {
         for frame in 0..frames {
             let base = frame * channels;
 
-            // K-weight each channel, accumulate weighted mean square.
-            let mut hop_ms = 0.0;
+            // K-weight each channel, accumulate the *weighted sum* of squared
+            // samples across channels (ITU-R BS.1770-4 §2 — a sum, not a mean),
+            // and run the oversampled true-peak detector on every channel.
+            let mut frame_energy = 0.0;
             for ch in 0..channels {
-                let s = f64::from(samples[base + ch]);
+                let raw = samples[base + ch];
+                let s = f64::from(raw);
                 let kw = self.k_filters[ch].process(s);
-                hop_ms += kw * kw * self.channel_weights[ch];
+                frame_energy += kw * kw * self.channel_weights[ch];
+                if let Some(detector) = self.tp_detectors.get_mut(ch) {
+                    detector.process_sample(raw);
+                }
             }
-            self.hop_accumulator[0] += hop_ms; // sum across channels into [0]
-
-            // True peak on the first channel (or the max channel if mono).
-            self.tp_detector.process_sample(samples[base]);
+            self.hop_energy += frame_energy;
 
             self.hop_count += 1;
 
@@ -569,13 +589,14 @@ impl EbuR128Meter {
             return;
         }
 
-        // Mean-square power for this hop, normalised by channel weight sum.
-        let raw_sum = self.hop_accumulator[0];
-        let hop_power = if self.weight_sum > 0.0 {
-            raw_sum / (n as f64 * self.weight_sum)
-        } else {
-            0.0
-        };
+        // Loudness power for this hop: `Σ_ch G_ch · z_ch`, where `z_ch` is the
+        // per-channel mean square of the K-weighted signal.
+        //
+        // ITU-R BS.1770-4 §2 sums the weighted channel powers; it does **not**
+        // average them. Dividing by the channel count (or by the sum of the
+        // channel weights, as an earlier revision did) makes dual-mono stereo
+        // read 3.01 LU too low. Only the time average over the hop is taken.
+        let hop_power = self.hop_energy / n as f64;
 
         // ── Momentary window (4 hops) ─────────────────────────────────────────
         self.momentary_buf.push_back(hop_power);
@@ -622,9 +643,7 @@ impl EbuR128Meter {
         }
 
         // Reset hop accumulator.
-        for v in &mut self.hop_accumulator {
-            *v = 0.0;
-        }
+        self.hop_energy = 0.0;
         self.hop_count = 0;
     }
 
@@ -741,9 +760,24 @@ impl EbuR128Meter {
         rel_gated[idx95] - rel_gated[idx10]
     }
 
-    /// Maximum true peak in dBTP detected since creation or last reset.
+    /// Maximum true peak in dBTP across **all** channels, detected since
+    /// creation or the last reset.
     pub fn true_peak_dbtp(&self) -> f64 {
-        self.tp_detector.max_true_peak_dbtp()
+        self.tp_detectors
+            .iter()
+            .map(TruePeakDetector::max_true_peak_dbtp)
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// Per-channel maximum true peak in dBTP, in channel order.
+    ///
+    /// Channels that have never seen a non-zero sample report
+    /// `f64::NEG_INFINITY`.
+    pub fn channel_true_peaks_dbtp(&self) -> Vec<f64> {
+        self.tp_detectors
+            .iter()
+            .map(TruePeakDetector::max_true_peak_dbtp)
+            .collect()
     }
 
     /// Reset all measurements.
@@ -751,9 +785,7 @@ impl EbuR128Meter {
         for f in &mut self.k_filters {
             f.reset();
         }
-        for v in &mut self.hop_accumulator {
-            *v = 0.0;
-        }
+        self.hop_energy = 0.0;
         self.hop_count = 0;
         self.momentary_buf.clear();
         self.short_term_buf.clear();
@@ -765,12 +797,17 @@ impl EbuR128Meter {
         self.short_term_max = f64::NEG_INFINITY;
         self.gating_blocks.clear();
         self.hop_powers.clear();
-        self.tp_detector.reset();
+        for detector in &mut self.tp_detectors {
+            detector.reset();
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Convert mean-square power to LUFS: L = −0.691 + 10 · log₁₀(P).
+    /// Convert loudness power to LUFS: `L = −0.691 + 10 · log₁₀(P)`.
+    ///
+    /// `power` must already be the **weighted sum across channels** of the
+    /// per-channel mean squares (`Σ_ch G_ch · z_ch`), not a per-channel average.
     #[inline]
     fn power_to_lufs(power: f64) -> f64 {
         if power > 0.0 {
@@ -1235,6 +1272,142 @@ mod tests {
         );
     }
 
+    // ── ITU-R BS.1770-4 channel-summation conformance ─────────────────────────
+    //
+    // BS.1770-4 §2 defines loudness as −0.691 + 10·log₁₀(Σ_ch G_ch·z_ch): the
+    // weighted per-channel mean squares are **summed**. An earlier revision of
+    // this meter divided the summed energy by the sum of the channel weights,
+    // which made every dual-mono stereo programme read 3.01 LU too low (and
+    // therefore over-amplified BGM during loudness normalisation).
+
+    /// 10·log₁₀(2) — the exact loudness offset between a mono programme and the
+    /// dual-mono stereo programme built from it.
+    const DUAL_MONO_OFFSET_LU: f64 = 3.010_299_956_639_812;
+
+    /// A dual-mono stereo signal must read exactly +3.01 LU above the identical
+    /// mono signal, for **momentary** loudness.
+    #[test]
+    fn test_dual_mono_stereo_reads_plus_3db_momentary() {
+        let sr = 48_000_u32;
+        let mono = mono_sine(997.0, -20.0, sr, sr as usize);
+        let stereo: Vec<f32> = mono.iter().flat_map(|&s| [s, s]).collect();
+
+        let mut mono_meter = EbuR128Meter::new(sr, 1);
+        mono_meter.process(&mono);
+        let mono_m = mono_meter.momentary_lufs();
+
+        let mut stereo_meter = EbuR128Meter::new(sr, 2);
+        stereo_meter.process(&stereo);
+        let stereo_m = stereo_meter.momentary_lufs();
+
+        assert!(
+            mono_m.is_finite() && stereo_m.is_finite(),
+            "both meters must produce a momentary reading (mono={mono_m}, stereo={stereo_m})"
+        );
+
+        let delta = stereo_m - mono_m;
+        assert!(
+            (delta - DUAL_MONO_OFFSET_LU).abs() <= 0.05,
+            "dual-mono stereo momentary must be +3.01 LU above mono; \
+             mono={mono_m:.4} LUFS, stereo={stereo_m:.4} LUFS, Δ={delta:.4} LU"
+        );
+    }
+
+    /// Same conformance requirement for **integrated** loudness (the value the
+    /// normalisation stage acts on).
+    #[test]
+    fn test_dual_mono_stereo_reads_plus_3db_integrated() {
+        let sr = 48_000_u32;
+        let mono = mono_sine(997.0, -20.0, sr, sr as usize * 2);
+        let stereo: Vec<f32> = mono.iter().flat_map(|&s| [s, s]).collect();
+
+        let mut mono_meter = EbuR128Meter::new(sr, 1);
+        mono_meter.process(&mono);
+        let mono_i = mono_meter.integrated_lufs();
+
+        let mut stereo_meter = EbuR128Meter::new(sr, 2);
+        stereo_meter.process(&stereo);
+        let stereo_i = stereo_meter.integrated_lufs();
+
+        assert!(
+            mono_i.is_finite() && stereo_i.is_finite(),
+            "both meters must produce an integrated reading (mono={mono_i}, stereo={stereo_i})"
+        );
+
+        let delta = stereo_i - mono_i;
+        assert!(
+            (delta - DUAL_MONO_OFFSET_LU).abs() <= 0.05,
+            "dual-mono stereo integrated must be +3.01 LU above mono; \
+             mono={mono_i:.4} LUFS, stereo={stereo_i:.4} LUFS, Δ={delta:.4} LU"
+        );
+    }
+
+    /// Absolute calibration of the stereo case.
+    ///
+    /// A 997 Hz sine at −20 dBFS peak has a per-channel mean square of
+    /// 10^(−2)/2, i.e. −23.01 dBFS RMS. K-weighting is +0.691 dB at 997 Hz,
+    /// which exactly cancels the −0.691 LUFS calibration offset, so the mono
+    /// reading is −23.01 LUFS. Summing two identical channels adds
+    /// 10·log₁₀(2) = 3.01 LU → **−20.00 LUFS**.
+    ///
+    /// This pins the sign of the fix: with the old divide-by-weight-sum the
+    /// same signal read −23.01 LUFS, identical to mono.
+    #[test]
+    fn test_stereo_absolute_calibration_997hz_minus20dbfs() {
+        let sr = 48_000_u32;
+        let mono = mono_sine(997.0, -20.0, sr, sr as usize * 2);
+        let stereo: Vec<f32> = mono.iter().flat_map(|&s| [s, s]).collect();
+
+        let mut meter = EbuR128Meter::new(sr, 2);
+        meter.process(&stereo);
+
+        let i = meter.integrated_lufs();
+        assert!(
+            (i - (-20.0)).abs() < 0.2,
+            "dual-mono stereo −20 dBFS sine should read ≈ −20.0 LUFS, got {i:.3}"
+        );
+    }
+
+    /// Mono calibration must be untouched by the channel-summation fix:
+    /// a 997 Hz mono sine at −20 dBFS peak still reads ≈ −23.01 LUFS
+    /// (−3.01 dB sine crest, K-weighting +0.691 dB cancelling the −0.691 offset).
+    #[test]
+    fn test_mono_absolute_calibration_unchanged_997hz_minus20dbfs() {
+        let sr = 48_000_u32;
+        let mut meter = EbuR128Meter::new(sr, 1);
+        meter.process(&mono_sine(997.0, -20.0, sr, sr as usize * 2));
+
+        let i = meter.integrated_lufs();
+        assert!(
+            (i - (-23.01)).abs() < 0.2,
+            "mono −20 dBFS sine should still read ≈ −23.01 LUFS, got {i:.3}"
+        );
+    }
+
+    /// The −10 LU relative gate must still exclude quiet material.
+    ///
+    /// 5 s at −20 dBFS followed by 5 s at −60 dBFS: the quiet half sits well
+    /// above the −70 LUFS absolute gate, so only the relative gate can remove
+    /// it. With the relative gate working, the integrated value tracks the loud
+    /// half (≈ −23.01 LUFS); without it, the two halves average in power and the
+    /// reading drops by ≈ 3 LU.
+    #[test]
+    fn test_relative_gate_excludes_quiet_section() {
+        let sr = 48_000_u32;
+        let mut samples = mono_sine(997.0, -20.0, sr, sr as usize * 5);
+        samples.extend(mono_sine(997.0, -60.0, sr, sr as usize * 5));
+
+        let mut meter = EbuR128Meter::new(sr, 1);
+        meter.process(&samples);
+
+        let i = meter.integrated_lufs();
+        assert!(
+            (i - (-23.01)).abs() < 0.3,
+            "the −10 LU relative gate should exclude the −60 dBFS half, \
+             leaving ≈ −23.01 LUFS; got {i:.3}"
+        );
+    }
+
     #[test]
     fn test_short_term_lufs_valid_after_3s() {
         let sr = 48_000_u32;
@@ -1337,6 +1510,46 @@ mod tests {
         assert!(
             (lra - 15.0).abs() <= 1.0,
             "EBU Tech 3342 case 4: expected LRA = 15 ±1 LU, got {lra:.2} LU"
+        );
+    }
+
+    /// True peak must be measured on **every** channel, not just channel 0.
+    ///
+    /// Regression guard: the detector used to run on `samples[base]` only, so a
+    /// loud right channel next to a quiet left channel was reported at the left
+    /// channel's level.
+    #[test]
+    fn test_true_peak_uses_all_channels() {
+        let sr = 48_000_u32;
+        let mut meter = EbuR128Meter::new(sr, 2);
+
+        // L = −40 dBFS, R = −6 dBFS (interleaved).
+        let left = mono_sine(997.0, -40.0, sr, sr as usize / 2);
+        let right = mono_sine(997.0, -6.0, sr, sr as usize / 2);
+        let stereo: Vec<f32> = left
+            .iter()
+            .zip(right.iter())
+            .flat_map(|(&l, &r)| [l, r])
+            .collect();
+        meter.process(&stereo);
+
+        let tp = meter.true_peak_dbtp();
+        assert!(
+            (tp - (-6.0)).abs() < 1.0,
+            "true peak must follow the loudest channel (−6 dBTP), got {tp:.2} dBTP"
+        );
+
+        let per_channel = meter.channel_true_peaks_dbtp();
+        assert_eq!(per_channel.len(), 2, "one true peak per channel");
+        assert!(
+            (per_channel[0] - (-40.0)).abs() < 1.0,
+            "left channel true peak = {:.2} dBTP, expected ≈ −40",
+            per_channel[0]
+        );
+        assert!(
+            (per_channel[1] - (-6.0)).abs() < 1.0,
+            "right channel true peak = {:.2} dBTP, expected ≈ −6",
+            per_channel[1]
         );
     }
 

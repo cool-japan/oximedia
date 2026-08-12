@@ -146,6 +146,15 @@ pub struct UncompressedHeader {
     pub tile_cols_log2: u8,
     /// log2 of tile rows.
     pub tile_rows_log2: u8,
+    /// Which of the three references the frame size was copied from, when
+    /// `frame_size_with_refs` signalled `found_ref` (spec §6.2.5; libvpx
+    /// `setup_frame_size_with_refs`).
+    ///
+    /// `Some(i)` means `width`/`height` are the display dimensions of the
+    /// reference in slot `ref_frame_idx[i]`, taken from the decoded-picture
+    /// buffer passed to [`UncompressedHeader::parse_with_ref_sizes`], not
+    /// coded in this frame. `None` means the frame coded its own size.
+    pub size_from_ref: Option<usize>,
     /// Size of the compressed header in bytes (`header_size_in_bytes`).
     pub compressed_header_size: u16,
     /// Byte size of the uncompressed header (offset of the compressed
@@ -155,21 +164,36 @@ pub struct UncompressedHeader {
 
 /// Loop filter fields of the uncompressed header (spec `loop_filter_params`).
 ///
-/// For keyframes the mode/ref deltas start from the
-/// `vp9_setup_past_independence` defaults (`set_default_lf_deltas`:
-/// ref `[1, 0, -1, -1]`, mode `[0, 0]`) and are then optionally updated.
+/// The mode/ref deltas are **persistent decoder state**, not per-frame data:
+/// libvpx `setup_loopfilter` assigns only the entries a frame individually
+/// flags, and only when `delta_enabled && delta_update`, leaving every other
+/// entry at whatever the last frame that wrote it left behind. Parsing stays
+/// pure — the values here start from the `vp9_setup_past_independence`
+/// defaults (`set_default_lf_deltas`: ref `[1, 0, -1, -1]`, mode `[0, 0]`),
+/// and [`ref_delta_updated`](Self::ref_delta_updated) /
+/// [`mode_delta_updated`](Self::mode_delta_updated) record exactly which
+/// entries this frame transmitted, so the decoder can merge them into the
+/// persistent set.
 #[derive(Clone, Debug)]
 pub struct LoopFilterHeader {
     /// Base filter level (0..=63).
     pub filter_level: u8,
     /// Sharpness level (0..=7).
     pub sharpness: u8,
-    /// Mode/ref delta enabled flag.
+    /// Mode/ref delta enabled flag (`mode_ref_delta_enabled`).
     pub delta_enabled: bool,
+    /// Whether this frame transmits any delta update at all
+    /// (`mode_ref_delta_update`); always `false` when `delta_enabled` is
+    /// clear, since the bit is not coded then.
+    pub delta_update: bool,
     /// Reference deltas (INTRA, LAST, GOLDEN, ALTREF).
     pub ref_deltas: [i8; 4],
     /// Mode deltas.
     pub mode_deltas: [i8; 2],
+    /// Which reference deltas this frame actually transmitted.
+    pub ref_delta_updated: [bool; 4],
+    /// Which mode deltas this frame actually transmitted.
+    pub mode_delta_updated: [bool; 2],
 }
 
 impl Default for LoopFilterHeader {
@@ -178,8 +202,11 @@ impl Default for LoopFilterHeader {
             filter_level: 0,
             sharpness: 0,
             delta_enabled: true,
+            delta_update: false,
             ref_deltas: [1, 0, -1, -1],
             mode_deltas: [0, 0],
+            ref_delta_updated: [false; 4],
+            mode_delta_updated: [false; 2],
         }
     }
 }
@@ -209,12 +236,22 @@ impl QuantHeader {
 }
 
 /// Segmentation fields of the uncompressed header.
+///
+/// Like the loop-filter deltas, `feature_enabled`/`feature_data`/`abs_delta`
+/// are persistent decoder state: libvpx `setup_segmentation` clears and
+/// re-reads the whole feature set only when
+/// [`update_data`](Self::update_data) is signalled, and leaves it untouched
+/// otherwise. The parser fills in this frame's transmitted values;
+/// `Vp9DecState::apply_segmentation_data` merges them.
 #[derive(Clone, Debug)]
 pub struct SegmentationHeader {
     /// Segmentation enabled.
     pub enabled: bool,
     /// Segment map update flag.
     pub update_map: bool,
+    /// Whether this frame retransmits the per-segment feature data
+    /// (`segmentation_update_data`). `false` means inherit.
+    pub update_data: bool,
     /// Segment tree probabilities.
     pub tree_probs: [u8; 7],
     /// Temporal update flag.
@@ -235,6 +272,7 @@ impl Default for SegmentationHeader {
         Self {
             enabled: false,
             update_map: false,
+            update_data: false,
             tree_probs: [255; 7],
             temporal_update: false,
             pred_probs: [255; 3],
@@ -248,13 +286,44 @@ impl Default for SegmentationHeader {
 impl UncompressedHeader {
     const SYNC_BYTES: [u8; 3] = [0x49, 0x83, 0x42];
 
-    /// Parses the uncompressed header from bitstream data.
+    /// Parses the uncompressed header from bitstream data, with no
+    /// decoded-picture buffer available.
+    ///
+    /// Equivalent to [`Self::parse_with_ref_sizes`] with every reference slot
+    /// empty. An inter frame that copies its size from a reference
+    /// (`frame_size_with_refs` with `found_ref` set) therefore fails here —
+    /// that frame's dimensions are simply not in its own bitstream. Use
+    /// [`Self::parse_with_ref_sizes`] whenever a decoder state exists.
     ///
     /// # Errors
     ///
     /// Returns error if the header is invalid.
-    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     pub fn parse(data: &[u8]) -> CodecResult<Self> {
+        Self::parse_with_ref_sizes(data, &[None; 8])
+    }
+
+    /// Parses the uncompressed header, resolving a `frame_size_with_refs`
+    /// size copy against the decoded-picture buffer.
+    ///
+    /// `ref_sizes[i]` is the display size (`y_crop_width` / `y_crop_height`)
+    /// currently held by reference slot `i`, or `None` if the slot is empty;
+    /// there are eight slots (`refresh_frame_flags` is `f(8)`).
+    ///
+    /// The sizes have to be known *during* the parse, not patched in
+    /// afterwards: `render_size()` copies `width`/`height` when it signals
+    /// "same as frame size", and `tile_info()` derives *how many bits it
+    /// reads* from the frame width, so a header parsed with a placeholder
+    /// size desynchronises the bitstream from that point on.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the header is invalid, or if it copies its size from
+    /// a reference slot that holds no decoded frame.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    pub fn parse_with_ref_sizes(
+        data: &[u8],
+        ref_sizes: &[Option<(u32, u32)>; 8],
+    ) -> CodecResult<Self> {
         let mut reader = BitReader::new(data);
         let mut header = Self::default();
 
@@ -280,6 +349,21 @@ impl UncompressedHeader {
 
         if header.show_existing_frame {
             header.frame_to_show = reader.read_bits(3).map_err(CodecError::Core)? as u8;
+            // The three values the specification *assigns* on this path
+            // (§6.2 `uncompressed_header`: `refresh_frame_flags = 0`,
+            // `loop_filter_level = 0`, `header_size_in_bytes = 0`) plus
+            // libvpx's explicit `cm->show_frame = 1`
+            // (`vp9_decodeframe.c:2677-2679`). None of them is coded, so
+            // every one is set here rather than left to `derive(Default)` —
+            // `show_frame` in particular does *not* default to the right
+            // value, and it is read downstream: `use_prev_frame_mvs` tests
+            // `last_show_frame`, and a caller that mirrors this header into
+            // its own bookkeeping would otherwise record a shown frame as
+            // hidden.
+            header.refresh_frame_flags = 0;
+            header.loop_filter.filter_level = 0;
+            header.compressed_header_size = 0;
+            header.show_frame = true;
             return Ok(header);
         }
 
@@ -327,7 +411,8 @@ impl UncompressedHeader {
                     header.ref_frame_sign_bias[i + 1] =
                         reader.read_bit().map_err(CodecError::Core)? != 0;
                 }
-                let found_ref = Self::parse_frame_size_with_refs(&mut reader, &mut header)?;
+                let found_ref =
+                    Self::parse_frame_size_with_refs(&mut reader, &mut header, ref_sizes)?;
                 if !found_ref {
                     Self::parse_frame_size(&mut reader, &mut header)?;
                 }
@@ -385,16 +470,18 @@ impl UncompressedHeader {
         lf.sharpness = reader.read_bits(3).map_err(CodecError::Core)? as u8;
         lf.delta_enabled = reader.read_bit().map_err(CodecError::Core)? != 0;
         if lf.delta_enabled {
-            let delta_update = reader.read_bit().map_err(CodecError::Core)? != 0;
-            if delta_update {
+            lf.delta_update = reader.read_bit().map_err(CodecError::Core)? != 0;
+            if lf.delta_update {
                 for i in 0..4 {
                     if reader.read_bit().map_err(CodecError::Core)? != 0 {
                         lf.ref_deltas[i] = Self::read_signed_literal(reader, 6)? as i8;
+                        lf.ref_delta_updated[i] = true;
                     }
                 }
                 for i in 0..2 {
                     if reader.read_bit().map_err(CodecError::Core)? != 0 {
                         lf.mode_deltas[i] = Self::read_signed_literal(reader, 6)? as i8;
+                        lf.mode_delta_updated[i] = true;
                     }
                 }
             }
@@ -456,8 +543,8 @@ impl UncompressedHeader {
             }
         }
 
-        if reader.read_bit().map_err(CodecError::Core)? != 0 {
-            // update_data
+        seg.update_data = reader.read_bit().map_err(CodecError::Core)? != 0;
+        if seg.update_data {
             seg.abs_delta = reader.read_bit().map_err(CodecError::Core)? != 0;
             for s in 0..8 {
                 for f in 0..4 {
@@ -589,14 +676,50 @@ impl UncompressedHeader {
         Ok(())
     }
 
+    /// Spec `frame_size_with_refs()` (libvpx `setup_frame_size_with_refs`).
+    ///
+    /// Reads up to three `found_ref` bits; the first set bit adopts the
+    /// display size of the reference it names and stops the scan:
+    ///
+    /// ```c
+    /// for (i = 0; i < REFS_PER_FRAME; ++i) {
+    ///   if (vpx_rb_read_bit(rb)) {
+    ///     YV12_BUFFER_CONFIG *const buf = cm->frame_refs[i].buf;
+    ///     width = buf->y_crop_width;
+    ///     height = buf->y_crop_height;
+    ///     found = 1;
+    ///     break;
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// Returns `true` when a reference supplied the size (so the caller must
+    /// not read an explicit `frame_size()`).
     fn parse_frame_size_with_refs(
         reader: &mut BitReader<'_>,
-        _header: &mut Self,
+        header: &mut Self,
+        ref_sizes: &[Option<(u32, u32)>; 8],
     ) -> CodecResult<bool> {
-        for _ in 0..3 {
-            if reader.read_bit().map_err(CodecError::Core)? != 0 {
-                return Ok(true);
+        for i in 0..3 {
+            if reader.read_bit().map_err(CodecError::Core)? == 0 {
+                continue;
             }
+            let slot = usize::from(header.ref_frame_idx[i]);
+            let (width, height) = ref_sizes.get(slot).copied().flatten().ok_or_else(|| {
+                CodecError::InvalidBitstream(format!(
+                    "VP9: frame_size_with_refs takes the frame size from \
+                     reference {i} (slot {slot}), which holds no decoded frame"
+                ))
+            })?;
+            if width == 0 || height == 0 {
+                return Err(CodecError::InvalidBitstream(format!(
+                    "VP9: reference slot {slot} has invalid dimensions {width}x{height}"
+                )));
+            }
+            header.width = width;
+            header.height = height;
+            header.size_from_ref = Some(i);
+            return Ok(true);
         }
         Ok(false)
     }
@@ -661,5 +784,206 @@ mod tests {
         header.subsampling_x = true;
         header.subsampling_y = true;
         assert_eq!(header.chroma_subsampling(), (2, 2));
+    }
+
+    /// Real libvpx-vp9 inter frame (frame 1 of a 3-frame 76x42 encode) whose
+    /// `frame_size_with_refs` sets `found_ref` on reference 0 — i.e. its
+    /// dimensions live in the decoded-picture buffer, not in its own bits.
+    const INTER_FRAME_76X42: &[u8] = include_bytes!("dec/testdata/seq76x42.frame1.bin");
+    /// Real libvpx-vp9 key frame, 76x42, crf 24.
+    const KEYFRAME_76X42: &[u8] = include_bytes!("dec/testdata/kf76x42.frame0.bin");
+
+    #[test]
+    fn test_frame_size_with_refs_records_index_and_copies_dimensions() {
+        let mut refs = [None; 8];
+        refs[0] = Some((76, 42));
+
+        let hdr = UncompressedHeader::parse_with_ref_sizes(INTER_FRAME_76X42, &refs)
+            .expect("inter header parses against a populated DPB");
+
+        assert_eq!(hdr.size_from_ref, Some(0), "found_ref on reference 0");
+        assert_eq!((hdr.width, hdr.height), (76, 42));
+        assert_eq!(
+            (hdr.render_width, hdr.render_height),
+            (76, 42),
+            "render_size() copies the frame size when it signals 'same'"
+        );
+        assert!(!hdr.is_keyframe() && !hdr.is_intra_only());
+        assert!(
+            hdr.compressed_header_size > 0 && hdr.uncompressed_header_bytes > 0,
+            "the sections after frame_size_with_refs must still parse"
+        );
+    }
+
+    #[test]
+    fn test_frame_size_with_refs_takes_the_slot_dimensions_not_a_guess() {
+        // The size genuinely comes from the referenced slot: point that slot
+        // at different dimensions and the parsed frame size follows.
+        let mut refs = [None; 8];
+        refs[0] = Some((320, 240));
+
+        let hdr = UncompressedHeader::parse_with_ref_sizes(INTER_FRAME_76X42, &refs)
+            .expect("header parses");
+
+        assert_eq!(hdr.size_from_ref, Some(0));
+        assert_eq!((hdr.width, hdr.height), (320, 240));
+        assert_eq!((hdr.render_width, hdr.render_height), (320, 240));
+    }
+
+    #[test]
+    fn test_frame_size_with_refs_without_the_slot_is_an_honest_error() {
+        let err = UncompressedHeader::parse(INTER_FRAME_76X42)
+            .expect_err("size copied from an absent reference cannot be invented");
+        match err {
+            CodecError::InvalidBitstream(msg) => {
+                assert!(msg.contains("frame_size_with_refs"), "{msg}");
+                assert!(msg.contains("no decoded frame"), "{msg}");
+            }
+            other => panic!("expected InvalidBitstream, got {other:?}"),
+        }
+
+        // An empty slot at the referenced index is the same failure.
+        let mut refs = [None; 8];
+        refs[1] = Some((76, 42));
+        assert!(UncompressedHeader::parse_with_ref_sizes(INTER_FRAME_76X42, &refs).is_err());
+    }
+
+    #[test]
+    fn test_frame_size_with_refs_rejects_a_zero_sized_slot() {
+        let mut refs = [None; 8];
+        refs[0] = Some((0, 0));
+        let err = UncompressedHeader::parse_with_ref_sizes(INTER_FRAME_76X42, &refs)
+            .expect_err("a 0x0 reference is not a usable frame size");
+        match err {
+            CodecError::InvalidBitstream(msg) => {
+                assert!(msg.contains("invalid dimensions"), "{msg}");
+            }
+            other => panic!("expected InvalidBitstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_keyframe_size_is_coded_not_copied() {
+        let hdr = UncompressedHeader::parse(KEYFRAME_76X42).expect("keyframe parses");
+        assert_eq!(hdr.size_from_ref, None, "key frames code their own size");
+        assert_eq!((hdr.width, hdr.height), (76, 42));
+    }
+
+    #[test]
+    fn test_loop_filter_delta_update_flags_track_transmitted_entries() {
+        let hdr = UncompressedHeader::parse(KEYFRAME_76X42).expect("keyframe parses");
+        let lf = &hdr.loop_filter;
+
+        if !lf.delta_update {
+            assert_eq!(
+                lf.ref_delta_updated, [false; 4],
+                "no delta payload was coded, so nothing may be flagged as transmitted"
+            );
+            assert_eq!(lf.mode_delta_updated, [false; 2]);
+            assert_eq!(
+                (lf.ref_deltas, lf.mode_deltas),
+                ([1, 0, -1, -1], [0, 0]),
+                "un-transmitted deltas stay at the set_default_lf_deltas values"
+            );
+        }
+        if !lf.delta_enabled {
+            assert!(
+                !lf.delta_update,
+                "the update bit is not coded when disabled"
+            );
+        }
+        // Any entry that differs from the default must have been transmitted.
+        for (i, (&d, &flagged)) in lf
+            .ref_deltas
+            .iter()
+            .zip(lf.ref_delta_updated.iter())
+            .enumerate()
+        {
+            if d != [1, 0, -1, -1][i] {
+                assert!(flagged, "ref delta {i} changed without being flagged");
+            }
+        }
+    }
+
+    /// The one-byte `show_existing_frame` packet from libvpx's
+    /// `vp90-2-16-intra-only.webm` (frame marker `10`, profile 0,
+    /// `show_existing_frame = 1`, `frame_to_show_map_idx = 0`).
+    const SHOW_EXISTING_SLOT0: &[u8] = include_bytes!("dec/testdata/p9io.frame1.bin");
+
+    /// Every field the specification *assigns* on the `show_existing_frame`
+    /// path must be assigned, not left to `derive(Default)` — §6.2
+    /// `uncompressed_header` sets `refresh_frame_flags = 0`,
+    /// `loop_filter_level = 0` and `header_size_in_bytes = 0`, and libvpx
+    /// additionally sets `cm->show_frame = 1` (`vp9_decodeframe.c:2677-2679`).
+    ///
+    /// `show_frame` is the one that bites: its `Default` is `false`, which is
+    /// the *opposite* of the truth for a packet whose entire purpose is to
+    /// display a frame, and `Vp9DecState::use_prev_frame_mvs` reads a
+    /// `last_show_frame` derived from it.
+    #[test]
+    fn test_show_existing_frame_assigns_every_derived_field() {
+        assert_eq!(SHOW_EXISTING_SLOT0, &[0x88], "the fixture is that one byte");
+        let hdr = UncompressedHeader::parse(SHOW_EXISTING_SLOT0)
+            .expect("a show_existing_frame packet parses from one byte");
+
+        assert!(hdr.show_existing_frame);
+        assert_eq!(hdr.frame_to_show, 0);
+        assert!(
+            hdr.show_frame,
+            "the specification forces show_frame on this path (libvpx \
+             vp9_decodeframe.c:2679); the struct default would say hidden"
+        );
+        assert_eq!(hdr.refresh_frame_flags, 0, "no slot is refreshed");
+        assert_eq!(hdr.loop_filter.filter_level, 0, "no loop filter is run");
+        assert_eq!(
+            hdr.compressed_header_size, 0,
+            "header_size_in_bytes = 0: there is no compressed header"
+        );
+    }
+
+    /// All eight slot indices parse, and none of them is confused with a
+    /// normal frame header.
+    #[test]
+    fn test_show_existing_frame_reads_every_slot_index() {
+        for slot in 0u8..8 {
+            // frame_marker(10) profile(00) show_existing(1) idx(3 bits)
+            let byte = 0b1000_1000 | slot;
+            let hdr = UncompressedHeader::parse(&[byte]).expect("one-byte header parses");
+            assert!(hdr.show_existing_frame);
+            assert_eq!(hdr.frame_to_show, slot);
+            assert!(hdr.show_frame);
+            assert_eq!(hdr.refresh_frame_flags, 0);
+            assert!(
+                !hdr.is_keyframe() || hdr.show_existing_frame,
+                "a show-existing packet codes no frame_type"
+            );
+        }
+    }
+
+    /// A real key frame must not pick up any of the show-existing
+    /// assignments — the guard against implementing them in the wrong place.
+    #[test]
+    fn test_a_real_key_frame_is_untouched_by_the_show_existing_assignments() {
+        let hdr = UncompressedHeader::parse(KEYFRAME_76X42).expect("keyframe parses");
+        assert!(!hdr.show_existing_frame);
+        assert_eq!(hdr.refresh_frame_flags, 0xFF, "a key frame refreshes all");
+        assert!(hdr.compressed_header_size > 0);
+    }
+
+    #[test]
+    fn test_segmentation_update_data_flag_is_recorded() {
+        let hdr = UncompressedHeader::parse(KEYFRAME_76X42).expect("keyframe parses");
+        if !hdr.seg.enabled {
+            assert!(
+                !hdr.seg.update_data && !hdr.seg.update_map,
+                "no segmentation payload is coded when segmentation is off"
+            );
+        }
+        if !hdr.seg.update_data {
+            assert_eq!(
+                hdr.seg.feature_data, [[0; 4]; 8],
+                "features are only filled in by an update_data pass"
+            );
+        }
     }
 }

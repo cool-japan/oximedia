@@ -9,7 +9,8 @@
 
 use super::peak::TruePeakDetector;
 use super::r128::R128Meter;
-use crate::frame::AudioFrame;
+use super::sample_bytes;
+use crate::frame::{AudioBuffer, AudioFrame};
 
 /// Loudness normalization mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -203,10 +204,22 @@ impl LoudnessNormalizer {
             measured_peak_dbtp,
             predicted_peak_dbtp: predicted_peak_dbtp + limiting_gain_db,
             loudness_range: lra,
+            frames_modified: 0,
         }
     }
 
-    /// Normalize audio frames to target loudness.
+    /// Normalize audio frames to target loudness, rewriting their samples.
+    ///
+    /// The measured gain is applied to the sample data of every frame **in
+    /// place**, in the frame's own [`SampleFormat`](oximedia_core::SampleFormat)
+    /// (all integer and float formats listed in
+    /// [`super::sample_bytes`] are supported). If true peak limiting is enabled
+    /// and the gained signal would exceed the configured ceiling, a brick-wall
+    /// limiter is applied afterwards — also written back.
+    ///
+    /// [`NormalizationParams::frames_modified`] reports how many frames were
+    /// actually rewritten, so a caller can detect frames whose sample format
+    /// could not be written.
     ///
     /// # Arguments
     ///
@@ -217,118 +230,134 @@ impl LoudnessNormalizer {
     /// Normalization parameters used
     pub fn normalize(&self, frames: &mut [AudioFrame]) -> NormalizationParams {
         // Analysis pass
-        let params = self.analyze(frames);
+        let mut params = self.analyze(frames);
 
         if params.total_gain_db.abs() < 0.01 {
-            // No normalization needed
+            // No normalization needed; nothing is rewritten.
             return params;
         }
 
         // Processing pass
         let linear_gain = Self::db_to_linear(params.gain_db);
 
+        let mut modified = 0_usize;
         for frame in frames.iter_mut() {
-            self.apply_gain(frame, linear_gain);
+            if Self::apply_gain(frame, linear_gain) {
+                modified += 1;
+            }
         }
 
         // Apply limiting if needed and enabled
         if self.config.enable_limiting && params.limiting_gain_db < -0.1 {
-            self.apply_limiting(frames, self.config.max_true_peak_dbtp);
+            Self::apply_limiting(frames, self.config.max_true_peak_dbtp);
         }
 
+        params.frames_modified = modified;
         params
     }
 
-    /// Apply gain to an audio frame.
-    fn apply_gain(&self, frame: &mut AudioFrame, linear_gain: f64) {
-        match &mut frame.samples {
-            crate::frame::AudioBuffer::Interleaved(data) => {
-                // Convert to mutable samples
-                let mut samples = self.bytes_to_samples_f64(data);
-                for sample in &mut samples {
-                    *sample *= linear_gain;
-                }
-                // Would need to convert back to bytes - simplified for now
-            }
-            crate::frame::AudioBuffer::Planar(planes) => {
-                for plane in planes {
-                    let mut samples = self.bytes_to_samples_f64(plane);
-                    for sample in &mut samples {
-                        *sample *= linear_gain;
-                    }
-                }
-            }
-        }
+    /// Apply a linear gain to an audio frame, writing the result back into the
+    /// frame's byte buffer.
+    ///
+    /// Returns `true` if the frame's samples were rewritten, `false` if the
+    /// frame's sample format is not supported by [`super::sample_bytes`] (in
+    /// which case the frame is left untouched rather than silently corrupted).
+    fn apply_gain(frame: &mut AudioFrame, linear_gain: f64) -> bool {
+        Self::map_frame_samples(frame, |sample| sample * linear_gain)
     }
 
-    /// Apply true peak limiting to frames.
-    fn apply_limiting(&self, frames: &mut [AudioFrame], max_peak_dbtp: f64) {
+    /// Apply true peak limiting to frames, writing the result back.
+    fn apply_limiting(frames: &mut [AudioFrame], max_peak_dbtp: f64) {
         let max_peak_linear = TruePeakDetector::dbtp_to_linear(max_peak_dbtp);
 
         for frame in frames {
-            let mut samples = self.extract_samples(frame);
-
-            // Simple brick-wall limiter
-            for sample in &mut samples {
+            Self::map_frame_samples(frame, |sample| {
                 if sample.abs() > max_peak_linear {
-                    *sample = sample.signum() * max_peak_linear;
+                    sample.signum() * max_peak_linear
+                } else {
+                    sample
                 }
-            }
-
-            // Would need to write samples back to frame
+            });
         }
     }
 
-    /// Extract samples from audio frame as f64.
+    /// Apply `op` to every sample of `frame`, decoding and re-encoding the raw
+    /// bytes in the frame's own sample format.
+    ///
+    /// Returns `false` (leaving the frame untouched) if the format cannot be
+    /// decoded or encoded.
+    fn map_frame_samples<F: Fn(f64) -> f64>(frame: &mut AudioFrame, op: F) -> bool {
+        let format = frame.format;
+
+        match &mut frame.samples {
+            AudioBuffer::Interleaved(data) => {
+                let Some(mut samples) = sample_bytes::decode(data, format) else {
+                    return false;
+                };
+                for sample in &mut samples {
+                    *sample = op(*sample);
+                }
+                let Some(encoded) = sample_bytes::encode(&samples, format) else {
+                    return false;
+                };
+                *data = encoded;
+                true
+            }
+            AudioBuffer::Planar(planes) => {
+                let mut all_ok = true;
+                for plane in planes.iter_mut() {
+                    let Some(mut samples) = sample_bytes::decode(plane, format) else {
+                        all_ok = false;
+                        continue;
+                    };
+                    for sample in &mut samples {
+                        *sample = op(*sample);
+                    }
+                    if let Some(encoded) = sample_bytes::encode(&samples, format) {
+                        *plane = encoded;
+                    } else {
+                        all_ok = false;
+                    }
+                }
+                all_ok
+            }
+        }
+    }
+
+    /// Extract samples from an audio frame as interleaved f64.
+    ///
+    /// Planar frames are interleaved channel-by-channel; the shortest plane
+    /// bounds the number of frames produced.
     fn extract_samples(&self, frame: &AudioFrame) -> Vec<f64> {
+        let format = frame.format;
+
         match &frame.samples {
-            crate::frame::AudioBuffer::Interleaved(data) => self.bytes_to_samples_f64(data),
-            crate::frame::AudioBuffer::Planar(planes) => {
-                // Interleave planar samples
+            AudioBuffer::Interleaved(data) => {
+                sample_bytes::decode(data, format).unwrap_or_default()
+            }
+            AudioBuffer::Planar(planes) => {
                 if planes.is_empty() {
                     return Vec::new();
                 }
 
-                let channels = planes.len();
-                let frames = planes[0].len() / std::mem::size_of::<f32>();
+                let decoded: Vec<Vec<f64>> = planes
+                    .iter()
+                    .map(|plane| sample_bytes::decode(plane, format).unwrap_or_default())
+                    .collect();
+
+                let channels = decoded.len();
+                let frames = decoded.iter().map(Vec::len).min().unwrap_or(0);
                 let mut interleaved = Vec::with_capacity(frames * channels);
 
-                for _ in 0..frames {
-                    for plane in planes {
-                        let samples = self.bytes_to_samples_f64(plane);
-                        if let Some(&sample) = samples.first() {
-                            interleaved.push(sample);
-                        }
+                for frame_idx in 0..frames {
+                    for plane in &decoded {
+                        interleaved.push(plane[frame_idx]);
                     }
                 }
 
                 interleaved
             }
         }
-    }
-
-    /// Convert bytes to f64 samples (simplified - assumes f32 for now).
-    fn bytes_to_samples_f64(&self, bytes: &bytes::Bytes) -> Vec<f64> {
-        // Simplified: would need to handle different sample formats
-        // For now, assume f32
-        let sample_count = bytes.len() / 4;
-        let mut samples = Vec::with_capacity(sample_count);
-
-        for i in 0..sample_count {
-            let offset = i * 4;
-            if offset + 4 <= bytes.len() {
-                let bytes_array = [
-                    bytes[offset],
-                    bytes[offset + 1],
-                    bytes[offset + 2],
-                    bytes[offset + 3],
-                ];
-                let sample = f32::from_le_bytes(bytes_array);
-                samples.push(f64::from(sample));
-            }
-        }
-
-        samples
     }
 
     /// Convert dB to linear gain.
@@ -367,6 +396,12 @@ pub struct NormalizationParams {
     pub predicted_peak_dbtp: f64,
     /// Measured loudness range in LU.
     pub loudness_range: f64,
+    /// Number of frames whose sample data was actually rewritten by
+    /// [`LoudnessNormalizer::normalize`].
+    ///
+    /// Zero after a pure [`LoudnessNormalizer::analyze`] call, and zero when the
+    /// required gain is below the 0.01 dB no-op threshold.
+    pub frames_modified: usize,
 }
 
 impl NormalizationParams {
@@ -783,6 +818,260 @@ impl AutoGainProcessor {
     pub fn set_release(&mut self, release_secs: f64) {
         self.config.release_secs = release_secs;
         self.release_coeff = Self::time_to_coeff(release_secs, self.config.sample_rate);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LoudnessNormalizer tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod normalizer_tests {
+    use super::*;
+    use crate::frame::ChannelLayout;
+    use oximedia_core::SampleFormat;
+    use std::f64::consts::PI;
+
+    const SAMPLE_RATE: f64 = 48_000.0;
+
+    /// Build a stereo (dual-mono) sine as a sequence of 0.5 s audio frames in
+    /// `format`.
+    fn sine_frames(
+        peak_dbfs: f64,
+        duration_secs: f64,
+        format: SampleFormat,
+        planar: bool,
+    ) -> Vec<AudioFrame> {
+        let amplitude = 10.0_f64.powf(peak_dbfs / 20.0);
+        let per_frame = (SAMPLE_RATE * 0.5) as usize;
+        let total = (SAMPLE_RATE * duration_secs) as usize;
+
+        let mut frames = Vec::new();
+        let mut start = 0_usize;
+        while start < total {
+            let end = (start + per_frame).min(total);
+            let mono: Vec<f64> = (start..end)
+                .map(|n| amplitude * (2.0 * PI * 997.0 * n as f64 / SAMPLE_RATE).sin())
+                .collect();
+
+            let mut frame = AudioFrame::new(format, SAMPLE_RATE as u32, ChannelLayout::Stereo);
+            frame.samples = if planar {
+                let plane = sample_bytes::encode(&mono, format).expect("encodable");
+                AudioBuffer::Planar(vec![plane.clone(), plane])
+            } else {
+                let interleaved: Vec<f64> = mono.iter().flat_map(|&s| [s, s]).collect();
+                AudioBuffer::Interleaved(
+                    sample_bytes::encode(&interleaved, format).expect("encodable"),
+                )
+            };
+            frames.push(frame);
+            start = end;
+        }
+        frames
+    }
+
+    /// Re-measure the integrated loudness of a frame sequence with the
+    /// (corrected) K-weighted R128 meter.
+    fn measure_lufs(frames: &[AudioFrame], normalizer: &LoudnessNormalizer) -> f64 {
+        let mut meter = R128Meter::new(SAMPLE_RATE, 2);
+        for frame in frames {
+            meter.process_interleaved(&normalizer.extract_samples(frame));
+        }
+        meter.integrated_loudness()
+    }
+
+    fn normalizer_for(target_lufs: f64) -> LoudnessNormalizer {
+        let config = NormalizationConfig {
+            target_lufs,
+            max_true_peak_dbtp: -1.0,
+            mode: NormalizationMode::LinearGain,
+            enable_limiting: false,
+            ..Default::default()
+        };
+        LoudnessNormalizer::new(config, SAMPLE_RATE, 2)
+    }
+
+    /// `normalize()` must actually rewrite the frame bytes, and the re-measured
+    /// integrated loudness must land on target.
+    ///
+    /// Regression guard: `apply_gain` used to decode the samples, scale them in
+    /// a temporary `Vec`, and drop it — returning correct-looking parameters
+    /// while leaving the audio byte-identical.
+    #[test]
+    fn test_normalize_rewrites_samples_and_hits_target() {
+        let normalizer = normalizer_for(-23.0);
+        let mut frames = sine_frames(-30.0, 4.0, SampleFormat::F32, false);
+        let original = frames.clone();
+
+        let before = measure_lufs(&frames, &normalizer);
+        assert!(before.is_finite(), "input loudness must be measurable");
+
+        let params = normalizer.normalize(&mut frames);
+        assert!(
+            params.gain_db.abs() > 1.0,
+            "a -30 dBFS sine needs real gain to reach -23 LUFS, got {:.2} dB",
+            params.gain_db
+        );
+        assert_eq!(
+            params.frames_modified,
+            frames.len(),
+            "every frame must be rewritten"
+        );
+
+        // The bytes must have changed.
+        let mut changed = 0;
+        for (before_frame, after_frame) in original.iter().zip(frames.iter()) {
+            if let (AudioBuffer::Interleaved(a), AudioBuffer::Interleaved(b)) =
+                (&before_frame.samples, &after_frame.samples)
+            {
+                if a != b {
+                    changed += 1;
+                }
+            }
+        }
+        assert_eq!(changed, frames.len(), "all frames must differ after gain");
+
+        let after = measure_lufs(&frames, &normalizer);
+        assert!(
+            (after - (-23.0)).abs() <= 0.5,
+            "re-measured loudness {after:.2} LUFS should be within 0.5 LU of -23.0 (was {before:.2})"
+        );
+    }
+
+    /// The write-back must work for every integer and float sample format,
+    /// interleaved and planar.
+    #[test]
+    fn test_normalize_all_sample_formats() {
+        let formats = [
+            (SampleFormat::S16, false),
+            (SampleFormat::S16p, true),
+            (SampleFormat::S24, false),
+            (SampleFormat::S24p, true),
+            (SampleFormat::S32, false),
+            (SampleFormat::F32, false),
+            (SampleFormat::F32p, true),
+            (SampleFormat::F64, false),
+            (SampleFormat::U8, false),
+        ];
+
+        for (format, planar) in formats {
+            let normalizer = normalizer_for(-20.0);
+            let mut frames = sine_frames(-26.0, 4.0, format, planar);
+            let original = frames.clone();
+
+            let params = normalizer.normalize(&mut frames);
+            assert_eq!(
+                params.frames_modified,
+                frames.len(),
+                "{format:?}: every frame must be rewritten"
+            );
+
+            let mut any_changed = false;
+            for (a, b) in original.iter().zip(frames.iter()) {
+                match (&a.samples, &b.samples) {
+                    (AudioBuffer::Interleaved(x), AudioBuffer::Interleaved(y)) => {
+                        any_changed |= x != y;
+                    }
+                    (AudioBuffer::Planar(x), AudioBuffer::Planar(y)) => {
+                        any_changed |= x != y;
+                    }
+                    _ => panic!("{format:?}: buffer kind changed"),
+                }
+            }
+            assert!(any_changed, "{format:?}: samples were not modified");
+
+            let after = measure_lufs(&frames, &normalizer);
+            // 8-bit PCM quantisation noise dominates at -20 LUFS, so it gets a
+            // wider window than the 0.5 LU used for the other formats.
+            let tolerance = if format == SampleFormat::U8 { 1.5 } else { 0.5 };
+            assert!(
+                (after - (-20.0)).abs() <= tolerance,
+                "{format:?}: re-measured {after:.2} LUFS, expected -20.0 ±{tolerance}"
+            );
+        }
+    }
+
+    /// Turning a loud signal down must also work (negative gain).
+    #[test]
+    fn test_normalize_attenuates_loud_input() {
+        let normalizer = normalizer_for(-23.0);
+        let mut frames = sine_frames(-6.0, 4.0, SampleFormat::F32, false);
+
+        let params = normalizer.normalize(&mut frames);
+        assert!(
+            params.gain_db < -5.0,
+            "expected attenuation, got {:.2} dB",
+            params.gain_db
+        );
+
+        let after = measure_lufs(&frames, &normalizer);
+        assert!(
+            (after - (-23.0)).abs() <= 0.5,
+            "re-measured {after:.2} LUFS, expected -23.0 ±0.5"
+        );
+    }
+
+    /// True peak limiting must be written back too.
+    #[test]
+    fn test_normalize_with_limiting_clamps_samples() {
+        // A dual-mono 997 Hz sine measures ≈ its peak dBFS in LUFS (ITU-R
+        // BS.1770-4 sums the per-channel mean squares), so a 0 LUFS target on a
+        // -20 dBFS source needs ≈ +20 dB and drives the true peak past the
+        // -1 dBTP ceiling — exactly the case the limiter exists for.
+        let config = NormalizationConfig {
+            target_lufs: 0.0,
+            max_true_peak_dbtp: -1.0,
+            mode: NormalizationMode::LimitedGain,
+            enable_limiting: true,
+            ..Default::default()
+        };
+        let normalizer = LoudnessNormalizer::new(config, SAMPLE_RATE, 2);
+        let mut frames = sine_frames(-20.0, 4.0, SampleFormat::F32, false);
+
+        let params = normalizer.normalize(&mut frames);
+        assert!(
+            params.limiting_gain_db < -0.1,
+            "limiting should engage, got {:.3} dB",
+            params.limiting_gain_db
+        );
+
+        let ceiling = TruePeakDetector::dbtp_to_linear(-1.0);
+        for frame in &frames {
+            for sample in normalizer.extract_samples(frame) {
+                assert!(
+                    sample.abs() <= ceiling + 1e-6,
+                    "sample {sample} exceeds the -1 dBTP ceiling {ceiling}"
+                );
+            }
+        }
+    }
+
+    /// A signal already at target must not be touched.
+    #[test]
+    fn test_normalize_noop_when_on_target() {
+        let normalizer = normalizer_for(-23.0);
+        let mut frames = sine_frames(-30.0, 4.0, SampleFormat::F32, false);
+        normalizer.normalize(&mut frames);
+
+        let snapshot = frames.clone();
+        let params = normalizer.normalize(&mut frames);
+        assert!(
+            params.gain_db.abs() < 0.5,
+            "second pass should need almost no gain, got {:.3} dB",
+            params.gain_db
+        );
+
+        if params.total_gain_db.abs() < 0.01 {
+            assert_eq!(params.frames_modified, 0, "no-op must not rewrite frames");
+            for (a, b) in snapshot.iter().zip(frames.iter()) {
+                match (&a.samples, &b.samples) {
+                    (AudioBuffer::Interleaved(x), AudioBuffer::Interleaved(y)) => {
+                        assert_eq!(x, y, "no-op must leave bytes untouched");
+                    }
+                    _ => panic!("unexpected buffer kind"),
+                }
+            }
+        }
     }
 }
 

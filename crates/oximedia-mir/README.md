@@ -1,6 +1,6 @@
 # oximedia-mir
 
-**Status: [Stable]** | Version: 0.2.0 | Tests: extensively tested | Updated: 2026-07-14
+**Status: [Stable]** | Version: 0.2.1 | Tests: extensively tested | Updated: 2026-08-12
 
 Music Information Retrieval (MIR) system for OxiMedia, providing comprehensive music analysis including tempo, beat, key, chord, melody, structure, genre, mood, and spectral features.
 
@@ -37,9 +37,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-mir = "0.1.9"
+oximedia-mir = "0.2.0"
 # Select specific features:
-oximedia-mir = { version = "0.1.9", features = ["tempo", "beat", "key", "chord"] }
+oximedia-mir = { version = "0.2.0", features = ["tempo", "beat", "key", "chord"] }
 ```
 
 ```rust

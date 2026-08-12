@@ -1,9 +1,9 @@
 # oximedia-imf
 
 ![Status: Stable](https://img.shields.io/badge/status-stable-green)
-![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-blue)
+![Version: 0.2.1](https://img.shields.io/badge/version-0.2.1-blue)
 ![Tests: 512](https://img.shields.io/badge/tests-512-brightgreen)
-![Updated: 2026-07-14](https://img.shields.io/badge/updated-2026--07--14-blue)
+![Updated: 2026-08-12](https://img.shields.io/badge/updated-2026--08--12-blue)
 
 IMF (Interoperable Master Format) support for OxiMedia, providing SMPTE ST 2067-compliant package creation, validation, and parsing for professional broadcast and streaming delivery.
 
@@ -39,7 +39,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-imf = "0.1.9"
+oximedia-imf = "0.2.0"
 ```
 
 ```rust

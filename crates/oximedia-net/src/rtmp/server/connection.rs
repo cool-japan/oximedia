@@ -32,6 +32,12 @@ pub struct ServerConnection {
     media_receiver: Option<broadcast::Receiver<MediaPacket>>,
     /// Stream metadata.
     stream_metadata: Option<StreamMetadata>,
+    /// Sequence-header cache of the stream this connection publishes.
+    ///
+    /// Populated once, right after the stream is registered, so codec
+    /// configuration packets can be cached as they arrive without re-locking
+    /// the registry per packet. Late subscribers replay the cache on play.
+    seq_headers: Option<Arc<RwLock<SeqHeaderCache>>>,
 }
 
 impl ServerConnection {
@@ -65,6 +71,7 @@ impl ServerConnection {
             media_broadcaster: None,
             media_receiver: None,
             stream_metadata: None,
+            seq_headers: None,
         }
     }
 
@@ -299,6 +306,10 @@ impl ServerConnection {
                             stream_id,
                             data: payload.clone(),
                         };
+                        // Cache the codec sequence header *before* broadcasting
+                        // so a subscriber that arrives between the two still
+                        // finds it in the cache.
+                        self.cache_sequence_header(&packet).await;
                         let _ = tx.send(packet);
                     }
                 }
@@ -313,6 +324,7 @@ impl ServerConnection {
                             stream_id,
                             data: payload.clone(),
                         };
+                        self.cache_sequence_header(&packet).await;
                         let _ = tx.send(packet);
                     }
                 }
@@ -320,6 +332,42 @@ impl ServerConnection {
             _ => {}
         }
 
+        Ok(())
+    }
+
+    /// Caches `packet` in this stream's sequence-header cache if it is one.
+    ///
+    /// Codec sequence headers are sent once, at the start of a publish. Without
+    /// this cache every player that joins afterwards would receive coded frames
+    /// it has no decoder configuration for.
+    async fn cache_sequence_header(&self, packet: &MediaPacket) {
+        if let Some(cache) = &self.seq_headers {
+            // Cheap check first: taking the write lock for every media packet
+            // would serialise the whole publish path.
+            let is_header = match packet.packet_type {
+                MediaPacketType::Video => is_video_sequence_header(&packet.data),
+                MediaPacketType::Audio => is_audio_sequence_header(&packet.data),
+                MediaPacketType::Data => false,
+            };
+            if is_header {
+                cache.write().await.capture(packet);
+            }
+        }
+    }
+
+    /// Replays cached codec sequence headers to a freshly subscribed player.
+    ///
+    /// Must be called *after* subscribing to the broadcast channel: a header
+    /// that arrives in between is then at worst delivered twice, whereas
+    /// reading the cache first would lose it entirely.
+    async fn replay_sequence_headers(
+        &mut self,
+        cache: &Arc<RwLock<SeqHeaderCache>>,
+    ) -> NetResult<()> {
+        let packets = cache.read().await.replay_packets();
+        for packet in packets {
+            self.send_media_packet(packet).await?;
+        }
         Ok(())
     }
 
@@ -617,6 +665,11 @@ impl ServerConnection {
                     .register_stream(stream_key.clone(), metadata.clone(), self.info.id)
                     .await?;
 
+                // Fetch the shared sequence-header cache once, so codec
+                // configuration packets can be captured without re-locking the
+                // registry for every media packet.
+                self.seq_headers = self.stream_registry.seq_headers(&stream_key).await;
+
                 self.stream_metadata = Some(metadata);
                 self.media_broadcaster = Some(media_tx);
                 self.info.state = ServerConnectionState::Publishing;
@@ -737,6 +790,14 @@ impl ServerConnection {
                         .with_arg(AmfValue::Object(start_info));
 
                     self.send_command(start_status, 3).await?;
+
+                    // Replay the publisher's codec sequence headers. They were
+                    // sent once, before this subscription existed, so without
+                    // this a late player receives coded frames it cannot
+                    // configure a decoder for. Ordering is deliberate:
+                    // subscribe -> onStatus -> replay, so the headers precede
+                    // every live packet the run loop later drains.
+                    self.replay_sequence_headers(&stream.seq_headers).await?;
                 } else {
                     // Stream not found
                     let mut info = HashMap::new();
@@ -908,5 +969,116 @@ impl ServerConnection {
     #[must_use]
     pub fn message_sender(&self) -> mpsc::UnboundedSender<OutgoingMessage> {
         self.message_tx.clone()
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn packet(packet_type: MediaPacketType, body: &[u8]) -> MediaPacket {
+        MediaPacket {
+            packet_type,
+            timestamp: 0,
+            stream_id: 1,
+            data: Bytes::copy_from_slice(body),
+        }
+    }
+
+    /// Opens a loopback TCP pair and wraps the server side in a
+    /// [`ServerConnection`], returning the connection and the client socket.
+    async fn connection_pair() -> (ServerConnection, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await });
+        let (server_stream, peer) = listener.accept().await.expect("accept");
+        let client_stream = client.await.expect("join").expect("connect");
+
+        let connection = ServerConnection::new(
+            1,
+            server_stream,
+            peer,
+            RtmpServerConfig::default(),
+            Arc::new(StreamRegistry::new()),
+            Arc::new(AllowAllAuth),
+        );
+        (connection, client_stream)
+    }
+
+    // A player that subscribes after the publisher's sequence headers were sent
+    // must still receive them: `replay_sequence_headers` writes them onto the
+    // wire before any live packet the run loop later drains.
+    #[tokio::test]
+    async fn late_subscriber_receives_cached_sequence_headers() {
+        let (mut connection, mut client) = connection_pair().await;
+
+        let video_body: &[u8] = &[0x18, b'a', b'v', b'0', b'1', 0x81, 0x00, 0x00, 0x00];
+        let audio_body: &[u8] = &[0x9F, 0x00, b'O', b'p', b'u', b's', 0x01, 0x02];
+
+        let cache = Arc::new(RwLock::new(SeqHeaderCache::new()));
+        {
+            let mut guard = cache.write().await;
+            assert!(guard.capture(&packet(MediaPacketType::Video, video_body)));
+            assert!(guard.capture(&packet(MediaPacketType::Audio, audio_body)));
+        }
+
+        connection
+            .replay_sequence_headers(&cache)
+            .await
+            .expect("replay must succeed");
+
+        // Read whatever landed on the wire. Two chunked RTMP messages, so the
+        // payloads appear verbatim inside the chunk stream.
+        let mut buf = vec![0u8; 4096];
+        let n = timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("replay bytes must arrive")
+            .expect("read");
+        let wire = &buf[..n];
+
+        assert!(
+            wire.windows(video_body.len()).any(|w| w == video_body),
+            "the cached video sequence header must be sent to the late subscriber"
+        );
+        assert!(
+            wire.windows(audio_body.len()).any(|w| w == audio_body),
+            "the cached audio sequence header must be sent to the late subscriber"
+        );
+
+        let video_at = wire
+            .windows(video_body.len())
+            .position(|w| w == video_body)
+            .expect("video header present");
+        let audio_at = wire
+            .windows(audio_body.len())
+            .position(|w| w == audio_body)
+            .expect("audio header present");
+        assert!(
+            video_at < audio_at,
+            "video configuration must precede audio configuration"
+        );
+    }
+
+    // An empty cache sends nothing at all — no fabricated configuration.
+    #[tokio::test]
+    async fn empty_cache_replays_nothing() {
+        let (mut connection, mut client) = connection_pair().await;
+        let cache = Arc::new(RwLock::new(SeqHeaderCache::new()));
+
+        connection
+            .replay_sequence_headers(&cache)
+            .await
+            .expect("replay of an empty cache is a no-op");
+
+        let mut buf = vec![0u8; 64];
+        let read = timeout(Duration::from_millis(200), client.read(&mut buf)).await;
+        assert!(
+            read.is_err(),
+            "nothing may be written when no sequence header was cached"
+        );
     }
 }

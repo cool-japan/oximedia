@@ -9,6 +9,8 @@
 //! - Sample tables (`stts`, `stsc`, `stsz`, `stco`, `co64`, `stss`, `ctts`)
 
 use super::atom::Mp4Atom;
+use super::fragments::{parse_mvex, TrexBox};
+use crate::track_header::TransformMatrix;
 use oximedia_core::{OxiError, OxiResult};
 
 /// Maximum container-box nesting depth accepted while recursing through
@@ -150,6 +152,26 @@ impl BoxType {
     pub const EDTS: Self = Self::new(*b"edts");
     /// Edit list box.
     pub const ELST: Self = Self::new(*b"elst");
+    /// Movie extends box (declares that the file is fragmented).
+    pub const MVEX: Self = Self::new(*b"mvex");
+    /// Track extends box (per-track fragment defaults).
+    pub const TREX: Self = Self::new(*b"trex");
+    /// Movie fragment box.
+    pub const MOOF: Self = Self::new(*b"moof");
+    /// Movie fragment header box.
+    pub const MFHD: Self = Self::new(*b"mfhd");
+    /// Track fragment box.
+    pub const TRAF: Self = Self::new(*b"traf");
+    /// Track fragment header box.
+    pub const TFHD: Self = Self::new(*b"tfhd");
+    /// Track fragment decode time box.
+    pub const TFDT: Self = Self::new(*b"tfdt");
+    /// Track fragment run box.
+    pub const TRUN: Self = Self::new(*b"trun");
+    /// Segment index box.
+    pub const SIDX: Self = Self::new(*b"sidx");
+    /// Segment type box (CMAF media segments).
+    pub const STYP: Self = Self::new(*b"styp");
 }
 
 impl BoxHeader {
@@ -293,6 +315,21 @@ pub struct MoovBox {
     pub mvhd: Option<MvhdBox>,
     /// Track boxes (`trak`).
     pub traks: Vec<TrakBox>,
+    /// `trex` entries from the `mvex` box.
+    ///
+    /// A non-empty vector means the file is *fragmented*: the sample tables in
+    /// `moov` are empty (or absent) and the real sample descriptions live in
+    /// `moof` boxes further down the file.
+    pub trex: Vec<TrexBox>,
+}
+
+impl MoovBox {
+    /// Returns `true` when this movie declares an `mvex` box, i.e. the file is
+    /// a fragmented MP4 whose media samples are described by `moof` boxes.
+    #[must_use]
+    pub fn is_fragmented(&self) -> bool {
+        !self.trex.is_empty()
+    }
 }
 
 impl MoovBox {
@@ -341,6 +378,9 @@ impl MoovBox {
                 }
                 BoxType::TRAK => {
                     moov.traks.push(TrakBox::parse(content)?);
+                }
+                BoxType::MVEX => {
+                    moov.trex = parse_mvex(content)?;
                 }
                 // Skip udta, meta, edts, free, skip, and unknown boxes
                 _ => {}
@@ -1117,12 +1157,27 @@ impl TrakBox {
 }
 
 /// Track header box (`tkhd`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TkhdBox {
+    /// Box version (0 = 32-bit times, 1 = 64-bit times).
+    pub version: u8,
+    /// 24-bit `tkhd` flags (`track_enabled`, `track_in_movie`, …).
+    pub flags: u32,
     /// Track ID (1-based).
     pub track_id: u32,
     /// Duration in movie timescale units.
     pub duration: u64,
+    /// Visual layer ordering (lower = closer to the viewer).
+    pub layer: i16,
+    /// Alternate group identifier (0 = not in a group).
+    pub alternate_group: u16,
+    /// Audio volume (8.8 fixed-point in the file; 1.0 = full).
+    pub volume: f64,
+    /// Raw 3x3 display transformation matrix exactly as stored in the file.
+    ///
+    /// Row-major `[a, b, u, c, d, v, x, y, w]`. `a`, `b`, `c`, `d`, `x` and `y`
+    /// are 16.16 fixed-point; `u`, `v` and `w` are 2.30 fixed-point.
+    pub matrix: [i32; 9],
     /// Display width (16.16 fixed-point).
     pub width: f64,
     /// Display height (16.16 fixed-point).
@@ -1130,6 +1185,9 @@ pub struct TkhdBox {
 }
 
 impl TkhdBox {
+    /// The ISOBMFF unity matrix (no rotation, no scale, no translation).
+    pub const UNITY_MATRIX: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
+
     /// Parses the content of a `tkhd` box.
     ///
     /// # Arguments
@@ -1143,7 +1201,9 @@ impl TkhdBox {
         let mut atom = Mp4Atom::new(data);
 
         let version = atom.read_u8()?;
-        atom.skip(3)?; // flags
+        let flags = u32::from(atom.read_u8()?) << 16
+            | u32::from(atom.read_u8()?) << 8
+            | u32::from(atom.read_u8()?);
 
         let (creation_time, modification_time, track_id, duration) = if version == 1 {
             let ct = atom.read_u64()?;
@@ -1164,24 +1224,108 @@ impl TkhdBox {
         // Silence unused variable warnings
         let _ = (creation_time, modification_time);
 
-        // Skip: reserved (2 * 4 bytes)
+        // reserved (2 * 4 bytes)
         atom.skip(8)?;
-        // Skip: layer, alternate_group
-        atom.skip(4)?;
-        // Skip: volume, reserved
-        atom.skip(4)?;
-        // Skip: matrix (9 * 4 bytes)
-        atom.skip(36)?;
+        #[allow(clippy::cast_possible_wrap)]
+        let layer = atom.read_u16()? as i16;
+        let alternate_group = atom.read_u16()?;
+        let volume = atom.read_fixed_8_8()?;
+        atom.skip(2)?; // reserved
+
+        // matrix (9 * 4 bytes) — parsed, not skipped: phone/camera captures
+        // encode portrait orientation here and downstream reframing needs it.
+        let mut matrix = [0i32; 9];
+        for slot in &mut matrix {
+            *slot = atom.read_i32()?;
+        }
 
         let width = atom.read_fixed_16_16()?;
         let height = atom.read_fixed_16_16()?;
 
         Ok(Self {
+            version,
+            flags,
             track_id,
             duration,
+            layer,
+            alternate_group,
+            volume,
+            matrix,
             width,
             height,
         })
+    }
+
+    /// Converts the raw fixed-point matrix into a floating-point
+    /// [`TransformMatrix`].
+    ///
+    /// `a`, `b`, `c`, `d`, `x` and `y` are decoded as 16.16 fixed-point and
+    /// `u`, `v`, `w` as 2.30 fixed-point, per ISO/IEC 14496-12 §6.2.2.
+    #[must_use]
+    pub fn transform_matrix(&self) -> TransformMatrix {
+        const FP_16_16: f64 = 65536.0;
+        const FP_2_30: f64 = 1_073_741_824.0;
+        let scale = |index: usize| -> f64 {
+            let divisor = if matches!(index, 2 | 5 | 8) {
+                FP_2_30
+            } else {
+                FP_16_16
+            };
+            f64::from(self.matrix[index]) / divisor
+        };
+        let mut values = [0.0f64; 9];
+        for (index, slot) in values.iter_mut().enumerate() {
+            *slot = scale(index);
+        }
+        TransformMatrix::new(values)
+    }
+
+    /// Returns the display rotation encoded by the transformation matrix,
+    /// snapped to the nearest quarter turn (`0`, `90`, `180` or `270` degrees).
+    ///
+    /// Returns `0` for the unity matrix and for any degenerate matrix whose
+    /// first row is all zeros.
+    #[must_use]
+    pub fn rotation_degrees(&self) -> u16 {
+        const FP_16_16: f64 = 65536.0;
+        let a = f64::from(self.matrix[0]) / FP_16_16;
+        let b = f64::from(self.matrix[1]) / FP_16_16;
+        if a.abs() < 1e-6 && b.abs() < 1e-6 {
+            return 0;
+        }
+        let degrees = b.atan2(a).to_degrees().rem_euclid(360.0);
+        if !(45.0..315.0).contains(&degrees) {
+            0
+        } else if degrees < 135.0 {
+            90
+        } else if degrees < 225.0 {
+            180
+        } else {
+            270
+        }
+    }
+
+    /// Returns `true` when the matrix is the ISOBMFF unity matrix.
+    #[must_use]
+    pub fn has_unity_matrix(&self) -> bool {
+        self.matrix == Self::UNITY_MATRIX
+    }
+}
+
+impl Default for TkhdBox {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            flags: 0x0000_0003,
+            track_id: 0,
+            duration: 0,
+            layer: 0,
+            alternate_group: 0,
+            volume: 0.0,
+            matrix: Self::UNITY_MATRIX,
+            width: 0.0,
+            height: 0.0,
+        }
     }
 }
 
@@ -1401,6 +1545,199 @@ mod tests {
     #[test]
     fn test_box_type_as_u32() {
         assert_eq!(BoxType::FTYP.as_u32(), 0x66747970); // "ftyp"
+    }
+
+    // ------------------------------------------------------------------
+    // tkhd display matrix / rotation.
+    //
+    // `TkhdBox::parse` used to `skip(36)` straight over the 3x3 transform
+    // matrix, so every phone/camera capture that records portrait footage as
+    // landscape pixels plus a 90/270-degree rotation was silently demuxed as
+    // landscape. These build a `tkhd` payload by hand for each quarter turn.
+    // ------------------------------------------------------------------
+
+    /// 16.16 fixed-point one.
+    const FP_ONE: i32 = 0x0001_0000;
+    /// 2.30 fixed-point one (the `w` element).
+    const FP_W_ONE: i32 = 0x4000_0000;
+
+    /// Builds a version-0 `tkhd` payload carrying `matrix`.
+    fn tkhd_v0_payload(matrix: [i32; 9], width: u32, height: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.push(0x00); // version
+        data.extend_from_slice(&[0x00, 0x00, 0x03]); // flags = enabled | in_movie
+        data.extend_from_slice(&1u32.to_be_bytes()); // creation_time
+        data.extend_from_slice(&2u32.to_be_bytes()); // modification_time
+        data.extend_from_slice(&7u32.to_be_bytes()); // track_id
+        data.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        data.extend_from_slice(&10_000u32.to_be_bytes()); // duration
+        data.extend_from_slice(&[0u8; 8]); // reserved
+        data.extend_from_slice(&(-1i16).to_be_bytes()); // layer
+        data.extend_from_slice(&3u16.to_be_bytes()); // alternate_group
+        data.extend_from_slice(&0x0100u16.to_be_bytes()); // volume = 1.0
+        data.extend_from_slice(&[0u8; 2]); // reserved
+        for value in matrix {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        data.extend_from_slice(&(width << 16).to_be_bytes());
+        data.extend_from_slice(&(height << 16).to_be_bytes());
+        data
+    }
+
+    /// The four quarter-turn matrices a camera actually writes, translation
+    /// included (rotating about the origin has to be undone by a shift).
+    fn rotation_matrix(degrees: u16, width: u32, height: u32) -> [i32; 9] {
+        #[allow(clippy::cast_possible_wrap)]
+        let (w, h) = ((width as i32) << 16, (height as i32) << 16);
+        match degrees {
+            90 => [0, FP_ONE, 0, -FP_ONE, 0, 0, h, 0, FP_W_ONE],
+            180 => [-FP_ONE, 0, 0, 0, -FP_ONE, 0, w, h, FP_W_ONE],
+            270 => [0, -FP_ONE, 0, FP_ONE, 0, 0, 0, w, FP_W_ONE],
+            _ => TkhdBox::UNITY_MATRIX,
+        }
+    }
+
+    #[test]
+    fn tkhd_parses_rotation_zero() {
+        let data = tkhd_v0_payload(rotation_matrix(0, 1920, 1080), 1920, 1080);
+        let tkhd = TkhdBox::parse(&data).expect("tkhd parses");
+        assert_eq!(tkhd.rotation_degrees(), 0);
+        assert!(tkhd.has_unity_matrix());
+        assert!(tkhd.transform_matrix().is_identity());
+    }
+
+    #[test]
+    fn tkhd_parses_rotation_ninety() {
+        let data = tkhd_v0_payload(rotation_matrix(90, 1920, 1080), 1920, 1080);
+        let tkhd = TkhdBox::parse(&data).expect("tkhd parses");
+        assert_eq!(tkhd.rotation_degrees(), 90);
+        assert!(!tkhd.has_unity_matrix());
+
+        let matrix = tkhd.transform_matrix();
+        assert!((matrix.values[0] - 0.0).abs() < 1e-9, "a");
+        assert!((matrix.values[1] - 1.0).abs() < 1e-9, "b");
+        assert!((matrix.values[3] + 1.0).abs() < 1e-9, "c");
+        assert!((matrix.values[4] - 0.0).abs() < 1e-9, "d");
+        assert!((matrix.values[8] - 1.0).abs() < 1e-9, "w decodes as 2.30");
+        let (tx, ty) = matrix.translation_xy();
+        assert!((tx - 1080.0).abs() < 1e-6, "tx decodes as 16.16");
+        assert!((ty - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tkhd_parses_rotation_one_eighty() {
+        let data = tkhd_v0_payload(rotation_matrix(180, 1920, 1080), 1920, 1080);
+        let tkhd = TkhdBox::parse(&data).expect("tkhd parses");
+        assert_eq!(tkhd.rotation_degrees(), 180);
+    }
+
+    #[test]
+    fn tkhd_parses_rotation_two_seventy() {
+        let data = tkhd_v0_payload(rotation_matrix(270, 1920, 1080), 1920, 1080);
+        let tkhd = TkhdBox::parse(&data).expect("tkhd parses");
+        assert_eq!(tkhd.rotation_degrees(), 270);
+    }
+
+    #[test]
+    fn tkhd_rotation_snaps_slightly_off_matrices() {
+        // A real-world matrix is rarely exactly 0x00010000; snap to the nearest
+        // quarter turn rather than reporting an odd angle.
+        let mut matrix = rotation_matrix(90, 1080, 1920);
+        matrix[0] = 200; // a tiny non-zero a
+        matrix[1] = FP_ONE - 40;
+        let data = tkhd_v0_payload(matrix, 1080, 1920);
+        let tkhd = TkhdBox::parse(&data).expect("tkhd parses");
+        assert_eq!(tkhd.rotation_degrees(), 90);
+    }
+
+    #[test]
+    fn tkhd_degenerate_matrix_reports_zero_rotation() {
+        let mut matrix = TkhdBox::UNITY_MATRIX;
+        matrix[0] = 0;
+        matrix[1] = 0;
+        let data = tkhd_v0_payload(matrix, 640, 480);
+        let tkhd = TkhdBox::parse(&data).expect("tkhd parses");
+        assert_eq!(tkhd.rotation_degrees(), 0);
+    }
+
+    #[test]
+    fn tkhd_parses_header_fields_alongside_the_matrix() {
+        let data = tkhd_v0_payload(rotation_matrix(270, 1920, 1080), 1920, 1080);
+        let tkhd = TkhdBox::parse(&data).expect("tkhd parses");
+        assert_eq!(tkhd.version, 0);
+        assert_eq!(tkhd.flags, 0x0000_0003);
+        assert_eq!(tkhd.track_id, 7);
+        assert_eq!(tkhd.duration, 10_000);
+        assert_eq!(tkhd.layer, -1);
+        assert_eq!(tkhd.alternate_group, 3);
+        assert!((tkhd.volume - 1.0).abs() < f64::EPSILON);
+        assert!((tkhd.width - 1920.0).abs() < 1.0);
+        assert!((tkhd.height - 1080.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn tkhd_v1_parses_the_matrix_too() {
+        let mut data = Vec::new();
+        data.push(0x01); // version = 1
+        data.extend_from_slice(&[0x00, 0x00, 0x03]); // flags
+        data.extend_from_slice(&0u64.to_be_bytes()); // creation_time
+        data.extend_from_slice(&0u64.to_be_bytes()); // modification_time
+        data.extend_from_slice(&2u32.to_be_bytes()); // track_id
+        data.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        data.extend_from_slice(&123_456u64.to_be_bytes()); // duration
+        data.extend_from_slice(&[0u8; 8]); // reserved
+        data.extend_from_slice(&0i16.to_be_bytes()); // layer
+        data.extend_from_slice(&0u16.to_be_bytes()); // alternate_group
+        data.extend_from_slice(&0u16.to_be_bytes()); // volume
+        data.extend_from_slice(&[0u8; 2]); // reserved
+        for value in rotation_matrix(180, 3840, 2160) {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        data.extend_from_slice(&(3840u32 << 16).to_be_bytes());
+        data.extend_from_slice(&(2160u32 << 16).to_be_bytes());
+
+        let tkhd = TkhdBox::parse(&data).expect("v1 tkhd parses");
+        assert_eq!(tkhd.version, 1);
+        assert_eq!(tkhd.track_id, 2);
+        assert_eq!(tkhd.duration, 123_456);
+        assert_eq!(tkhd.rotation_degrees(), 180);
+    }
+
+    // ------------------------------------------------------------------
+    // mvex / trex
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn moov_parse_detects_mvex() {
+        fn plain_box(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let total = (payload.len() + 8) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&total.to_be_bytes());
+            out.extend_from_slice(tag);
+            out.extend_from_slice(payload);
+            out
+        }
+
+        let mut trex_payload = Vec::new();
+        trex_payload.extend_from_slice(&[0u8; 4]); // version + flags
+        trex_payload.extend_from_slice(&1u32.to_be_bytes()); // track_id
+        trex_payload.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index
+        trex_payload.extend_from_slice(&1024u32.to_be_bytes()); // default duration
+        trex_payload.extend_from_slice(&512u32.to_be_bytes()); // default size
+        trex_payload.extend_from_slice(&0u32.to_be_bytes()); // default flags
+        let mvex = plain_box(b"mvex", &plain_box(b"trex", &trex_payload));
+
+        let moov = MoovBox::parse(&mvex).expect("moov parses");
+        assert!(moov.is_fragmented());
+        assert_eq!(moov.trex.len(), 1);
+        assert_eq!(moov.trex[0].default_sample_duration, 1024);
+        assert_eq!(moov.trex[0].default_sample_size, 512);
+    }
+
+    #[test]
+    fn moov_without_mvex_is_not_fragmented() {
+        let moov = MoovBox::parse(&[]).expect("empty moov parses");
+        assert!(!moov.is_fragmented());
     }
 
     // ------------------------------------------------------------------

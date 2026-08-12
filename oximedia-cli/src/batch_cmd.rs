@@ -265,7 +265,7 @@ async fn cmd_submit(
             "{}",
             serde_json::to_string_pretty(&obj).context("JSON serialization failed")?
         );
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Job Submitted".green().bold());
         println!("{:20} {}", "Job ID:", submitted_id.as_str().cyan());
         println!("{:20} {}", "Name:", job_name);
@@ -433,7 +433,7 @@ async fn cmd_cancel(id: &str, db: &PathBuf, json_output: bool) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&obj).context("JSON serialization")?
         );
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Job Cancelled".green().bold());
         println!("{:20} {}", "Job ID:", id.cyan());
         println!("{:20} {}", "Database:", db.display());

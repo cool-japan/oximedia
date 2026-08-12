@@ -115,7 +115,7 @@ fn create_imf_package(input: &PathBuf, output: &PathBuf, json_output: bool) -> R
             "status": "created",
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!(
             "{} IMF package created: {}",
             "OK".green().bold(),
@@ -159,7 +159,7 @@ fn create_generic_archive(input: &PathBuf, output: &PathBuf, json_output: bool) 
             "status": "created",
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!(
             "{} Generic archive created: {}",
             "OK".green().bold(),
@@ -287,7 +287,7 @@ async fn cmd_extract(input: &PathBuf, output: &PathBuf, json_output: bool) -> Re
                 "status": "extracted",
             });
             println!("{}", serde_json::to_string_pretty(&json)?);
-        } else {
+        } else if !crate::progress::is_quiet() {
             println!(
                 "{} Extracted: {} -> {}",
                 "OK".green().bold(),
@@ -336,7 +336,7 @@ async fn cmd_extract(input: &PathBuf, output: &PathBuf, json_output: bool) -> Re
             "status": "extracted",
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!(
             "{} Extracted: {} -> {}",
             "OK".green().bold(),

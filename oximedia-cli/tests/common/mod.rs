@@ -60,3 +60,62 @@ pub fn write_wav_fixture(
     std::fs::write(&path, data).expect("failed to write WAV fixture");
     (dir, path)
 }
+
+/// Build a minimal single-frame 4:2:0 Y4M clip in memory with every luma
+/// byte set to `luma` and every chroma byte set to `chroma`.
+///
+/// Only `validate_loudness_check.rs` uses this today; each `tests/*.rs` file
+/// is its own crate, so an unused-by-this-particular-binary helper here
+/// would otherwise be flagged as dead code in the other test binaries.
+#[allow(dead_code)]
+pub fn make_solid_y4m(width: u32, height: u32, luma: u8, chroma: u8) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(format!("YUV4MPEG2 W{width} H{height} C420jpeg\n").as_bytes());
+    buf.extend_from_slice(b"FRAME\n");
+    buf.extend(std::iter::repeat_n(luma, (width * height) as usize));
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+    buf.extend(std::iter::repeat_n(
+        chroma,
+        (chroma_w * chroma_h) as usize * 2,
+    ));
+    buf
+}
+
+/// Write a solid-color Y4M file to a temp dir and return `(TempDir, path)`.
+///
+/// The `TempDir` must be kept alive for the duration of the test.
+#[allow(dead_code)]
+pub fn write_y4m_fixture(width: u32, height: u32, luma: u8, chroma: u8) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("failed to create TempDir");
+    let path = dir.path().join("test.y4m");
+    let data = make_solid_y4m(width, height, luma, chroma);
+    std::fs::write(&path, data).expect("failed to write Y4M fixture");
+    (dir, path)
+}
+
+/// Build a minimal valid FLAC file in memory (a short ramp signal) using the
+/// real `oximedia_codec::flac::FlacEncoder` — header plus every encoded
+/// frame concatenated, exactly as the codec crate's own round-trip tests
+/// assemble a complete stream.
+#[allow(dead_code)]
+pub fn make_ramp_flac(channels: u8, sample_rate: u32) -> Vec<u8> {
+    use oximedia_codec::flac::{FlacConfig, FlacEncoder};
+
+    let mut enc = FlacEncoder::new(FlacConfig {
+        sample_rate,
+        channels,
+        bits_per_sample: 16,
+    });
+    let samples_per_channel = 256usize;
+    let ramp: Vec<i32> = (0..samples_per_channel * channels as usize)
+        .map(|i| ((i / channels as usize) as i32 % 2000) - 1000)
+        .collect();
+    let (header, frames) = enc.encode(&ramp).expect("encode ramp");
+
+    let mut stream = header;
+    for f in &frames {
+        stream.extend_from_slice(&f.data);
+    }
+    stream
+}

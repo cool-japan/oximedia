@@ -17,7 +17,11 @@ oximedia-core = { workspace = true }
 oximedia-graph = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
-ab_glyph.workspace = true
+# Pure-Rust glyph rasterization for `text::render` (same engine as
+# oximedia-graph's timecode burn-in and oximedia-subtitle). Depending on
+# oximedia-subtitle's font module instead would re-enable oximedia-codec's
+# default features, which oximedia-graph deliberately turns off.
+fontdue.workspace = true
 rand = { workspace = true }
 rayon = { workspace = true }
 

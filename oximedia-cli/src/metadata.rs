@@ -227,7 +227,7 @@ async fn set_metadata(options: &MetadataOptions, fields: &HashMap<String, String
     let output = options.output.as_ref().unwrap_or(&options.input);
     write_metadata(output, &metadata).await?;
 
-    if !options.json_output {
+    if !options.json_output && !crate::progress::is_quiet() {
         println!("{}", "Metadata updated successfully".green().bold());
         println!("{:20} {}", "Output file:", output.display());
     }
@@ -251,7 +251,7 @@ async fn remove_metadata(options: &MetadataOptions, fields: &[String]) -> Result
     let output = options.output.as_ref().unwrap_or(&options.input);
     write_metadata(output, &metadata).await?;
 
-    if !options.json_output {
+    if !options.json_output && !crate::progress::is_quiet() {
         println!("{}", "Metadata fields removed successfully".green().bold());
         println!("{:20} {}", "Output file:", output.display());
     }
@@ -269,7 +269,7 @@ async fn clear_metadata(options: &MetadataOptions) -> Result<()> {
     let output = options.output.as_ref().unwrap_or(&options.input);
     write_metadata(output, &metadata).await?;
 
-    if !options.json_output {
+    if !options.json_output && !crate::progress::is_quiet() {
         println!("{}", "All metadata cleared".green().bold());
         println!("{:20} {}", "Output file:", output.display());
     }
@@ -291,7 +291,7 @@ async fn copy_metadata(options: &MetadataOptions, source: &Path) -> Result<()> {
     let output = options.output.as_ref().unwrap_or(&options.input);
     write_metadata(output, &metadata).await?;
 
-    if !options.json_output {
+    if !options.json_output && !crate::progress::is_quiet() {
         println!("{}", "Metadata copied successfully".green().bold());
         println!("{:20} {}", "Source:", source.display());
         println!("{:20} {}", "Destination:", output.display());

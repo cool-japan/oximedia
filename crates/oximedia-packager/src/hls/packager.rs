@@ -90,31 +90,47 @@ impl HlsPackager {
         Ok(())
     }
 
-    /// Generate a bitrate ladder from the real source-media parameters supplied
-    /// via [`crate::config::PackagerConfig::source_media`].
+    /// Generate a bitrate ladder from real source-media parameters.
     ///
-    /// Rungs are derived from the actual source resolution, framerate and codec:
-    /// [`LadderGenerator`] caps rungs at or below the source resolution and
-    /// labels each rung with the source codec. If no source info was provided,
-    /// this returns an error instead of fabricating a resolution — the caller
-    /// must either supply source info via `with_source_info(..)` or provide an
-    /// explicit ladder via `with_ladder(..)` and set `auto_generate = false`.
+    /// Resolution order:
+    /// 1. [`crate::config::PackagerConfig::source_media`], if the caller
+    ///    explicitly supplied it via `with_source_info(..)` — an explicit
+    ///    override always wins over auto-detection.
+    /// 2. Otherwise, a real probe of `input` (see
+    ///    [`crate::source_probe`]): when `input` names a readable media file,
+    ///    this reads its header and runs `oximedia-container`'s real
+    ///    `MultiFormatProber` — the same prober behind `oximedia-cli`'s probe
+    ///    tooling — to recover the actual codec and dimensions, never a
+    ///    fabricated resolution.
+    /// 3. If neither yields usable source info (no config override, and
+    ///    `input` is unreadable, unrecognized, or has no usable video
+    ///    stream), this returns an error rather than guessing — the caller
+    ///    must supply source info via `with_source_info(..)` or an explicit
+    ///    ladder via `with_ladder(..)` with `auto_generate = false`.
     ///
-    /// TODO(0.2.x): when `input` refers to a readable media file, probe it via
-    /// `oximedia-container` (`DetailedContainerInfo`) to auto-populate
-    /// `source_media` instead of requiring the caller to pass it.
+    /// Rungs are derived from the actual source resolution, framerate and
+    /// codec: [`LadderGenerator`] caps rungs at or below the source
+    /// resolution and labels each rung with the source codec.
     async fn generate_ladder_from_source(
         &self,
         input: &str,
     ) -> PackagerResult<crate::config::BitrateLadder> {
-        let source = self.config.source_media.clone().ok_or_else(|| {
-            PackagerError::invalid_config(format!(
-                "automatic bitrate ladder requested (ladder.auto_generate = true) but no source \
-                 media info is available for '{input}'; call with_source_info(SourceInfo::new(..)) \
-                 with the real resolution/framerate/codec, or supply an explicit ladder via \
-                 with_ladder(..) and set auto_generate = false"
-            ))
-        })?;
+        let source = match self.config.source_media.clone() {
+            Some(source) => source,
+            None => match crate::source_probe::probe_source_info(input).await {
+                Some(probed) => probed,
+                None => {
+                    return Err(PackagerError::invalid_config(format!(
+                        "automatic bitrate ladder requested (ladder.auto_generate = true) but no \
+                         source media info is available for '{input}' (it could not be probed as \
+                         a readable, video-bearing media file either); call \
+                         with_source_info(SourceInfo::new(..)) with the real \
+                         resolution/framerate/codec, or supply an explicit ladder via \
+                         with_ladder(..) and set auto_generate = false"
+                    )))
+                }
+            },
+        };
 
         let codec = source.codec.clone();
         let generator = LadderGenerator::new(source).with_codec(&codec);
@@ -125,15 +141,17 @@ impl HlsPackager {
     async fn process_input(&mut self, input: &str) -> PackagerResult<()> {
         info!("Processing input: {}", input);
 
-        // Collect variant names first to avoid borrow conflicts
-        let variant_names: Vec<_> = self
+        // Collect (variant name, codec) pairs first to avoid borrow conflicts.
+        // The codec drives `encrypt_for_codec`'s NAL-aware vs whole-buffer
+        // routing below.
+        let variant_names: Vec<(String, String)> = self
             .variant_set
             .variants()
             .iter()
-            .map(|v| v.config().name.clone())
+            .map(|v| (v.config().name.clone(), v.config().bitrate.codec.clone()))
             .collect();
 
-        for variant_name in variant_names {
+        for (variant_name, variant_codec) in variant_names {
             let variant_dir = self
                 .output_manager
                 .structure()
@@ -158,7 +176,7 @@ impl HlsPackager {
                     segment_generator.add_frame(&frame_data, true, timestamp)?
                 {
                     let segment_data = if let Some(handler) = &self.encryption_handler {
-                        handler.encrypt(&frame_data)?
+                        handler.encrypt_for_codec(&frame_data, &variant_codec)?
                     } else {
                         frame_data
                     };
@@ -187,7 +205,7 @@ impl HlsPackager {
                 segment_generator.add_frame(&final_data, true, final_timestamp)?
             {
                 let segment_data = if let Some(handler) = &self.encryption_handler {
-                    handler.encrypt(&final_data)?
+                    handler.encrypt_for_codec(&final_data, &variant_codec)?
                 } else {
                     final_data
                 };

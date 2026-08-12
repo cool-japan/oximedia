@@ -717,8 +717,12 @@ fn decode_block(
             break;
         }
         let coeff = extend(reader.read_bits(size)?, size);
+        // `quant` holds the DQT segment as it was read, i.e. in zigzag scan
+        // order (T.81 §B.2.4.1), so the divisor for scan position `k` is
+        // `quant[k]` — not `quant[ZIGZAG[k]]`, which pairs a coefficient with
+        // another frequency's step size and silently distorts every block.
         let natural = ZIGZAG[k];
-        block[natural] = (coeff * i32::from(quant[natural])) as f32;
+        block[natural] = (coeff * i32::from(quant[k])) as f32;
         k += 1;
     }
     Ok(())

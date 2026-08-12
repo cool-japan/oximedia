@@ -5,7 +5,6 @@ use crate::{
     error::{ReviewError, ReviewResult},
     CommentId,
 };
-use chrono::Utc;
 
 /// Resolve a comment.
 ///
@@ -18,16 +17,12 @@ use chrono::Utc;
 ///
 /// Returns error if comment cannot be resolved.
 pub async fn resolve_comment(comment_id: CommentId, user_id: &str) -> ReviewResult<()> {
-    // In a real implementation, this would:
-    // 1. Load the comment
-    // 2. Check if already resolved
-    // 3. Update status to Resolved
-    // 4. Set resolved_at and resolved_by
-    // 5. Persist changes
-    // 6. Send notifications
-
-    let _ = (comment_id, user_id, Utc::now());
-    Ok(())
+    let store = crate::store::default_store().await?;
+    let comment = store.get_comment(comment_id).await?;
+    validate_resolution(comment.status)?;
+    store
+        .set_comment_status(comment_id, CommentStatus::Resolved, Some(user_id))
+        .await
 }
 
 /// Unresolve a comment.
@@ -40,15 +35,12 @@ pub async fn resolve_comment(comment_id: CommentId, user_id: &str) -> ReviewResu
 ///
 /// Returns error if comment cannot be unresolved.
 pub async fn unresolve_comment(comment_id: CommentId) -> ReviewResult<()> {
-    // In a real implementation, this would:
-    // 1. Load the comment
-    // 2. Check if it's resolved
-    // 3. Update status to Open
-    // 4. Clear resolved_at and resolved_by
-    // 5. Persist changes
-
-    let _ = comment_id;
-    Ok(())
+    let store = crate::store::default_store().await?;
+    let comment = store.get_comment(comment_id).await?;
+    validate_unresolve(comment.status)?;
+    store
+        .set_comment_status(comment_id, CommentStatus::Open, None)
+        .await
 }
 
 /// Mark comment as archived.
@@ -61,8 +53,12 @@ pub async fn unresolve_comment(comment_id: CommentId) -> ReviewResult<()> {
 ///
 /// Returns error if comment cannot be archived.
 pub async fn archive_comment(comment_id: CommentId) -> ReviewResult<()> {
-    let _ = comment_id;
-    Ok(())
+    let store = crate::store::default_store().await?;
+    // Ensure the comment exists before honoring the archive request.
+    store.get_comment(comment_id).await?;
+    store
+        .set_comment_status(comment_id, CommentStatus::Archived, None)
+        .await
 }
 
 /// Bulk resolve multiple comments.
@@ -132,24 +128,62 @@ pub fn validate_unresolve(current_status: CommentStatus) -> ReviewResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AnnotationType, SessionId};
+
+    async fn create_test_comment() -> CommentId {
+        let session_id = SessionId::new();
+        crate::comment::add::add_comment(session_id, 100, "Test comment", AnnotationType::Issue)
+            .await
+            .expect("comment creation should succeed")
+    }
 
     #[tokio::test]
     async fn test_resolve_comment() {
-        let comment_id = CommentId::new();
+        let comment_id = create_test_comment().await;
         let result = resolve_comment(comment_id, "user-123").await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_unresolve_comment() {
+    async fn test_resolve_comment_not_found_is_honest_error() {
+        // A comment ID that was never created must not silently succeed.
         let comment_id = CommentId::new();
+        let result = resolve_comment(comment_id, "user-123").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_comment_twice_is_error() {
+        let comment_id = create_test_comment().await;
+        resolve_comment(comment_id, "user-123")
+            .await
+            .expect("first resolve should succeed");
+        let result = resolve_comment(comment_id, "user-123").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_unresolve_comment() {
+        let comment_id = create_test_comment().await;
+        resolve_comment(comment_id, "user-123")
+            .await
+            .expect("resolve should succeed");
+
         let result = unresolve_comment(comment_id).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
+    async fn test_unresolve_comment_not_yet_resolved_is_error() {
+        // validate_unresolve requires the comment to currently be Resolved.
+        let comment_id = create_test_comment().await;
+        let result = unresolve_comment(comment_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_resolve_comments_batch() {
-        let comment_ids = vec![CommentId::new(), CommentId::new()];
+        let comment_ids = vec![create_test_comment().await, create_test_comment().await];
         let result = resolve_comments_batch(&comment_ids, "user-123").await;
         assert!(result.is_ok());
     }

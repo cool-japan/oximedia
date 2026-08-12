@@ -80,7 +80,10 @@ pub use connection::ServerConnection;
 #[allow(unused_imports)]
 pub use recording::{RecordingRegistry, RecordingSession, RecordingStatus};
 #[allow(unused_imports)]
-pub use registry::{ActiveStream, StreamRegistry};
+pub use registry::{
+    is_audio_sequence_header, is_video_sequence_header, ActiveStream, SeqHeaderCache,
+    StreamRegistry,
+};
 #[allow(unused_imports)]
 pub use relay::{RelayManager, RelayTarget};
 #[allow(unused_imports)]

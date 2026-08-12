@@ -13,7 +13,8 @@
 //! - Linear and logarithmic color spaces
 //! - Metadata preservation (camera, display window, etc.)
 //! - Sequence pattern matching (printf-style, hash notation)
-//! - Parallel I/O with rayon
+//! - Parallel I/O with rayon on native targets (`wasm32`, which has no threads,
+//!   transparently falls back to sequential iteration)
 //! - Zero-copy operations where possible
 //!
 //! # Example
@@ -124,6 +125,7 @@ pub mod webp;
 
 mod error;
 mod image;
+mod parallel;
 mod pattern;
 #[cfg(test)]
 mod wave13_tests;

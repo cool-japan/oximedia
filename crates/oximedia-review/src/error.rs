@@ -28,6 +28,14 @@ pub enum ReviewError {
     #[error("Version not found: {0}")]
     VersionNotFound(String),
 
+    /// Change request not found.
+    #[error("Change request not found: {0}")]
+    ChangeRequestNotFound(String),
+
+    /// Notification not found.
+    #[error("Notification not found: {0}")]
+    NotificationNotFound(String),
+
     /// User not found.
     #[error("User not found: {0}")]
     UserNotFound(String),
@@ -79,6 +87,10 @@ pub enum ReviewError {
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Persistence-layer (SQLite) error from the review store.
+    #[error("Database error: {0}")]
+    Database(#[from] oxisql_core::OxiSqlError),
 
     /// Serialization error.
     #[error("Serialization error: {0}")]

@@ -378,22 +378,24 @@ async fn normalize_audio(
         audio.sample_rate,
     )?;
 
-    println!("{}", "Audio Normalization".green().bold());
-    println!("{}", "=".repeat(60));
-    println!("{:20} {}", "Input:", input.display());
-    println!("{:20} {}", "Output:", output.display());
-    println!("{:20} {:.1} LUFS", "Target:", standard.target_lufs());
-    println!("{:20} {:.1} LUFS", "Measured:", analysis.integrated_lufs);
-    println!("{:20} {:+.1} dB", "Applied gain:", applied_gain_db);
-    println!(
-        "{:20} {}",
-        "Limiter:",
-        if limiter { "enabled" } else { "disabled" }
-    );
-    println!("{:20} {}", "DRC:", if drc { "enabled" } else { "disabled" });
-    println!("{:20} {} bytes", "Output size:", file_size);
-    println!();
-    println!("{}", "Status: normalization applied and written.".green());
+    if !crate::progress::is_quiet() {
+        println!("{}", "Audio Normalization".green().bold());
+        println!("{}", "=".repeat(60));
+        println!("{:20} {}", "Input:", input.display());
+        println!("{:20} {}", "Output:", output.display());
+        println!("{:20} {:.1} LUFS", "Target:", standard.target_lufs());
+        println!("{:20} {:.1} LUFS", "Measured:", analysis.integrated_lufs);
+        println!("{:20} {:+.1} dB", "Applied gain:", applied_gain_db);
+        println!(
+            "{:20} {}",
+            "Limiter:",
+            if limiter { "enabled" } else { "disabled" }
+        );
+        println!("{:20} {}", "DRC:", if drc { "enabled" } else { "disabled" });
+        println!("{:20} {} bytes", "Output size:", file_size);
+        println!();
+        println!("{}", "Status: normalization applied and written.".green());
+    }
 
     Ok(())
 }

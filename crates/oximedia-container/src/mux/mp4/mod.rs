@@ -37,10 +37,12 @@
 
 mod av1c;
 mod basic;
+pub mod esds;
 pub mod simple;
 mod writer;
 
 pub use basic::{BasicMp4Error, BasicMp4Muxer};
+pub use esds::{build_audio_specific_config, build_esds_box, build_esds_payload, EsdsParams};
 pub use simple::{
     AudioCodecInfo, FourCC, Mp4Sample, Mp4TrackWriter, SimpleMp4Config, SimpleMp4Error,
     SimpleMp4Muxer, TrackCodec, VideoCodecInfo,

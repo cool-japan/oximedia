@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 
 /// Render farm cluster management subcommands.
 #[derive(Subcommand, Debug)]
@@ -307,6 +308,66 @@ fn validate_priority(priority: &str) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Persistent cluster state directory
+// ---------------------------------------------------------------------------
+//
+// `oximedia_renderfarm::CoordinatorConfig` has no state-directory field (it
+// only carries scheduling/retry/timeout knobs — verified against the crate
+// source), so `--data-dir` cannot configure the in-process `Coordinator`
+// itself. It can, however, drive a real directory *this CLI* owns: each
+// `init` writes a JSON cluster manifest there, following the same
+// established pattern as `mam_cmd`/`proxy_cmd`'s JSON catalogs and
+// `tui_cmd`/`virtual_cmd`'s XDG-resolved state files. `add-node`/
+// `remove-node`/`submit`/`status`/`dashboard` do not read this manifest —
+// those five subcommands remain the pre-existing stubs documented inline as
+// requiring gRPC cluster integration, which is unrelated, much larger work.
+
+/// A cluster's persisted init-time configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClusterManifest {
+    name: String,
+    bind_address: String,
+    max_concurrent_jobs: u32,
+    scheduler: String,
+    cloud_burst: bool,
+    created_at: String,
+}
+
+/// Default per-user state directory when `--data-dir` is omitted:
+/// `$XDG_STATE_HOME/oximedia/renderfarm` (or the platform equivalent via the
+/// `dirs` crate, falling back to the system temp dir). Mirrors the
+/// resolution order `tui_cmd`/`virtual_cmd` already use for their own state
+/// files — no hardcoded absolute path.
+fn default_state_dir() -> std::path::PathBuf {
+    let base = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("oximedia").join("renderfarm")
+}
+
+/// Turn a cluster name into a filesystem-safe manifest filename: ASCII
+/// alphanumerics, `-` and `_` pass through; everything else (including path
+/// separators, so a hostile `--name` cannot escape the state directory)
+/// becomes `_`.
+fn sanitize_cluster_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "unnamed".to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Initialize a new render farm cluster.
 async fn init_cluster(
     name: &str,
@@ -319,15 +380,6 @@ async fn init_cluster(
 ) -> Result<()> {
     validate_scheduler(scheduler)?;
 
-    // CoordinatorConfig has no state-directory field, so --data-dir cannot
-    // configure anything real; warn instead of silently accepting a path
-    // the coordinator will never touch.
-    // TODO(0.2.x): add a persistent state directory to
-    // oximedia_renderfarm::CoordinatorConfig and thread this through.
-    if data_dir.is_some() {
-        eprintln!("warning: --data-dir is not implemented yet and is ignored");
-    }
-
     let config = oximedia_renderfarm::CoordinatorConfig {
         max_concurrent_jobs: max_jobs as usize,
         ..oximedia_renderfarm::CoordinatorConfig::default()
@@ -337,6 +389,32 @@ async fn init_cluster(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to initialize cluster: {}", e))?;
 
+    // Real, user-configurable persistent state directory: `--data-dir` when
+    // given, otherwise the XDG-conventional default. Actually created on
+    // disk, and a real manifest file is written into it below — this is not
+    // just accepted-and-ignored.
+    let state_dir = data_dir.map_or_else(default_state_dir, std::path::Path::to_path_buf);
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("Failed to create state directory: {}", state_dir.display()))?;
+
+    let manifest = ClusterManifest {
+        name: name.to_string(),
+        bind_address: bind.to_string(),
+        max_concurrent_jobs: max_jobs,
+        scheduler: scheduler.to_string(),
+        cloud_burst,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let manifest_path = state_dir.join(format!("{}.json", sanitize_cluster_name(name)));
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).context("Failed to serialize cluster manifest")?;
+    std::fs::write(&manifest_path, manifest_json).with_context(|| {
+        format!(
+            "Failed to write cluster manifest: {}",
+            manifest_path.display()
+        )
+    })?;
+
     if json_output {
         let result = serde_json::json!({
             "command": "init",
@@ -345,7 +423,8 @@ async fn init_cluster(
             "max_jobs": max_jobs,
             "scheduler": scheduler,
             "cloud_burst": cloud_burst,
-            "data_dir": data_dir.map(|p| p.display().to_string()),
+            "state_dir": state_dir.display().to_string(),
+            "manifest": manifest_path.display().to_string(),
             "status": "initialized",
         });
         let json_str =
@@ -363,15 +442,20 @@ async fn init_cluster(
             "Cloud bursting:",
             if cloud_burst { "enabled" } else { "disabled" }
         );
-        if let Some(dd) = data_dir {
-            println!("{:25} {}", "Data directory:", dd.display());
-        }
+        println!("{:25} {}", "State directory:", state_dir.display());
+        println!("{:25} {}", "Manifest:", manifest_path.display());
         println!();
         println!(
             "{}",
             "Cluster coordinator initialized and ready for nodes."
                 .cyan()
                 .bold()
+        );
+        println!(
+            "{}",
+            "Note: add-node/submit/status/dashboard do not yet read this manifest \
+             (cluster gRPC integration is separate, pending work)."
+                .yellow()
         );
     }
 
@@ -800,5 +884,108 @@ mod tests {
             deadline: None,
         };
         assert!(matches!(cmd, RenderfarmCommand::Submit { .. }));
+    }
+
+    // ── Persistent state directory ─────────────────────────────────────────
+
+    #[test]
+    fn test_default_state_dir_is_sane() {
+        let dir = default_state_dir();
+        assert!(
+            dir.ends_with("renderfarm"),
+            "expected a renderfarm leaf, got: {}",
+            dir.display()
+        );
+        assert!(
+            dir.to_string_lossy().contains("oximedia"),
+            "expected an oximedia subdirectory, got: {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn test_sanitize_cluster_name_keeps_safe_chars() {
+        assert_eq!(sanitize_cluster_name("prod-cluster_01"), "prod-cluster_01");
+    }
+
+    #[test]
+    fn test_sanitize_cluster_name_strips_path_traversal() {
+        // Must not allow a hostile --name to escape the state directory.
+        let sanitized = sanitize_cluster_name("../../etc/passwd");
+        assert!(!sanitized.contains('/'));
+        assert!(!sanitized.contains(".."));
+    }
+
+    #[test]
+    fn test_sanitize_cluster_name_empty_falls_back() {
+        assert_eq!(sanitize_cluster_name(""), "unnamed");
+    }
+
+    #[test]
+    fn test_sanitize_cluster_name_all_unsafe_chars_become_underscores() {
+        // Non-empty input never falls back to "unnamed", even if every
+        // character had to be replaced.
+        assert_eq!(sanitize_cluster_name("///"), "___");
+    }
+
+    #[tokio::test]
+    async fn test_init_cluster_writes_real_manifest() {
+        let dir = std::env::temp_dir().join("oximedia_renderfarm_cmd_test_init");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        init_cluster(
+            "my-test-cluster",
+            "0.0.0.0:9200",
+            Some(&dir),
+            250,
+            "priority",
+            true,
+            true,
+        )
+        .await
+        .expect("init_cluster should succeed");
+
+        let manifest_path = dir.join("my-test-cluster.json");
+        assert!(
+            manifest_path.exists(),
+            "a real manifest file must be written to the data dir, expected: {}",
+            manifest_path.display()
+        );
+
+        let raw = std::fs::read_to_string(&manifest_path).expect("read manifest");
+        let manifest: ClusterManifest = serde_json::from_str(&raw).expect("parse manifest");
+        assert_eq!(manifest.name, "my-test-cluster");
+        assert_eq!(manifest.bind_address, "0.0.0.0:9200");
+        assert_eq!(manifest.max_concurrent_jobs, 250);
+        assert_eq!(manifest.scheduler, "priority");
+        assert!(manifest.cloud_burst);
+        assert!(
+            !manifest.created_at.is_empty(),
+            "created_at must be a real timestamp"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_init_cluster_rejects_invalid_scheduler_before_writing() {
+        let dir = std::env::temp_dir().join("oximedia_renderfarm_cmd_test_bad_scheduler");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let result = init_cluster(
+            "bad-scheduler-cluster",
+            "0.0.0.0:9200",
+            Some(&dir),
+            100,
+            "not-a-real-scheduler",
+            false,
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !dir.exists(),
+            "an invalid scheduler must fail before any directory/manifest is created"
+        );
     }
 }

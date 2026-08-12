@@ -148,7 +148,7 @@ impl MetricSeries {
 
         let rate_per_sec = if in_window.len() >= 2 {
             let first = &in_window[0];
-            let last = in_window.last().expect("already checked len >= 2");
+            let last = in_window.last().copied().unwrap_or(*first);
             let elapsed = last
                 .0
                 .duration_since(first.0)
@@ -338,7 +338,10 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     let frac = rank - lo as f64;
 
     if hi >= sorted.len() {
-        return *sorted.last().expect("len > 1 checked above");
+        // `sorted` has at least 2 elements here (both the empty and
+        // single-element cases return above), so this fallback is never
+        // actually reached — kept as a safe default rather than a panic.
+        return sorted.last().copied().unwrap_or(0.0);
     }
 
     sorted[lo] + frac * (sorted[hi] - sorted[lo])
@@ -392,8 +395,11 @@ fn lttb(data: &[(f64, f64)], target: usize) -> Vec<(f64, f64)> {
             data[n - 1]
         };
 
-        // Point A is the last selected point.
-        let (ax, ay) = *sampled.last().expect("sampled is non-empty");
+        // Point A is the last selected point. `sampled` always holds at
+        // least the first data point pushed above, so this is never
+        // actually reached — `data[0]` is a safe, semantically correct
+        // fallback rather than a panic.
+        let (ax, ay) = sampled.last().copied().unwrap_or(data[0]);
 
         // Find the point in the current bucket that maximises the triangle area.
         let mut max_area = -1.0_f64;
@@ -412,8 +418,10 @@ fn lttb(data: &[(f64, f64)], target: usize) -> Vec<(f64, f64)> {
         sampled.push(data[max_idx]);
     }
 
-    // Always include the last point.
-    sampled.push(*data.last().expect("data is non-empty"));
+    // Always include the last point. `n >= 3` here (the early return above
+    // covers `target >= n || target < 2`, and `target >= 2`), so indexing
+    // by `n - 1` mirrors the existing `data[n - 1]` fallback used above.
+    sampled.push(data[n - 1]);
 
     sampled
 }

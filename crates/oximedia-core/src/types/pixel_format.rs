@@ -110,6 +110,14 @@ pub enum PixelFormat {
     /// Full chroma resolution, each sample in a 16-bit word.
     /// Plane layout: Y (w×h), Cb (w×h), Cr (w×h).
     Yuv444p16le,
+
+    /// YUYV 4:2:2 packed, 8-bit (FourCC YUYV/YUY2): Y0 U Y1 V per 2 pixels.
+    /// Single plane; 2 bytes per pixel. The most common UVC webcam format.
+    Yuyv422,
+
+    /// UYVY 4:2:2 packed, 8-bit (FourCC UYVY/2vuy): U Y0 V Y1 per 2 pixels.
+    /// Single plane; 2 bytes per pixel. AVFoundation's 2vuy, NDI's UYVY.
+    Uyvy422,
 }
 
 impl PixelFormat {
@@ -135,7 +143,7 @@ impl PixelFormat {
             Self::Yuv420p10le => 15,
             // Yuv422p10le: 10-bit samples in 16-bit words, 4:2:2 chroma
             // Average bpp = (w*h*2 + w/2*h*2 + w/2*h*2) / (w*h) * 8 / 2 = 20 bpp
-            Self::Yuv422p | Self::Gray16 => 16,
+            Self::Yuv422p | Self::Gray16 | Self::Yuyv422 | Self::Uyvy422 => 16,
             Self::Yuv422p10le => 20,
             Self::Yuv420p12le => 18,
             // Yuv422p12le: 12-bit samples in 16-bit words, 4:2:2 chroma
@@ -188,7 +196,12 @@ impl PixelFormat {
             | Self::Yuv422p16le
             | Self::Yuv444p16le => 3,
             Self::Nv12 | Self::Nv21 | Self::P010 | Self::P016 => 2,
-            Self::Rgb24 | Self::Rgba32 | Self::Gray8 | Self::Gray16 => 1,
+            Self::Rgb24
+            | Self::Rgba32
+            | Self::Gray8
+            | Self::Gray16
+            | Self::Yuyv422
+            | Self::Uyvy422 => 1,
         }
     }
 
@@ -223,6 +236,8 @@ impl PixelFormat {
             Self::Rgb24 | Self::Rgba32 | Self::Gray8 | Self::Gray16 => false,
             // Semi-planar formats are considered non-planar (UV is interleaved)
             Self::Nv12 | Self::Nv21 | Self::P010 | Self::P016 => false,
+            // Packed 4:2:2 formats interleave luma and chroma in one plane
+            Self::Yuyv422 | Self::Uyvy422 => false,
         }
     }
 
@@ -266,7 +281,9 @@ impl PixelFormat {
             | Self::Rgba32
             | Self::Gray8
             | Self::Nv12
-            | Self::Nv21 => 8,
+            | Self::Nv21
+            | Self::Yuyv422
+            | Self::Uyvy422 => 8,
             Self::Yuv420p10le | Self::Yuv422p10le | Self::Yuv444p10le | Self::P010 => 10,
             Self::Yuv420p12le | Self::Yuv422p12le | Self::Yuv444p12le => 12,
             Self::Gray16
@@ -307,6 +324,8 @@ impl PixelFormat {
                 | Self::Nv21
                 | Self::P010
                 | Self::P016
+                | Self::Yuyv422
+                | Self::Uyvy422
         )
     }
 
@@ -365,7 +384,12 @@ impl PixelFormat {
             | Self::Nv21
             | Self::P010
             | Self::P016 => (2, 2),
-            Self::Yuv422p | Self::Yuv422p10le | Self::Yuv422p12le | Self::Yuv422p16le => (2, 1),
+            Self::Yuv422p
+            | Self::Yuv422p10le
+            | Self::Yuv422p12le
+            | Self::Yuv422p16le
+            | Self::Yuyv422
+            | Self::Uyvy422 => (2, 1),
             Self::Yuv444p
             | Self::Yuv444p10le
             | Self::Yuv444p12le
@@ -400,6 +424,8 @@ impl PixelFormat {
             Self::Gray16 => w * h * 2,
             Self::Rgb24 => w * h * 3,
             Self::Rgba32 => w * h * 4,
+            // Packed YUV 4:2:2 (single interleaved plane): 2 bytes per pixel
+            Self::Yuyv422 | Self::Uyvy422 => w * h * 2,
             // Planar YUV 8-bit
             Self::Yuv420p => w * h + 2 * (w / 2) * (h / 2), // Y + U + V
             Self::Yuv422p => w * h + 2 * (w / 2) * h,       // Y + U + V
@@ -467,6 +493,14 @@ impl PixelFormat {
             Self::Rgba32 => {
                 if plane == 0 {
                     Some(w * 4)
+                } else {
+                    None
+                }
+            }
+            // Packed 4:2:2: single interleaved plane, 2 bytes per pixel
+            Self::Yuyv422 | Self::Uyvy422 => {
+                if plane == 0 {
+                    Some(w * 2)
                 } else {
                     None
                 }
@@ -554,6 +588,8 @@ impl std::str::FromStr for PixelFormat {
             "yuv420p16le" | "yuv420p16" => Ok(Self::Yuv420p16le),
             "yuv422p16le" | "yuv422p16" => Ok(Self::Yuv422p16le),
             "yuv444p16le" | "yuv444p16" => Ok(Self::Yuv444p16le),
+            "yuyv422" | "yuyv" | "yuy2" => Ok(Self::Yuyv422),
+            "uyvy422" | "uyvy" | "2vuy" => Ok(Self::Uyvy422),
             "rgb24" | "rgb" => Ok(Self::Rgb24),
             "rgba32" | "rgba" => Ok(Self::Rgba32),
             "gray8" | "gray" | "grey8" | "grey" => Ok(Self::Gray8),
@@ -584,6 +620,8 @@ impl std::fmt::Display for PixelFormat {
             Self::Yuv420p16le => "yuv420p16le",
             Self::Yuv422p16le => "yuv422p16le",
             Self::Yuv444p16le => "yuv444p16le",
+            Self::Yuyv422 => "yuyv422",
+            Self::Uyvy422 => "uyvy422",
             Self::Rgb24 => "rgb24",
             Self::Rgba32 => "rgba32",
             Self::Gray8 => "gray8",
@@ -976,5 +1014,64 @@ mod tests {
             let parsed: PixelFormat = s.parse().expect("roundtrip should work");
             assert_eq!(*fmt, parsed);
         }
+    }
+
+    // ── Yuyv422 / Uyvy422 packed 4:2:2 tests ─────────────────────────
+
+    #[test]
+    fn test_yuyv422_properties() {
+        let fmt = PixelFormat::Yuyv422;
+        assert_eq!(fmt.bits_per_pixel(), 16);
+        assert_eq!(fmt.plane_count(), 1);
+        assert_eq!(fmt.frame_buffer_size(64, 48), 6144);
+        assert_eq!(fmt.stride_for_width(64, 0), Some(128));
+        assert_eq!(fmt.chroma_subsampling(), (2, 1));
+        assert!(fmt.is_yuv());
+        assert!(!fmt.is_rgb());
+        assert!(!fmt.has_alpha());
+        assert!(!fmt.is_planar());
+        assert!(!fmt.is_semi_planar());
+        assert_eq!(fmt.bits_per_component(), 8);
+        assert_eq!(format!("{fmt}"), "yuyv422");
+    }
+
+    #[test]
+    fn test_uyvy422_properties() {
+        let fmt = PixelFormat::Uyvy422;
+        assert_eq!(fmt.bits_per_pixel(), 16);
+        assert_eq!(fmt.plane_count(), 1);
+        assert_eq!(fmt.frame_buffer_size(64, 48), 6144);
+        assert_eq!(fmt.stride_for_width(64, 0), Some(128));
+        assert_eq!(fmt.chroma_subsampling(), (2, 1));
+        assert!(fmt.is_yuv());
+        assert!(!fmt.is_rgb());
+        assert!(!fmt.has_alpha());
+        assert!(!fmt.is_planar());
+        assert!(!fmt.is_semi_planar());
+        assert_eq!(fmt.bits_per_component(), 8);
+        assert_eq!(format!("{fmt}"), "uyvy422");
+    }
+
+    #[test]
+    fn test_yuyv422_uyvy422_stride_out_of_range() {
+        assert_eq!(PixelFormat::Yuyv422.stride_for_width(64, 1), None);
+        assert_eq!(PixelFormat::Uyvy422.stride_for_width(64, 1), None);
+    }
+
+    #[test]
+    fn test_yuyv422_uyvy422_from_str_roundtrip() {
+        let cases = [
+            ("yuyv422", PixelFormat::Yuyv422),
+            ("yuyv", PixelFormat::Yuyv422),
+            ("yuy2", PixelFormat::Yuyv422),
+            ("uyvy422", PixelFormat::Uyvy422),
+            ("uyvy", PixelFormat::Uyvy422),
+            ("2vuy", PixelFormat::Uyvy422),
+        ];
+        for (s, fmt) in cases {
+            assert_eq!(s.parse::<PixelFormat>().expect("parse"), fmt);
+        }
+        assert_eq!(format!("{}", PixelFormat::Yuyv422), "yuyv422");
+        assert_eq!(format!("{}", PixelFormat::Uyvy422), "uyvy422");
     }
 }

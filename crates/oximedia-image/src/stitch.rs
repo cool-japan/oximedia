@@ -552,17 +552,14 @@ pub fn match_descriptors_parallel(
     descriptors_a: &[Descriptor],
     descriptors_b: &[Descriptor],
 ) -> Vec<DescriptorMatch> {
-    use rayon::prelude::*;
+    use crate::parallel::filter_map_enumerated;
 
     if descriptors_b.is_empty() {
         return Vec::new();
     }
 
-    let mut matches: Vec<DescriptorMatch> = descriptors_a
-        .par_iter()
-        .enumerate()
-        .filter_map(|(ai, da)| find_nearest(da, descriptors_b, ai))
-        .collect();
+    let mut matches: Vec<DescriptorMatch> =
+        filter_map_enumerated(descriptors_a, |ai, da| find_nearest(da, descriptors_b, ai));
 
     matches.sort_by(|a, b| {
         a.distance

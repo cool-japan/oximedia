@@ -317,6 +317,15 @@ pub struct VideoConfig {
 impl VideoConfig {
     /// Creates a new video configuration.
     ///
+    /// The codec defaults to [`VideoCodec::Vp9`], which **cannot be sent**:
+    /// no working VP9 encoder exists behind this crate, so
+    /// [`VideoIpSource::new`](crate::VideoIpSource::new) rejects it (see
+    /// [`crate::codec`]). Call [`with_codec`](Self::with_codec) with an
+    /// uncompressed codec — [`VideoCodec::Uyvy`], [`VideoCodec::V210`],
+    /// [`VideoCodec::Yuv420p`] or [`VideoCodec::Yuv420p10`] — to build a
+    /// transmittable configuration. The VP9 default is retained because it is
+    /// still meaningful on the receiving side, where VP9 decode is real.
+    ///
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid.
@@ -358,6 +367,14 @@ pub struct AudioConfig {
 
 impl AudioConfig {
     /// Creates a new audio configuration.
+    ///
+    /// The codec defaults to [`AudioCodec::Opus`], which this crate can
+    /// neither encode nor decode — the backing implementation produces and
+    /// consumes output that is not the actual signal, so both directions fail
+    /// honestly (see [`crate::codec`]). Call
+    /// [`with_codec`](Self::with_codec) with [`AudioCodec::Pcm16`],
+    /// [`AudioCodec::Pcm24`] or [`AudioCodec::PcmF32`] for a usable
+    /// configuration.
     ///
     /// # Errors
     ///

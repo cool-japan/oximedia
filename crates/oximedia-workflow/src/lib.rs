@@ -85,6 +85,8 @@ pub mod step_conditions;
 pub mod step_result;
 pub mod task;
 pub mod task_dependency;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod task_exec;
 pub mod task_graph;
 pub mod task_priority_queue;
 pub mod task_template;
@@ -161,6 +163,8 @@ pub use task::{
     AnalysisType, HttpMethod, NotificationChannel, RetryPolicy, Task, TaskId, TaskPriority,
     TaskResult, TaskState, TaskType, TransferProtocol,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use task_exec::TaskOutcome;
 pub use task_priority_queue::{PriorityEntry, PriorityLevel, TaskPriorityQueue};
 pub use utils::{
     calculate_parallelism, clone_workflow, estimate_workflow_duration, expand_env_vars,

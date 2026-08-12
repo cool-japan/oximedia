@@ -408,17 +408,13 @@ impl MetricsCollector {
     }
 
     /// Get average job duration by type
-    ///
-    /// # Panics
-    ///
-    /// This function may panic if `duration_secs` is `None` for a filtered metric.
     #[must_use]
     pub async fn get_avg_duration_by_type(&self, job_type: &str) -> f64 {
         let metrics = self.job_metrics.read().await;
         let durations: Vec<f64> = metrics
             .iter()
-            .filter(|m| m.job_type == job_type && m.duration_secs.is_some())
-            .map(|m| m.duration_secs.expect("duration_secs should be Some"))
+            .filter(|m| m.job_type == job_type)
+            .filter_map(|m| m.duration_secs)
             .collect();
 
         if durations.is_empty() {

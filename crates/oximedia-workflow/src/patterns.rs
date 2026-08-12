@@ -1,4 +1,23 @@
 //! Common workflow patterns and templates.
+//!
+//! # Executability
+//!
+//! These constructors build workflow *shapes*. Whether a given shape runs to
+//! completion under [`crate::executor::DefaultTaskExecutor`] depends on what
+//! [`crate::task_exec`] can really do with the caller's files today:
+//!
+//! - **Transcode** — every preset named here resolves onto an encoder that
+//!   exists in this build (see [`crate::task_exec::transcode`]). Inputs must
+//!   be a container `oximedia-transcode` demuxes.
+//! - **Analysis** — decodes **WAV** and **Y4M** only. A pattern that analyses
+//!   an MP4/MKV master (e.g. [`archive_workflow`], [`distribution_workflow`])
+//!   fails that step with an honest "cannot decode" error until the crate
+//!   grows an A/V demux path; it does not report a fabricated success.
+//! - **QualityControl** — needs a container `oximedia-qc` genuinely probes
+//!   (ISO-BMFF, Matroska/WebM, AVI, WAV, FLAC, Ogg, MXF).
+//! - **Transfer** to a remote protocol and **Notification** delivery are
+//!   simulated by the default executor; supply a custom
+//!   [`crate::executor::TaskExecutor`] for those.
 
 use crate::task::{Task, TaskPriority, TaskType};
 use crate::workflow::Workflow;
@@ -69,7 +88,12 @@ pub fn multi_pass_encoding(
         TaskType::QualityControl {
             input: proxy_output.clone(),
             profile: qc_profile,
-            rules: vec!["video_quality".to_string(), "audio_levels".to_string()],
+            // Left empty on purpose: `rules` means "these checks MUST have
+            // run", and the caller-supplied profile decides which rules are
+            // installed *and* which of them apply to the file. Demanding a
+            // specific rule here would fail QC for reasons unrelated to the
+            // media. See `task_exec::qc`.
+            rules: Vec::new(),
         },
     );
 
@@ -129,11 +153,10 @@ pub fn validation_pipeline(
         TaskType::QualityControl {
             input: input_file.clone(),
             profile: "broadcast".to_string(),
-            rules: vec![
-                "video_bitrate".to_string(),
-                "audio_channels".to_string(),
-                "format_compliance".to_string(),
-            ],
+            // See the note in `multi_pass_encoding`: the Broadcast preset
+            // installs the rule set, and rule applicability depends on the
+            // file's streams.
+            rules: Vec::new(),
         },
     );
 
@@ -198,24 +221,33 @@ pub fn distribution_workflow(
 
     let source_id = workflow.add_task(source_task);
 
-    // Create multiple format outputs
+    // Create multiple format outputs. Presets and scales are the ones
+    // `task_exec::transcode` really resolves onto encoders that exist in this
+    // build (MJPEG/FFV1 + PCM/FLAC in Matroska); a made-up preset name would
+    // now fail the task instead of silently "succeeding".
     let formats = vec![
-        ("web-hd", "1080p-web"),
-        ("web-sd", "720p-web"),
-        ("mobile", "480p-mobile"),
-        ("broadcast", "broadcast-hd"),
+        ("web-hd", "standard", 1920u32),
+        ("web-sd", "standard", 1280),
+        ("mobile", "proxy", 854),
+        ("broadcast", "high-quality", 1920),
     ];
 
     let mut encode_ids = Vec::new();
 
-    for (name, preset) in formats {
+    for (name, preset, width) in formats {
+        let mut params = HashMap::new();
+        params.insert(
+            "scale".to_string(),
+            serde_json::json!(format!("{width}x-1")),
+        );
+
         let encode_task = Task::new(
             format!("encode-{name}"),
             TaskType::Transcode {
                 input: source.clone(),
-                output: output_dir.join(format!("{name}.mp4")),
+                output: output_dir.join(format!("{name}.mkv")),
                 preset: preset.to_string(),
-                params: HashMap::new(),
+                params,
             },
         )
         .with_priority(TaskPriority::High);
@@ -277,24 +309,32 @@ pub fn archive_workflow(
 
     let ingest_id = workflow.add_task(ingest_task);
 
-    // Step 2: Create multiple proxy formats
+    // Step 2: Create multiple proxy formats. Every entry names a preset
+    // `task_exec::transcode` resolves onto real encoders, with the resolution
+    // expressed as a scale parameter.
     let proxy_formats = vec![
-        ("proxy-high", "proxy-1080p"),
-        ("proxy-medium", "proxy-720p"),
-        ("proxy-low", "proxy-480p"),
-        ("thumbnail", "thumbnail-grid"),
+        ("proxy-high", 1920u32),
+        ("proxy-medium", 1280),
+        ("proxy-low", 854),
+        ("proxy-thumb", 320),
     ];
 
     let mut proxy_ids = Vec::new();
 
-    for (name, preset) in proxy_formats {
+    for (name, width) in proxy_formats {
+        let mut params = HashMap::new();
+        params.insert(
+            "scale".to_string(),
+            serde_json::json!(format!("{width}x-1")),
+        );
+
         let proxy_task = Task::new(
             format!("create-{name}"),
             TaskType::Transcode {
                 input: source.clone(),
-                output: proxy_dir.join(format!("{name}.mp4")),
-                preset: preset.to_string(),
-                params: HashMap::new(),
+                output: proxy_dir.join(format!("{name}.mkv")),
+                preset: "proxy".to_string(),
+                params,
             },
         );
 

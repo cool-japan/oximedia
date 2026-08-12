@@ -35,3 +35,8 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

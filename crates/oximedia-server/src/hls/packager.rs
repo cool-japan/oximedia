@@ -91,6 +91,20 @@ impl StreamPackager {
 
     /// Processes a media packet.
     async fn process_packet(&self, packet: MediaPacket) -> ServerResult<()> {
+        // Learn the codec configuration as packets arrive, so a segment whose
+        // buffer happens to open with a coded frame still muxes rather than
+        // being dropped whole. Sequence headers carry no elementary samples,
+        // so the same packets are still muxed in full at finalize time.
+        if let Err(e) = self.segment_writer.observe_packet(&packet) {
+            if !self.mux_unsupported_logged.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "HLS ingest for stream '{}' is not muxable: {}; \
+                     dropping segments (no fabricated output produced)",
+                    self.stream_key, e
+                );
+            }
+        }
+
         let should_finalize = {
             let mut buffer = self.packet_buffer.write();
             buffer.push(packet);
@@ -124,21 +138,31 @@ impl StreamPackager {
             (idx, format!("segment{}.ts", idx))
         };
 
-        // Attempt to write a real MPEG-TS segment. Real muxing is not yet
-        // implemented (see hls/segment.rs), so this fails honestly. We degrade
-        // by dropping the segment instead of writing a fabricated file or
-        // advertising a segment that does not exist in the playlist. Warn once
-        // per stream to avoid flooding the log every segment.
+        // Write a real MPEG-TS segment via the transport-stream muxer. When
+        // the ingest cannot be depacketized (Red List codec, no Enhanced-RTMP
+        // sequence header yet) this fails honestly. We degrade by dropping the
+        // segment instead of writing a fabricated file or advertising a segment
+        // that does not exist in the playlist. Warn once per stream to avoid
+        // flooding the log every segment.
         match self
             .segment_writer
             .write_segment(&segment_name, &packets)
             .await
         {
-            Ok(()) => {
-                // Only advertise the segment once it was genuinely produced.
-                self.playlist_gen
-                    .add_segment(&segment_name, self.config.segment_duration.as_secs_f64())?;
-                info!("Finalized HLS segment: {}", segment_name);
+            Ok(measured_duration) => {
+                // Only advertise the segment once it was genuinely produced,
+                // and advertise the duration its samples actually span: an
+                // EXTINF that disagrees with the segment drifts a player's
+                // timeline. A segment too short to measure (a single sample has
+                // no measurable inter-sample delta) falls back to the
+                // configured target.
+                let duration = if measured_duration > 0.0 {
+                    measured_duration
+                } else {
+                    self.config.segment_duration.as_secs_f64()
+                };
+                self.playlist_gen.add_segment(&segment_name, duration)?;
+                info!("Finalized HLS segment: {} ({:.3}s)", segment_name, duration);
             }
             Err(e) => {
                 if !self.mux_unsupported_logged.swap(true, Ordering::Relaxed) {

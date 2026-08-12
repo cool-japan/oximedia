@@ -113,21 +113,32 @@ pub async fn compare_multiple(versions: &[Version]) -> ReviewResult<Vec<VersionC
 
 /// Find differences in frame range.
 ///
+/// This crate has no decoder dependency (it is the review/collaboration
+/// layer, not a codec), so it cannot decode `version_a`/`version_b`'s content
+/// to compare frame pixels. A real implementation needs a decoder-backed
+/// pipeline upstream (e.g. `oximedia-codec`) to produce per-frame hashes or
+/// diffs, which could then be persisted and listed from here; until such a
+/// pipeline is wired in, returning an empty list would misrepresent "no
+/// differences found" as a real result, so this honestly reports the missing
+/// capability instead.
+///
 /// # Errors
 ///
-/// Returns error if operation fails.
+/// Always returns [`crate::error::ReviewError::Other`]: frame-level
+/// differencing requires decoded video frames, which are not available to
+/// this crate.
 pub async fn find_frame_differences(
     _version_a: &Version,
     _version_b: &Version,
     _start_frame: i64,
     _end_frame: i64,
 ) -> ReviewResult<Vec<i64>> {
-    // In a real implementation, this would:
-    // 1. Load frames from both versions
-    // 2. Compare frame by frame
-    // 3. Identify changed frames
-
-    Ok(Vec::new())
+    Err(crate::error::ReviewError::Other(
+        "find_frame_differences requires decoded video frames; oximedia-review has no \
+         codec dependency to decode version content, so pixel-level frame comparison is \
+         not available (metadata-level comparison is available via compare_versions)"
+            .to_string(),
+    ))
 }
 
 /// Calculate a perceptual difference score in `[0.0, 1.0]`.
@@ -217,5 +228,54 @@ mod tests {
             .await
             .expect("should succeed in test");
         assert_eq!(comparisons.len(), 2);
+    }
+
+    /// `compare_versions` reflecting real, persisted data end-to-end: create
+    /// two real versions (different resolution) through the same free
+    /// functions the rest of the crate uses, load them back from the store,
+    /// and confirm the comparison reflects what was actually inserted.
+    #[tokio::test]
+    async fn test_compare_versions_reflects_real_inserted_data() {
+        let session_id = SessionId::new();
+        let v1 = crate::version::create_version(session_id, "v1".to_string(), "url1".to_string())
+            .await
+            .expect("v1 should succeed");
+        let v2 = crate::version::create_version(session_id, "v2".to_string(), "url2".to_string())
+            .await
+            .expect("v2 should succeed");
+        // The stub-created versions share identical metadata, so the
+        // comparison should report full similarity until we mutate one.
+        let loaded_v1 = crate::version::get_version(v1.id).await.expect("get v1");
+        let loaded_v2 = crate::version::get_version(v2.id).await.expect("get v2");
+        let identical = compare_versions(&loaded_v1, &loaded_v2)
+            .await
+            .expect("compare should succeed");
+        assert!(identical.metadata_changes.is_empty());
+        assert!((identical.similarity - 1.0).abs() < 0.001);
+
+        let mut mutated_v2 = loaded_v2;
+        mutated_v2.resolution = (3840, 2160);
+        mutated_v2.duration_frames = 480;
+        let diverged = compare_versions(&loaded_v1, &mutated_v2)
+            .await
+            .expect("compare should succeed");
+        assert_eq!(diverged.metadata_changes.len(), 2);
+        assert!(diverged
+            .metadata_changes
+            .iter()
+            .any(|c| c.field == "resolution" && c.new_value == "3840x2160"));
+        assert!(diverged
+            .metadata_changes
+            .iter()
+            .any(|c| c.field == "duration_frames" && c.new_value == "480"));
+        assert!(diverged.similarity < 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_find_frame_differences_is_honest_about_missing_capability() {
+        let version1 = create_test_version(1);
+        let version2 = create_test_version(2);
+        let result = find_frame_differences(&version1, &version2, 0, 10).await;
+        assert!(result.is_err(), "must not fabricate an empty diff result");
     }
 }

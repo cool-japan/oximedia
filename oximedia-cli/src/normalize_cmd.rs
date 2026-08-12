@@ -143,6 +143,7 @@ fn parse_preset(name: &str) -> Result<oximedia_normalize::TargetPreset> {
         "cd" | "cdmastering" => Ok(TargetPreset::CdMastering),
         "streaming" | "streamingmastering" => Ok(TargetPreset::StreamingMastering),
         "replaygain" | "rg" => Ok(TargetPreset::ReplayGain),
+        "tiktok" => Ok(TargetPreset::TikTok),
         other => Err(anyhow::anyhow!(
             "Unknown standard '{other}'. Run `oximedia normalize targets` to list all available targets."
         )),
@@ -386,22 +387,24 @@ async fn cmd_process(
         return Ok(());
     }
 
-    println!("{}", "Normalization Processing".green().bold());
-    println!("{}", "=".repeat(60));
-    println!("{:25} {}", "Input:", input.display());
-    println!("{:25} {}", "Output:", output.display());
-    println!("{:25} {:.1} LUFS", "Target:", norm_target.target_lufs);
-    println!(
-        "{:25} {:.1} dBTP",
-        "Max true peak:", norm_target.max_peak_dbtp
-    );
-    if let Some(gain) = analysis_gain {
-        println!("{:25} {:+.1} dB", "Recommended gain:", gain);
+    if !crate::progress::is_quiet() {
+        println!("{}", "Normalization Processing".green().bold());
+        println!("{}", "=".repeat(60));
+        println!("{:25} {}", "Input:", input.display());
+        println!("{:25} {}", "Output:", output.display());
+        println!("{:25} {:.1} LUFS", "Target:", norm_target.target_lufs);
+        println!(
+            "{:25} {:.1} dBTP",
+            "Max true peak:", norm_target.max_peak_dbtp
+        );
+        if let Some(gain) = analysis_gain {
+            println!("{:25} {:+.1} dB", "Recommended gain:", gain);
+        }
+        println!("{:25} {} bytes", "Output size:", output_size);
+        println!("{:25} yes (in-band)", "Pipeline applied:");
+        println!("{}", "Status:".green().bold());
+        println!("  Processing complete.");
     }
-    println!("{:25} {} bytes", "Output size:", output_size);
-    println!("{:25} yes (in-band)", "Pipeline applied:");
-    println!("{}", "Status:".green().bold());
-    println!("  Processing complete.");
 
     Ok(())
 }
@@ -479,18 +482,20 @@ async fn cmd_process_wav(
         return Ok(());
     }
 
-    println!("{}", "Normalization Processing".green().bold());
-    println!("{}", "=".repeat(60));
-    println!("{:25} {}", "Input:", input.display());
-    println!("{:25} {}", "Output:", output.display());
-    println!("{:25} {:.1} LUFS", "Target:", target_lufs);
-    println!("{:25} {:.1} dBTP", "Max true peak:", true_peak);
-    println!("{:25} {:.1} LUFS", "Measured:", analysis.integrated_lufs);
-    println!("{:25} {:+.1} dB", "Applied gain:", applied_gain_db);
-    println!("{:25} {} bytes", "Output size:", output_size);
-    println!("{:25} yes (PCM gain)", "Pipeline applied:");
-    println!("{}", "Status:".green().bold());
-    println!("  Processing complete.");
+    if !crate::progress::is_quiet() {
+        println!("{}", "Normalization Processing".green().bold());
+        println!("{}", "=".repeat(60));
+        println!("{:25} {}", "Input:", input.display());
+        println!("{:25} {}", "Output:", output.display());
+        println!("{:25} {:.1} LUFS", "Target:", target_lufs);
+        println!("{:25} {:.1} dBTP", "Max true peak:", true_peak);
+        println!("{:25} {:.1} LUFS", "Measured:", analysis.integrated_lufs);
+        println!("{:25} {:+.1} dB", "Applied gain:", applied_gain_db);
+        println!("{:25} {} bytes", "Output size:", output_size);
+        println!("{:25} yes (PCM gain)", "Pipeline applied:");
+        println!("{}", "Status:".green().bold());
+        println!("  Processing complete.");
+    }
 
     Ok(())
 }

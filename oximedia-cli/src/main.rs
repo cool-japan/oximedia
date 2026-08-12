@@ -194,7 +194,7 @@
 //! | `--log-format json` | plain | Structured JSON log output via `tracing-subscriber` |
 //! | `--progress <plain\|json>` | plain | Progress reporting format |
 //! | `-v` / `--verbose` | off | Enable debug/trace log output (repeatable: `-vv`, `-vvv`) |
-//! | `-q` / `--quiet` | off | Suppress logs and status/banner stdout (transcode/extract/image); results and errors still print |
+//! | `-q` / `--quiet` | off | Suppress logs and action-command status/banner stdout (most subcommands); query/report results (info/status/list/verify/...), `--json`/`--ndjson` output, and errors still print |
 //!
 //! ## See Also
 //!
@@ -265,6 +265,13 @@ mod ffcompat_cmd;
 mod filter_cmd;
 mod forensics_cmd;
 mod frame_extract;
+// The frame harness is shared with the lib target (see `lib.rs`), which
+// exports the whole foundation — the `f32` plane bridges, the clip helpers —
+// for the integration tests and for the ops the follow-up slice adds. This
+// binary reaches for only part of it, so unused-item warnings *here* are
+// expected rather than a sign of dead code.
+#[allow(dead_code)]
+mod frame_harness;
 mod gaming_cmd;
 mod graphics_cmd;
 mod handlers;
@@ -347,12 +354,13 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// Suppress log output and status/banner text on stdout (plans, summaries,
-    /// progress banners for transcode/extract/image). Command results (probe
-    /// data, analysis values, --json/--ndjson output) and errors still print.
-    // TODO(0.2.x): extend the status-output suppression to the remaining
-    // ~50 subcommand handlers; today it covers logging plus the
-    // transcode/extract/image status paths (see progress::is_quiet callers).
+    /// Suppress log output and status/banner text on stdout (plans,
+    /// summaries, and other decoration printed by action commands across
+    /// most subcommand handlers). Query/report command results (info,
+    /// status, list, verify, validate, probe data, analysis values,
+    /// --json/--ndjson output) and errors still print — see
+    /// `progress::is_quiet` for the full accounting and the nine
+    /// frame-harness handlers still pending a later pass.
     #[arg(short, long, global = true)]
     quiet: bool,
 

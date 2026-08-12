@@ -122,10 +122,7 @@ impl ChunkList {
     pub fn total_length(&self) -> Option<u64> {
         let mut total = 0u64;
         for chunk in &self.chunks {
-            match chunk.length {
-                Some(len) => total += len,
-                None => return None,
-            }
+            total += chunk.length?;
         }
         Some(total)
     }

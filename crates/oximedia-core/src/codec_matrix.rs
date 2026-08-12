@@ -59,6 +59,10 @@ impl CodecMatrix {
             ),
             CodecId::Alac => matches!(container.as_str(), "mp4" | "m4a" | "mov" | "caf" | "mkv"),
             CodecId::Mp3 => matches!(container.as_str(), "mp3" | "mkv" | "mp4"),
+            CodecId::Aac => matches!(
+                container.as_str(),
+                "mp4" | "isobmff" | "m4a" | "mov" | "mkv" | "ts" | "aac" | "adts"
+            ),
             CodecId::Pcm => matches!(container.as_str(), "wav" | "mkv" | "aiff"),
             // Image codecs — typically not in containers
             CodecId::JpegXl
@@ -99,6 +103,7 @@ impl CodecMatrix {
             CodecId::Flac => &["flac", "mkv", "ogg"],
             CodecId::Alac => &["mp4", "m4a", "mov", "caf", "mkv"],
             CodecId::Mp3 => &["mp3", "mkv"],
+            CodecId::Aac => &["mp4", "isobmff", "m4a", "mov", "mkv", "ts", "aac", "adts"],
             CodecId::Pcm => &["wav", "mkv", "aiff"],
             CodecId::WebVtt => &["webm", "mkv"],
             CodecId::Ass | CodecId::Ssa | CodecId::Srt => &["mkv", "mp4"],

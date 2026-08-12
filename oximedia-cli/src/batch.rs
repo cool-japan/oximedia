@@ -155,7 +155,9 @@ pub async fn batch_process(options: BatchOptions) -> Result<()> {
     let jobs = create_job_queue(&input_files, &options, &config)?;
 
     if options.dry_run {
-        print_dry_run(&jobs);
+        if !crate::progress::is_quiet() {
+            print_dry_run(&jobs);
+        }
         return Ok(());
     }
 
@@ -163,7 +165,9 @@ pub async fn batch_process(options: BatchOptions) -> Result<()> {
     let results = execute_jobs(jobs, &options, options.progress_format).await?;
 
     // Print summary
-    print_batch_summary(&results);
+    if !crate::progress::is_quiet() {
+        print_batch_summary(&results);
+    }
 
     // Check if any jobs failed
     let failed_count = results

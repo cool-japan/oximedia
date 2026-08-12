@@ -616,8 +616,11 @@ impl TranscodeMetricsCollector {
             .iter()
             .filter(|m| m.psnr_db.is_some())
             .min_by(|a, b| {
-                let pa = a.psnr_db.expect("filter ensures Some");
-                let pb = b.psnr_db.expect("filter ensures Some");
+                // `filter` above guarantees `Some` for every item reaching
+                // this comparator; the fallback (never actually used) ranks
+                // a missing value as "not the worst" rather than panicking.
+                let pa = a.psnr_db.unwrap_or(f64::INFINITY);
+                let pb = b.psnr_db.unwrap_or(f64::INFINITY);
                 pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
             })
     }

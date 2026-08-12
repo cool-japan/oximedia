@@ -100,17 +100,19 @@ impl Notification {
 
 /// Send a notification.
 ///
+/// Persists `notification` to the review store so it shows up in
+/// [`get_user_notifications`]. This does **not** attempt channel delivery --
+/// dispatching over email or webhook is a separate concern handled by
+/// [`crate::notify::email::send_email_notification`] and
+/// [`crate::notify::webhook::send_webhook`] respectively; callers that want
+/// both in-app persistence and outbound delivery must call both.
+///
 /// # Errors
 ///
-/// Returns error if notification fails to send.
+/// Returns error if the notification cannot be persisted.
 pub async fn send_notification(notification: Notification) -> ReviewResult<()> {
-    // In a real implementation, this would:
-    // 1. Store notification in database
-    // 2. Send via configured channels (email, webhook, push, etc.)
-    // 3. Handle delivery failures
-
-    let _ = notification;
-    Ok(())
+    let store = crate::store::default_store().await?;
+    store.insert_notification(&notification).await
 }
 
 /// Get notifications for a user.
@@ -119,20 +121,19 @@ pub async fn send_notification(notification: Notification) -> ReviewResult<()> {
 ///
 /// Returns error if retrieval fails.
 pub async fn get_user_notifications(user_id: &str) -> ReviewResult<Vec<Notification>> {
-    // In a real implementation, query database
-    let _ = user_id;
-    Ok(Vec::new())
+    let store = crate::store::default_store().await?;
+    store.list_notifications_by_user(user_id).await
 }
 
 /// Mark notification as read.
 ///
 /// # Errors
 ///
-/// Returns error if update fails.
+/// Returns [`crate::error::ReviewError::NotificationNotFound`] if
+/// `notification_id` does not identify an existing notification.
 pub async fn mark_notification_read(notification_id: &str) -> ReviewResult<()> {
-    // In a real implementation, update database
-    let _ = notification_id;
-    Ok(())
+    let store = crate::store::default_store().await?;
+    store.mark_notification_read(notification_id).await
 }
 
 #[cfg(test)]
@@ -205,5 +206,48 @@ mod tests {
     async fn test_get_user_notifications() {
         let result = get_user_notifications("user-1").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mark_notification_read_roundtrip() {
+        // Unique recipient so this test's list is not affected by other
+        // tests concurrently writing through the same process-wide default
+        // store.
+        let recipient = format!("user-{}", uuid::Uuid::new_v4());
+        let session_id = SessionId::new();
+        let notification = Notification::new(
+            session_id,
+            NotificationType::CommentAdded,
+            recipient.clone(),
+            "Test".to_string(),
+            "Test message".to_string(),
+        );
+        let notification_id = notification.id.clone();
+
+        send_notification(notification)
+            .await
+            .expect("send should succeed");
+
+        let before = get_user_notifications(&recipient)
+            .await
+            .expect("list should succeed");
+        assert_eq!(before.len(), 1);
+        assert!(!before[0].read);
+
+        mark_notification_read(&notification_id)
+            .await
+            .expect("mark read should succeed");
+
+        let after = get_user_notifications(&recipient)
+            .await
+            .expect("list should succeed");
+        assert_eq!(after.len(), 1);
+        assert!(after[0].read);
+    }
+
+    #[tokio::test]
+    async fn test_mark_notification_read_not_found_is_honest_error() {
+        let result = mark_notification_read("does-not-exist").await;
+        assert!(result.is_err());
     }
 }

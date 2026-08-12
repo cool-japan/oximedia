@@ -4,9 +4,9 @@
 #![allow(clippy::unused_self)]
 
 use crate::error::{ImageError, ImageResult};
+use crate::parallel::try_map_slice;
 use crate::pattern::SequencePattern;
 use crate::ImageFrame;
-use rayon::prelude::*;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
@@ -169,13 +169,8 @@ impl ImageSequence {
     ///
     /// Returns an error if any frame in the range cannot be read.
     pub fn read_frames_parallel(&self, range: RangeInclusive<u32>) -> ImageResult<Vec<ImageFrame>> {
-        let frames: Result<Vec<_>, _> = range
-            .into_par_iter()
-            .filter(|f| self.has_frame(*f))
-            .map(|f| self.read_frame(f))
-            .collect();
-
-        frames
+        let present: Vec<u32> = range.filter(|f| self.has_frame(*f)).collect();
+        try_map_slice(&present, |f| self.read_frame(*f))
     }
 
     /// Reads all frames in the sequence in parallel.

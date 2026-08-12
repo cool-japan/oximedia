@@ -321,28 +321,29 @@ impl KeyedRateLimiter {
             .filter(|k| self.buckets.contains_key(*k))
             .collect();
 
-        // Probe: refill and check availability without consuming.
+        // Probe: refill and check availability without consuming.  `relevant`
+        // was pre-filtered to keys with a registered bucket; the `if let`
+        // (rather than an expect) means a bucket that vanished between the
+        // filter and this loop is silently skipped, matching this method's
+        // documented "unknown keys are silently ignored" contract instead of
+        // panicking.
         for key in &relevant {
-            let limiter = self
-                .buckets
-                .get_mut(*key)
-                .expect("existence confirmed above");
-            // Trigger refill by peeking at tokens_f64 after calling refill via a
-            // no-cost try_acquire(0) equivalent.  We use `tokens_f64()` after an
-            // explicit refill call.
-            limiter.refill_only();
-            if limiter.tokens_f64() < 1.0 {
-                return false;
+            if let Some(limiter) = self.buckets.get_mut(*key) {
+                // Trigger refill by peeking at tokens_f64 after calling refill via a
+                // no-cost try_acquire(0) equivalent.  We use `tokens_f64()` after an
+                // explicit refill call.
+                limiter.refill_only();
+                if limiter.tokens_f64() < 1.0 {
+                    return false;
+                }
             }
         }
 
         // Consume: all probes passed, burn one token from each bucket.
         for key in &relevant {
-            let limiter = self
-                .buckets
-                .get_mut(*key)
-                .expect("existence confirmed above");
-            limiter.consume_one();
+            if let Some(limiter) = self.buckets.get_mut(*key) {
+                limiter.consume_one();
+            }
         }
         true
     }

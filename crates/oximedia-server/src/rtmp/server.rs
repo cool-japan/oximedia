@@ -1,7 +1,7 @@
 //! RTMP ingest server implementation.
 
-use crate::cdn::CdnUploader;
-use crate::error::ServerResult;
+use crate::cdn::{CdnConfig, CdnUploader};
+use crate::error::{ServerError, ServerResult};
 use crate::metrics::MetricsCollector;
 use crate::record::StreamRecorder;
 use crate::transcode::TranscodeEngine;
@@ -49,7 +49,13 @@ pub struct RtmpIngestConfig {
     pub enable_recording: bool,
 
     /// Enable CDN upload.
+    ///
+    /// Requires [`Self::cdn`] to be set; server construction fails otherwise
+    /// rather than starting an ingest that silently discards every upload.
     pub enable_cdn_upload: bool,
+
+    /// CDN destination used when [`Self::enable_cdn_upload`] is set.
+    pub cdn: Option<CdnConfig>,
 
     /// Recording directory.
     pub record_dir: String,
@@ -75,6 +81,7 @@ impl Default for RtmpIngestConfig {
             enable_transcoding: true,
             enable_recording: false,
             enable_cdn_upload: false,
+            cdn: None,
             record_dir: "./recordings".to_string(),
             chunk_size: 4096,
             max_chunk_size: 65536,
@@ -316,8 +323,20 @@ impl RtmpIngestServer {
             None
         };
 
+        // CDN upload is either fully wired (destination + a build that can
+        // reach it) or refused at construction. Starting an ingest whose CDN
+        // uploads silently vanish would be worse than not starting at all.
         let cdn_uploader = if config.enable_cdn_upload {
-            Some(Arc::new(CdnUploader::new().await?))
+            let cdn_config = config.cdn.clone().ok_or_else(|| {
+                ServerError::Internal(
+                    "enable_cdn_upload = true but RtmpIngestConfig::cdn is None; \
+                     supply a CdnConfig or disable CDN upload"
+                        .to_string(),
+                )
+            })?;
+            Some(Arc::new(
+                CdnUploader::with_config_and_metrics(cdn_config, Arc::clone(&metrics)).await?,
+            ))
         } else {
             None
         };
@@ -442,14 +461,23 @@ impl RtmpIngestServer {
             // Forward media from the net broadcast channel into the ingest
             // packet task until the publisher ends.
             let mut media_rx = active.media_tx.subscribe();
+            let seq_headers = Arc::clone(&active.seq_headers);
             let packet_tx = ingest.packet_tx.clone();
             let streams_for_cleanup = Arc::clone(&streams);
             let cleanup_key = key.clone();
             tokio::spawn(async move {
-                // NOTE: `subscribe()` only observes packets sent after this
-                // point, so a publisher's very first codec-sequence headers may
-                // be missed on a fast loopback.
-                // TODO(0.2.x): cache and replay sequence headers on subscribe.
+                // `subscribe()` above only observes packets sent after that
+                // point, so on a fast loopback the publisher's codec sequence
+                // headers can already be gone. Replay them from the registry's
+                // cache before forwarding anything live — subscribe first, then
+                // read the cache, so a header racing in between is at worst
+                // duplicated (the depacketizer absorbs duplicates) instead of
+                // lost.
+                for packet in seq_headers.read().await.replay_packets() {
+                    if packet_tx.send(packet).is_err() {
+                        return; // ingest task gone before it started
+                    }
+                }
                 loop {
                     match media_rx.recv().await {
                         Ok(packet) => {
@@ -557,13 +585,18 @@ impl RtmpIngestServer {
                     }
                 }
 
-                // Upload to CDN.
+                // Queue the packet for CDN upload. A queueing failure is
+                // logged here and counted by the uploader itself (metric
+                // `cdn_upload_failed_total`, along with the per-upload
+                // outcome recorded by its worker), so a CDN outage degrades
+                // to "no CDN" instead of tearing down the ingest loop: the
+                // stream keeps being received, recorded and transcoded.
                 if let Some(ref uploader) = cdn {
-                    if let Err(e) = uploader
-                        .upload_packet(&stream_clone.stream_key, &packet)
-                        .await
-                    {
-                        error!("CDN upload error: {}", e);
+                    if let Err(e) = uploader.upload_packet(&stream_clone.stream_key, &packet) {
+                        error!(
+                            stream = %stream_clone.stream_key,
+                            "CDN upload could not be queued: {e}"
+                        );
                     }
                 }
             }
@@ -641,5 +674,149 @@ impl RtmpIngestServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+    use bytes::Bytes;
+    use oximedia_net::rtmp::MediaPacketType;
+
+    fn packet(packet_type: MediaPacketType, body: &'static [u8]) -> NetMediaPacket {
+        NetMediaPacket {
+            packet_type,
+            timestamp: 0,
+            stream_id: 1,
+            data: Bytes::from_static(body),
+        }
+    }
+
+    /// The ingest bridge subscribes to a stream that is already publishing, so
+    /// the publisher's codec sequence headers were broadcast before the
+    /// subscription existed. They must be replayed from the registry cache,
+    /// otherwise the packaging layer only ever sees coded frames it has no
+    /// decoder configuration for.
+    #[tokio::test]
+    async fn bridge_replays_cached_sequence_headers() {
+        let registry = Arc::new(StreamRegistry::new());
+        registry
+            .register_stream(
+                "live/cam".to_string(),
+                StreamMetadata::new("cam", "live"),
+                1,
+            )
+            .await
+            .expect("register stream");
+
+        // Publisher's sequence headers, sent before the bridge subscribes.
+        let cache = registry
+            .seq_headers("live/cam")
+            .await
+            .expect("sequence-header cache");
+        {
+            let mut guard = cache.write().await;
+            guard.capture(&packet(
+                MediaPacketType::Video,
+                &[0x18, b'a', b'v', b'0', b'1', 0x81, 0x00, 0x00, 0x00],
+            ));
+            guard.capture(&packet(
+                MediaPacketType::Audio,
+                &[0x9F, 0x00, b'O', b'p', b'u', b's', 0x01],
+            ));
+        }
+
+        let streams: Arc<RwLock<HashMap<String, Arc<IngestStream>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(MetricsCollector::new());
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        publish_tx
+            .send(PublishEvent {
+                app: "live".to_string(),
+                stream_key: "cam".to_string(),
+            })
+            .expect("queue publish event");
+        drop(publish_tx);
+
+        tokio::spawn(RtmpIngestServer::run_bridge(
+            Arc::clone(&registry),
+            Arc::clone(&streams),
+            Arc::clone(&metrics),
+            None,
+            None,
+            None,
+            publish_rx,
+        ));
+
+        // The bridge registers the ingest stream, then replays both cached
+        // headers into it — with no live packet ever published.
+        let mut received = 0u64;
+        for _ in 0..200 {
+            if let Some(stream) = streams.read().get("live/cam").map(Arc::clone) {
+                received = *stream.packets_received.read();
+                if received >= 2 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            received, 2,
+            "the bridge must replay both cached sequence headers to a late subscriber"
+        );
+    }
+
+    /// With nothing cached, the bridge must not invent any packet.
+    #[tokio::test]
+    async fn bridge_replays_nothing_when_cache_is_empty() {
+        let registry = Arc::new(StreamRegistry::new());
+        registry
+            .register_stream(
+                "live/quiet".to_string(),
+                StreamMetadata::new("quiet", "live"),
+                1,
+            )
+            .await
+            .expect("register stream");
+
+        let streams: Arc<RwLock<HashMap<String, Arc<IngestStream>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(MetricsCollector::new());
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        publish_tx
+            .send(PublishEvent {
+                app: "live".to_string(),
+                stream_key: "quiet".to_string(),
+            })
+            .expect("queue publish event");
+        drop(publish_tx);
+
+        tokio::spawn(RtmpIngestServer::run_bridge(
+            Arc::clone(&registry),
+            Arc::clone(&streams),
+            Arc::clone(&metrics),
+            None,
+            None,
+            None,
+            publish_rx,
+        ));
+
+        // Wait for the bridge to register the stream, then confirm it is idle.
+        let mut stream = None;
+        for _ in 0..200 {
+            if let Some(s) = streams.read().get("live/quiet").map(Arc::clone) {
+                stream = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stream = stream.expect("the bridge must register the ingest stream");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *stream.packets_received.read(),
+            0,
+            "no packet may be fabricated when nothing was cached"
+        );
     }
 }

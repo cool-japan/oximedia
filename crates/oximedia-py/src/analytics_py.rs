@@ -11,10 +11,32 @@
 
 use oximedia_analytics::{
     analyze_session as core_analyze_session, attention_heatmap as core_attention_heatmap,
-    compute_engagement as core_compute_engagement, EngagementWeights, PlaybackEvent,
-    SessionMetrics, ViewerSession,
+    compute_engagement as core_compute_engagement,
+    compute_engagement_with_social as core_compute_engagement_with_social, EngagementWeights,
+    PlaybackEvent, SessionMetrics, SocialSignals, ViewerSession,
 };
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+
+// Family submodules — each owns a `register(m)` that adds its classes and
+// functions directly into the `oximedia.analytics` Python namespace built by
+// `register_submodule` below. Living under `analytics_py/` (Rust 2018+ file
+// module + sibling directory) keeps every family's binding code out of this
+// file without requiring any change to `lib.rs`.
+mod ab_testing;
+mod bandit;
+mod cohort;
+mod funnel;
+mod geo_device;
+mod quantile_realtime;
+mod replay_anomaly_attribution;
+mod retention;
+
+/// Map an [`oximedia_analytics::error::AnalyticsError`] to a Python
+/// `ValueError` carrying the real error message (no fabricated text).
+pub(crate) fn analytics_err(err: oximedia_analytics::error::AnalyticsError) -> PyErr {
+    PyValueError::new_err(err.to_string())
+}
 
 // ---------------------------------------------------------------------------
 // ViewerSession
@@ -241,6 +263,137 @@ impl PyContentEngagementScore {
 }
 
 // ---------------------------------------------------------------------------
+// SocialSignals / EngagementWeights
+// ---------------------------------------------------------------------------
+
+/// Raw social-interaction counts for a piece of content (views/likes/shares/
+/// comments). Real delegation to [`oximedia_analytics::SocialSignals`].
+///
+/// `ViewerSession`/`PlaybackEvent` carry no social data, so these counts must
+/// be supplied explicitly (e.g. from a CMS or comments service). Use
+/// :meth:`engagement_score` to collapse them into a normalised `0.0-1.0`
+/// score, or pass an instance to :func:`compute_engagement_with_social`.
+#[pyclass(name = "SocialSignals")]
+#[derive(Clone, Debug, Default)]
+pub struct PySocialSignals {
+    inner: SocialSignals,
+}
+
+#[pymethods]
+impl PySocialSignals {
+    #[new]
+    #[pyo3(signature = (views=0, likes=0, shares=0, comments=0))]
+    fn new(views: u64, likes: u64, shares: u64, comments: u64) -> Self {
+        Self {
+            inner: SocialSignals {
+                views,
+                likes,
+                shares,
+                comments,
+            },
+        }
+    }
+
+    #[getter]
+    fn views(&self) -> u64 {
+        self.inner.views
+    }
+
+    #[getter]
+    fn likes(&self) -> u64 {
+        self.inner.likes
+    }
+
+    #[getter]
+    fn shares(&self) -> u64 {
+        self.inner.shares
+    }
+
+    #[getter]
+    fn comments(&self) -> u64 {
+        self.inner.comments
+    }
+
+    /// Normalised social engagement score in `[0.0, 1.0]`. Honestly `0.0`
+    /// when `views == 0` (undefined rate), never a fabricated midpoint.
+    fn engagement_score(&self) -> f32 {
+        self.inner.engagement_score()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SocialSignals(views={}, likes={}, shares={}, comments={})",
+            self.inner.views, self.inner.likes, self.inner.shares, self.inner.comments
+        )
+    }
+}
+
+/// Weights controlling the relative importance of each engagement component.
+/// Real delegation to [`oximedia_analytics::EngagementWeights`].
+#[pyclass(name = "EngagementWeights")]
+#[derive(Clone, Debug)]
+pub struct PyEngagementWeights {
+    inner: EngagementWeights,
+}
+
+#[pymethods]
+impl PyEngagementWeights {
+    /// All five components equally weighted at 0.2 unless overridden.
+    #[new]
+    #[pyo3(signature = (watch_time=0.2, completion=0.2, rewatch=0.2, social=0.2, forward_seek_penalty=0.2))]
+    fn new(
+        watch_time: f32,
+        completion: f32,
+        rewatch: f32,
+        social: f32,
+        forward_seek_penalty: f32,
+    ) -> Self {
+        Self {
+            inner: EngagementWeights {
+                watch_time,
+                completion,
+                rewatch,
+                social,
+                forward_seek_penalty,
+            },
+        }
+    }
+
+    #[getter]
+    fn watch_time(&self) -> f32 {
+        self.inner.watch_time
+    }
+
+    #[getter]
+    fn completion(&self) -> f32 {
+        self.inner.completion
+    }
+
+    #[getter]
+    fn rewatch(&self) -> f32 {
+        self.inner.rewatch
+    }
+
+    #[getter]
+    fn social(&self) -> f32 {
+        self.inner.social
+    }
+
+    #[getter]
+    fn forward_seek_penalty(&self) -> f32 {
+        self.inner.forward_seek_penalty
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EngagementWeights(watch_time={:.3}, completion={:.3}, rewatch={:.3}, social={:.3}, forward_seek_penalty={:.3})",
+            self.inner.watch_time, self.inner.completion, self.inner.rewatch,
+            self.inner.social, self.inner.forward_seek_penalty
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Standalone functions
 // ---------------------------------------------------------------------------
 
@@ -273,21 +426,31 @@ pub fn attention_heatmap(
 
 /// Compute an overall engagement score for a content item from its viewer
 /// sessions, using equally-weighted default components (watch time,
-/// completion, rewatch, social, forward-seek penalty).
+/// completion, rewatch, social, forward-seek penalty) unless `weights` is
+/// given.
 ///
 /// `ViewerSession`/`PlaybackEvent` carry no social-interaction data, so the
 /// social channel's weight is honestly redistributed across the measurable
-/// channels (real crate behaviour) rather than fabricated. Use
-/// `oximedia_analytics::engagement::compute_engagement_with_social` from
-/// Rust for the social-aware variant (not yet bound — see module TODOs).
+/// channels (real crate behaviour) rather than fabricated. Pass explicit
+/// social interaction counts via :func:`compute_engagement_with_social`
+/// instead when you have them.
 #[pyfunction]
+#[pyo3(signature = (sessions, content_duration_ms, weights=None))]
 pub fn compute_engagement(
     sessions: Vec<PyRef<'_, PyViewerSession>>,
     content_duration_ms: u64,
+    weights: Option<&PyEngagementWeights>,
 ) -> PyContentEngagementScore {
     let inner_sessions: Vec<ViewerSession> = sessions.iter().map(|s| s.inner.clone()).collect();
-    let weights = EngagementWeights::default();
-    let score = core_compute_engagement(&inner_sessions, content_duration_ms, &weights);
+    let owned_default;
+    let weights_ref = match weights {
+        Some(w) => &w.inner,
+        None => {
+            owned_default = EngagementWeights::default();
+            &owned_default
+        }
+    };
+    let score = core_compute_engagement(&inner_sessions, content_duration_ms, weights_ref);
     PyContentEngagementScore {
         content_id: score.content_id,
         score: score.score,
@@ -299,25 +462,46 @@ pub fn compute_engagement(
     }
 }
 
-// TODO(0.2.x): expose oximedia_analytics::ab_testing (Experiment, assign_variant,
-// bayesian_winner) for A/B test allocation and analysis.
-// TODO(0.2.x): expose oximedia_analytics::bandit (MultiArmedBandit, RegretTracker).
-// TODO(0.2.x): expose oximedia_analytics::cohort (CohortAnalyzer, build_cohort_matrix).
-// TODO(0.2.x): expose oximedia_analytics::funnel (FunnelAnalyzer, predict_churn,
-// compute_loyalty).
-// TODO(0.2.x): expose oximedia_analytics::retention (compute_retention,
-// drop_off_points, compare_to_benchmark, re_watch_segments).
-// TODO(0.2.x): expose oximedia_analytics::geo_device (BreakdownAnalyzer,
-// SliceComparison).
-// TODO(0.2.x): expose oximedia_analytics::quantile (TDigest, percentiles) and
-// oximedia_analytics::percentile / uniformity.
-// TODO(0.2.x): expose oximedia_analytics::realtime (SlidingWindowAggregator).
-// TODO(0.2.x): expose oximedia_analytics::replay / anomaly / attribution /
-// fingerprint / heatmap (grid-based `Heatmap`) / multivariate /
-// weighted_retention / segment_retention.
-// TODO(0.2.x): expose `compute_engagement_with_social` (explicit SocialSignals +
-// custom EngagementWeights) and `reservoir_sampled_heatmap` (memory-bounded
-// sampling for very large session sets).
+/// Compute an engagement score from viewer sessions **and** explicit social
+/// signals. Real delegation to
+/// [`oximedia_analytics::compute_engagement_with_social`].
+///
+/// Unlike [`compute_engagement`], the social component here is the real
+/// normalised value from `social.engagement_score()`, and `weights` (if
+/// given) are applied exactly as given — no redistribution.
+#[pyfunction]
+#[pyo3(signature = (sessions, content_duration_ms, social, weights=None))]
+pub fn compute_engagement_with_social(
+    sessions: Vec<PyRef<'_, PyViewerSession>>,
+    content_duration_ms: u64,
+    social: &PySocialSignals,
+    weights: Option<&PyEngagementWeights>,
+) -> PyContentEngagementScore {
+    let inner_sessions: Vec<ViewerSession> = sessions.iter().map(|s| s.inner.clone()).collect();
+    let owned_default;
+    let weights_ref = match weights {
+        Some(w) => &w.inner,
+        None => {
+            owned_default = EngagementWeights::default();
+            &owned_default
+        }
+    };
+    let score = core_compute_engagement_with_social(
+        &inner_sessions,
+        content_duration_ms,
+        weights_ref,
+        &social.inner,
+    );
+    PyContentEngagementScore {
+        content_id: score.content_id,
+        score: score.score,
+        watch_time_score: score.components.watch_time_score,
+        completion_score: score.components.completion_score,
+        rewatch_score: score.components.rewatch_score,
+        social_score: score.components.social_score,
+        seek_forward_penalty: score.components.seek_forward_penalty,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -330,9 +514,22 @@ pub fn register_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyViewerSession>()?;
     m.add_class::<PySessionMetrics>()?;
     m.add_class::<PyContentEngagementScore>()?;
+    m.add_class::<PySocialSignals>()?;
+    m.add_class::<PyEngagementWeights>()?;
     m.add_function(wrap_pyfunction!(analyze_session, &m)?)?;
     m.add_function(wrap_pyfunction!(attention_heatmap, &m)?)?;
     m.add_function(wrap_pyfunction!(compute_engagement, &m)?)?;
+    m.add_function(wrap_pyfunction!(compute_engagement_with_social, &m)?)?;
+
+    // Family submodules (each adds its own classes/functions into `m`).
+    ab_testing::register(&m)?;
+    bandit::register(&m)?;
+    cohort::register(&m)?;
+    funnel::register(&m)?;
+    retention::register(&m)?;
+    geo_device::register(&m)?;
+    quantile_realtime::register(&m)?;
+    replay_anomaly_attribution::register(&m)?;
 
     parent.add_submodule(&m)?;
     Ok(())
@@ -418,4 +615,33 @@ mod tests {
     // which requires a live Python object (GIL) to construct a `PyRef` from — those
     // are covered end-to-end via the embedded interpreter in
     // `tests/analytics_smoke.rs` instead of here.
+
+    #[test]
+    fn social_signals_zero_views_is_honest_zero() {
+        let s = PySocialSignals::new(0, 1000, 500, 250);
+        assert_eq!(s.engagement_score(), 0.0);
+        assert_eq!(s.views(), 0);
+        assert_eq!(s.likes(), 1000);
+    }
+
+    #[test]
+    fn social_signals_high_engagement_near_one() {
+        let s = PySocialSignals::new(1_000, 500, 300, 200);
+        assert!(s.engagement_score() > 0.99);
+    }
+
+    #[test]
+    fn social_signals_repr_contains_counts() {
+        let s = PySocialSignals::new(10, 2, 1, 0);
+        let repr = s.__repr__();
+        assert!(repr.contains("views=10"));
+        assert!(repr.contains("likes=2"));
+    }
+
+    #[test]
+    fn engagement_weights_default_matches_core_default() {
+        let w = PyEngagementWeights::new(0.2, 0.2, 0.2, 0.2, 0.2);
+        assert!((w.watch_time() - 0.2).abs() < 1e-6);
+        assert!((w.social() - 0.2).abs() < 1e-6);
+    }
 }

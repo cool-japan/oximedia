@@ -696,6 +696,12 @@ impl<R: MediaSource> MatroskaDemuxer<R> {
                     let data_size = element.size as usize;
                     let total_size = element.header_size + data_size;
                     self.ensure_buffer(total_size).await?;
+                    if self.buffer.len() < total_size {
+                        // Declared element size overruns what the source
+                        // actually has left — truncated/malformed input,
+                        // not a slice to take out of bounds.
+                        return Err(OxiError::UnexpectedEof);
+                    }
 
                     let data = &self.buffer[element.header_size..total_size];
                     let (_, timecode) = ebml::read_uint(data).map_err(|e| OxiError::Parse {
@@ -713,6 +719,12 @@ impl<R: MediaSource> MatroskaDemuxer<R> {
                     let data_size = element.size as usize;
                     let total_size = element.header_size + data_size;
                     self.ensure_buffer(total_size).await?;
+                    if self.buffer.len() < total_size {
+                        // Declared element size overruns what the source
+                        // actually has left — truncated/malformed input,
+                        // not a slice to take out of bounds.
+                        return Err(OxiError::UnexpectedEof);
+                    }
 
                     let data = &self.buffer[element.header_size..total_size];
                     let block = parser::parse_simple_block(data)?;
@@ -727,6 +739,12 @@ impl<R: MediaSource> MatroskaDemuxer<R> {
                     let data_size = element.size as usize;
                     let total_size = element.header_size + data_size;
                     self.ensure_buffer(total_size).await?;
+                    if self.buffer.len() < total_size {
+                        // Declared element size overruns what the source
+                        // actually has left — truncated/malformed input,
+                        // not a slice to take out of bounds.
+                        return Err(OxiError::UnexpectedEof);
+                    }
 
                     let data = &self.buffer[element.header_size..total_size];
                     let block = parser::parse_block_group(data, element.size)?;
@@ -788,10 +806,41 @@ impl<R: MediaSource> MatroskaDemuxer<R> {
             flags |= PacketFlags::DISCARD;
         }
 
-        // Create timestamp
-        let timestamp = Timestamp::new(pts, stream.timebase);
+        // Create timestamp.
+        //
+        // `BlockDuration` (0x9B) only ever appears inside a `BlockGroup`; a
+        // `SimpleBlock` has no duration field. When present it is expressed in
+        // TimestampScale units — the very same units as the cluster-relative
+        // PTS computed above — so it can be forwarded verbatim. When absent we
+        // fall back to the track's `DefaultDuration` (nanoseconds) converted
+        // into TimestampScale units, which is what most muxers rely on for
+        // constant-frame-rate video.
+        let mut timestamp = Timestamp::new(pts, stream.timebase);
+        timestamp.duration = block
+            .duration
+            .and_then(|d| i64::try_from(d).ok())
+            .or_else(|| self.default_duration_in_scale(block.header.track_number));
 
         Ok(Packet::new(stream_index, data, timestamp, flags))
+    }
+
+    /// Converts a track's `DefaultDuration` (nanoseconds) into TimestampScale
+    /// units, so it can be used as a packet duration when a block carries no
+    /// explicit `BlockDuration`.
+    fn default_duration_in_scale(&self, track_number: u64) -> Option<i64> {
+        let default_duration = self
+            .tracks
+            .iter()
+            .find(|t| t.number == track_number)
+            .and_then(|t| t.default_duration)?;
+        let scale = self
+            .segment_info
+            .as_ref()
+            .map_or(NS_PER_MS, |info| info.timecode_scale);
+        if scale == 0 {
+            return None;
+        }
+        i64::try_from(default_duration / scale).ok()
     }
 
     /// Finds the best cue point for seeking to a target timestamp.
@@ -1333,6 +1382,200 @@ mod tests {
         data.extend_from_slice(&block_data);
 
         data
+    }
+
+    // ── BlockDuration propagation fixtures ────────────────────────────────
+
+    /// Encodes an EBML element ID as its minimal big-endian byte sequence.
+    fn ebml_id(id: u32) -> Vec<u8> {
+        if id <= 0xFF {
+            vec![id as u8]
+        } else if id <= 0xFFFF {
+            vec![(id >> 8) as u8, id as u8]
+        } else if id <= 0x00FF_FFFF {
+            vec![(id >> 16) as u8, (id >> 8) as u8, id as u8]
+        } else {
+            vec![
+                (id >> 24) as u8,
+                (id >> 16) as u8,
+                (id >> 8) as u8,
+                id as u8,
+            ]
+        }
+    }
+
+    /// Encodes a length as a 1- or 2-byte EBML VINT (enough for these fixtures).
+    fn ebml_size(len: usize) -> Vec<u8> {
+        assert!(len < 0x3FFF, "fixture elements stay small");
+        if len < 0x7F {
+            vec![(len as u8) | 0x80]
+        } else {
+            vec![0x40 | ((len >> 8) as u8), len as u8]
+        }
+    }
+
+    /// Builds `id + size + content`.
+    fn ebml_element(id: u32, content: &[u8]) -> Vec<u8> {
+        let mut out = ebml_id(id);
+        out.extend(ebml_size(content.len()));
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// Builds an unsigned-integer EBML element with minimal-width payload.
+    fn ebml_uint(id: u32, value: u64) -> Vec<u8> {
+        let mut bytes = value.to_be_bytes().to_vec();
+        while bytes.len() > 1 && bytes[0] == 0 {
+            bytes.remove(0);
+        }
+        ebml_element(id, &bytes)
+    }
+
+    /// The fixed EBML header used by every fixture below (`webm`, DocType v4).
+    fn ebml_header() -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(&[0x42, 0x86, 0x81, 0x01]); // EBMLVersion
+        header.extend_from_slice(&[0x42, 0xF7, 0x81, 0x01]); // EBMLReadVersion
+        header.extend_from_slice(&[0x42, 0xF2, 0x81, 0x04]); // EBMLMaxIDLength
+        header.extend_from_slice(&[0x42, 0xF3, 0x81, 0x08]); // EBMLMaxSizeLength
+        header.extend_from_slice(&[0x42, 0x82, 0x84, b'w', b'e', b'b', b'm']); // DocType
+        header.extend_from_slice(&[0x42, 0x87, 0x81, 0x04]); // DocTypeVersion
+        header.extend_from_slice(&[0x42, 0x85, 0x81, 0x02]); // DocTypeReadVersion
+        ebml_element(0x1A45_DFA3, &header)
+    }
+
+    /// Raw `Block`/`SimpleBlock` body: track VINT + s16 timecode + flags + data.
+    fn block_body(track: u8, timecode: i16, flags: u8, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0x80 | track);
+        out.extend_from_slice(&timecode.to_be_bytes());
+        out.push(flags);
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// Builds a complete one-track WebM whose cluster holds a `SimpleBlock`
+    /// followed by a `BlockGroup` carrying an explicit `BlockDuration`.
+    ///
+    /// `default_duration_ns` is written as the track's `DefaultDuration` when
+    /// `Some`, which is the fallback the demuxer should use for the
+    /// `SimpleBlock` (blocks outside a `BlockGroup` have no duration field).
+    fn webm_with_block_group(block_duration: u64, default_duration_ns: Option<u64>) -> Vec<u8> {
+        let mut data = ebml_header();
+
+        // Segment (unknown size)
+        data.extend_from_slice(&[
+            0x18, 0x53, 0x80, 0x67, // Segment ID
+            0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
+
+        // Info: TimestampScale = 1 000 000 ns (1 ms)
+        let info = ebml_uint(element_id::TIMECODE_SCALE, 1_000_000);
+        data.extend(ebml_element(element_id::INFO, &info));
+
+        // Tracks: one VP9 video track
+        let mut track_entry = Vec::new();
+        track_entry.extend(ebml_uint(element_id::TRACK_NUMBER, 1));
+        track_entry.extend(ebml_uint(element_id::TRACK_UID, 12_345));
+        track_entry.extend(ebml_uint(element_id::TRACK_TYPE, 1));
+        track_entry.extend(ebml_element(element_id::CODEC_ID, b"V_VP9"));
+        if let Some(default_duration) = default_duration_ns {
+            track_entry.extend(ebml_uint(element_id::DEFAULT_DURATION, default_duration));
+        }
+        let mut video = Vec::new();
+        video.extend(ebml_uint(element_id::PIXEL_WIDTH, 1920));
+        video.extend(ebml_uint(element_id::PIXEL_HEIGHT, 1080));
+        track_entry.extend(ebml_element(element_id::VIDEO, &video));
+        let tracks = ebml_element(element_id::TRACK_ENTRY, &track_entry);
+        data.extend(ebml_element(element_id::TRACKS, &tracks));
+
+        // Cluster (unknown size)
+        data.extend_from_slice(&[
+            0x1F, 0x43, 0xB6, 0x75, // Cluster ID
+            0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
+        data.extend(ebml_uint(element_id::TIMESTAMP, 0));
+
+        // SimpleBlock at t = 0 (keyframe), no duration of its own.
+        data.extend(ebml_element(
+            element_id::SIMPLE_BLOCK,
+            &block_body(1, 0, 0x80, &[0x01, 0x02, 0x03, 0x04]),
+        ));
+
+        // BlockGroup at t = 40 ms carrying an explicit BlockDuration.
+        let mut group = Vec::new();
+        group.extend(ebml_element(
+            element_id::BLOCK,
+            &block_body(1, 40, 0x00, &[0x0A, 0x0B, 0x0C]),
+        ));
+        group.extend(ebml_uint(element_id::BLOCK_DURATION, block_duration));
+        data.extend(ebml_element(element_id::BLOCK_GROUP, &group));
+
+        data
+    }
+
+    async fn read_all(data: Vec<u8>) -> Vec<Packet> {
+        let mut demuxer = MatroskaDemuxer::new(MemorySource::new(Bytes::from(data)));
+        demuxer.probe().await.expect("probe should succeed");
+        let mut packets = Vec::new();
+        while let Ok(packet) = demuxer.read_packet().await {
+            packets.push(packet);
+            if packets.len() > 8 {
+                break;
+            }
+        }
+        packets
+    }
+
+    /// Regression: `block_to_packet` never forwarded `BlockDuration`, so every
+    /// Matroska packet came back with `timestamp.duration == None` even when
+    /// the file said otherwise (TODO.md "Container" section).
+    #[tokio::test]
+    async fn block_group_duration_reaches_the_packet() {
+        let packets = read_all(webm_with_block_group(60, None)).await;
+        assert_eq!(packets.len(), 2, "SimpleBlock + BlockGroup");
+
+        assert_eq!(
+            packets[0].timestamp.duration, None,
+            "a SimpleBlock has no duration and no DefaultDuration to fall back on"
+        );
+
+        assert_eq!(packets[1].pts(), 40);
+        assert_eq!(
+            packets[1].timestamp.duration,
+            Some(60),
+            "BlockDuration must be forwarded verbatim in TimestampScale units"
+        );
+    }
+
+    /// With a `DefaultDuration` on the track, a duration-less `SimpleBlock`
+    /// inherits it — while an explicit `BlockDuration` still wins.
+    #[tokio::test]
+    async fn default_duration_is_the_fallback() {
+        // 33 ms per frame, TimestampScale is 1 ms → 33 scale units.
+        let packets = read_all(webm_with_block_group(60, Some(33_000_000))).await;
+        assert_eq!(packets.len(), 2);
+        assert_eq!(
+            packets[0].timestamp.duration,
+            Some(33),
+            "DefaultDuration (ns) must be converted into TimestampScale units"
+        );
+        assert_eq!(
+            packets[1].timestamp.duration,
+            Some(60),
+            "an explicit BlockDuration overrides DefaultDuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_block_duration_is_preserved() {
+        let packets = read_all(webm_with_block_group(0, None)).await;
+        assert_eq!(packets.len(), 2);
+        assert_eq!(
+            packets[1].timestamp.duration,
+            Some(0),
+            "an explicit zero duration is not the same as an absent one"
+        );
     }
 
     #[tokio::test]

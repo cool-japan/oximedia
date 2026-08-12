@@ -237,7 +237,11 @@ impl ResourcePool {
 
     /// Add a slot to the pool.  Panics if the ID is already registered.
     pub fn add_slot(&self, desc: ResourceSlotDesc) {
-        let mut guard = self.inner.0.lock().expect("lock poisoned");
+        // Recover from lock poisoning rather than propagating the panic:
+        // the pool data itself stays structurally valid even if a previous
+        // holder panicked mid-operation, consistent with the other
+        // `ResourcePool` accessors below that tolerate poisoning.
+        let mut guard = self.inner.0.lock().unwrap_or_else(|e| e.into_inner());
         guard.add_slot(desc);
     }
 

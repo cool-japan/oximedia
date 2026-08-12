@@ -11,6 +11,8 @@
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_possible_wrap)]
 
+use rayon::prelude::*;
+
 use super::cdfs::CdfCtx;
 use super::consts::{
     FILTER_BITS, RESTORE_NONE, RESTORE_SGRPROJ, RESTORE_SWITCHABLE, RESTORE_WIENER,
@@ -19,11 +21,16 @@ use super::consts::{
 };
 use super::hdr::FrameHdr;
 use super::msac::Msac;
-use super::recon::PlaneBuf;
+use super::recon::{auto_band_count, plan_bands, split_out_bands, OutBand, PlaneBuf};
 use super::tables_conv::{
     SGRPROJ_XQD_MAX, SGRPROJ_XQD_MID, SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_TAPS_K, WIENER_TAPS_MAX,
     WIENER_TAPS_MID, WIENER_TAPS_MIN,
 };
+
+/// Smallest luma area worth giving a loop-restoration band of its own. The
+/// self-guided box filter is far heavier per pixel than CDEF, so the split
+/// pays off on smaller frames.
+const LR_MIN_BAND_PIXELS: usize = 1 << 14;
 
 /// `Round2` for unsigned/positive quantities.
 #[inline]
@@ -262,36 +269,66 @@ struct StripeCtx {
 
 /// Applies loop restoration: `planes` holds the CDEF output on input
 /// (`UpscaledCdefFrame`) and the restored frame (`LrFrame`) on output.
-pub fn loop_restore_frame(planes: &mut [PlaneBuf; 3], a: &LrApply<'_>) {
+///
+/// `forced_bands` overrides the automatic row-band split (tests only); the
+/// restored output does not depend on it.
+pub fn loop_restore_frame(
+    planes: &mut [PlaneBuf; 3],
+    a: &LrApply<'_>,
+    forced_bands: Option<usize>,
+) {
     let mut out: [Vec<u8>; 3] = [
         planes[0].data.clone(),
         planes[1].data.clone(),
         planes[2].data.clone(),
     ];
-    let frame_height = a.hdr.frame_height as usize;
-    let upscaled_width = a.hdr.upscaled_width as usize;
-    let mut y = 0;
-    while y < frame_height {
-        let mut x = 0;
-        while x < upscaled_width {
-            for plane in 0..a.num_planes {
-                if a.hdr.lr.frame_restoration_type[plane] != RESTORE_NONE {
-                    loop_restore_block(planes, &mut out, a, plane, y >> 2, x >> 2);
-                }
-            }
-            x += 4;
+    let want = forced_bands
+        .unwrap_or_else(|| auto_band_count(planes[0].width * planes[0].height, LR_MIN_BAND_PIXELS));
+    // Restoration runs over 4x4 luma blocks, so bands split on multiples of
+    // four luma rows; the luma plane height is 4 * MiRows. Rows past
+    // FrameHeight are never written and keep the CDEF output, as in the
+    // serial loop.
+    let bounds = plan_bands(planes[0].height, 4, want);
+    let strides = [planes[0].stride, planes[1].stride, planes[2].stride];
+    let windows = split_out_bands(&mut out, strides, usize::from(a.sub_y), &bounds);
+    let jobs: Vec<((usize, usize), OutBand<'_>)> =
+        bounds.iter().copied().zip(windows).collect::<Vec<_>>();
+    if jobs.len() > 1 {
+        jobs.into_par_iter()
+            .for_each(|((y0, y1), mut band)| lr_rows(planes, &mut band, a, y0, y1));
+    } else {
+        for ((y0, y1), mut band) in jobs {
+            lr_rows(planes, &mut band, a, y0, y1);
         }
-        y += 4;
     }
     for (p, o) in planes.iter_mut().zip(out.into_iter()) {
         p.data = o;
     }
 }
 
+/// Runs the restoration block loop over the luma rows `y0..y1` of one band.
+fn lr_rows(planes: &[PlaneBuf; 3], out: &mut OutBand<'_>, a: &LrApply<'_>, y0: usize, y1: usize) {
+    let end = core::cmp::min(y1, a.hdr.frame_height as usize);
+    let upscaled_width = a.hdr.upscaled_width as usize;
+    let mut y = y0;
+    while y < end {
+        let mut x = 0;
+        while x < upscaled_width {
+            for plane in 0..a.num_planes {
+                if a.hdr.lr.frame_restoration_type[plane] != RESTORE_NONE {
+                    loop_restore_block(planes, out, a, plane, y >> 2, x >> 2);
+                }
+            }
+            x += 4;
+        }
+        y += 4;
+    }
+}
+
 /// Loop restore block process (spec 7.17.1).
 fn loop_restore_block(
     planes: &[PlaneBuf; 3],
-    out: &mut [Vec<u8>; 3],
+    out: &mut OutBand<'_>,
     a: &LrApply<'_>,
     plane: usize,
     row: usize,
@@ -353,7 +390,7 @@ fn get_source_sample(cdef: &PlaneBuf, pre_cdef: &PlaneBuf, sc: &StripeCtx, x: i3
 #[allow(clippy::too_many_arguments)]
 fn wiener_filter(
     planes: &[PlaneBuf; 3],
-    out: &mut [Vec<u8>; 3],
+    out: &mut OutBand<'_>,
     a: &LrApply<'_>,
     sc: &StripeCtx,
     plane: usize,
@@ -395,7 +432,7 @@ fn wiener_filter(
                 s += i64::from(vf) * i64::from(intermediate[r + t][c]);
             }
             let v = round2(s, INTER_ROUND1) as i32;
-            out[plane][(y + r) * cdef.stride + x + c] = v.clamp(0, 255) as u8;
+            out.put(plane, y + r, x + c, v.clamp(0, 255) as u8);
         }
     }
 }
@@ -415,7 +452,7 @@ fn wiener_coefficients(coeff: &[i32; 3], filter: &mut [i32; 7]) {
 #[allow(clippy::too_many_arguments)]
 fn self_guided_filter(
     planes: &[PlaneBuf; 3],
-    out: &mut [Vec<u8>; 3],
+    out: &mut OutBand<'_>,
     a: &LrApply<'_>,
     sc: &StripeCtx,
     plane: usize,
@@ -444,7 +481,7 @@ fn self_guided_filter(
             v += w0 * if r0 != 0 { flt0[i][j] } else { u };
             v += w2 * if r1 != 0 { flt1[i][j] } else { u };
             let s = round2(v, (SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS) as u32);
-            out[plane][(y + i) * cdef.stride + x + j] = s.clamp(0, 255) as u8;
+            out.put(plane, y + i, x + j, s.clamp(0, 255) as u8);
         }
     }
 }
@@ -546,6 +583,116 @@ fn box_filter(
                 v,
                 (SGRPROJ_SGR_BITS as u32 + shift) - SGRPROJ_RST_BITS as u32,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::consts::{RESTORE_NONE, RESTORE_SGRPROJ, RESTORE_WIENER};
+    use super::super::hdr::FrameHdr;
+    use super::super::tables_conv::{
+        SGRPROJ_XQD_MAX, SGRPROJ_XQD_MIN, WIENER_TAPS_MAX, WIENER_TAPS_MIN,
+    };
+    use super::{loop_restore_frame, LrApply, LrUnitGrids, PlaneBuf};
+
+    /// Deterministic filler (splitmix64).
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn make_planes(mi_rows: usize, mi_cols: usize, seed: u64) -> [PlaneBuf; 3] {
+        let mut state = seed;
+        let mut mk = |w: usize, h: usize| PlaneBuf {
+            data: (0..w * h).map(|_| next(&mut state) as u8).collect(),
+            stride: w,
+            width: w,
+            height: h,
+        };
+        let (lw, lh) = (mi_cols * 4, mi_rows * 4);
+        [mk(lw, lh), mk(lw / 2, lh / 2), mk(lw / 2, lh / 2)]
+    }
+
+    /// Loop restoration reads the CDEF output plus the pre-CDEF deblocked
+    /// frame and writes a separate `LrFrame`, so its result must not depend
+    /// on how the frame is split into row bands.
+    #[test]
+    fn lr_row_bands_match_serial() {
+        let shapes: [(usize, usize, u32, u32); 4] = [
+            // (MiRows, MiCols, FrameWidth, FrameHeight) — the last two are
+            // deliberately not MI-aligned, like the 76x42 fixtures.
+            (12, 20, 76, 42),
+            (32, 32, 128, 128),
+            (48, 80, 320, 192),
+            (18, 34, 133, 69),
+        ];
+        for (case, &(mi_rows, mi_cols, fw, fh)) in shapes.iter().enumerate() {
+            for types in [
+                [RESTORE_WIENER, RESTORE_SGRPROJ, RESTORE_SGRPROJ],
+                [RESTORE_SGRPROJ, RESTORE_WIENER, RESTORE_WIENER],
+            ] {
+                let mut state = 0x1234_5678_u64.wrapping_add(case as u64) ^ types[0] as u64;
+                let mut hdr = FrameHdr::default();
+                hdr.frame_width = fw;
+                hdr.frame_height = fh;
+                hdr.upscaled_width = fw;
+                hdr.lr.uses_lr = true;
+                hdr.lr.frame_restoration_type = types;
+                hdr.lr.loop_restoration_size = [64, 32, 32];
+                let mut grids = LrUnitGrids::new(&hdr, true, true, 3);
+                for plane in 0..3 {
+                    let n = grids.unit_rows[plane] * grids.unit_cols[plane];
+                    for idx in 0..n {
+                        // Mix RESTORE_NONE units in, as SWITCHABLE luma does.
+                        grids.types[plane][idx] = if next(&mut state) % 4 == 0 {
+                            RESTORE_NONE as u8
+                        } else {
+                            types[plane] as u8
+                        };
+                        for pass in 0..2 {
+                            for j in 0..3 {
+                                let lo = i32::from(WIENER_TAPS_MIN[j]);
+                                let hi = i32::from(WIENER_TAPS_MAX[j]);
+                                let span = (hi - lo + 1) as u64;
+                                grids.wiener[plane][idx][pass][j] =
+                                    lo + (next(&mut state) % span) as i32;
+                            }
+                        }
+                        grids.sgr_set[plane][idx] = (next(&mut state) % 16) as u8;
+                        for i in 0..2 {
+                            let lo = i32::from(SGRPROJ_XQD_MIN[i]);
+                            let hi = i32::from(SGRPROJ_XQD_MAX[i]);
+                            let span = (hi - lo + 1) as u64;
+                            grids.sgr_xqd[plane][idx][i] = lo + (next(&mut state) % span) as i32;
+                        }
+                    }
+                }
+                let pre_cdef = make_planes(mi_rows, mi_cols, 0xDEAD_BEEF ^ case as u64);
+                let apply = LrApply {
+                    hdr: &hdr,
+                    sub_x: true,
+                    sub_y: true,
+                    num_planes: 3,
+                    pre_cdef: &pre_cdef,
+                    grids: &grids,
+                };
+                let mut serial = make_planes(mi_rows, mi_cols, 0xFEED_FACE ^ case as u64);
+                loop_restore_frame(&mut serial, &apply, Some(1));
+                for bands in 2..=9usize {
+                    let mut split = make_planes(mi_rows, mi_cols, 0xFEED_FACE ^ case as u64);
+                    loop_restore_frame(&mut split, &apply, Some(bands));
+                    for plane in 0..3 {
+                        assert_eq!(
+                            split[plane].data, serial[plane].data,
+                            "LR plane {plane} differs at {fw}x{fh} with {bands} bands"
+                        );
+                    }
+                }
+            }
         }
     }
 }

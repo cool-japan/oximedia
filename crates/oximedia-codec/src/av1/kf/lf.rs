@@ -2,9 +2,14 @@
 //!
 //! Exact port of the loop filter process: per-plane vertical-then-horizontal
 //! passes, the edge loop filter process with block/transform edge detection,
-//! the filter size and adaptive filter strength processes (with per-block
-//! `DeltaLFs` and segment features), the filter mask process, and the
-//! narrow (filter4) and wide (8/16-tap) sample filters.
+//! and the filter size and adaptive filter strength processes (with per-block
+//! `DeltaLFs` and segment features).
+//!
+//! The sample filtering process itself — the filter mask, the narrow
+//! (filter4) filter and the wide 6/8/14-tap filters — lives in
+//! `oximedia_simd::av1_loopfilter`, which filters the four sample lines of an
+//! edge as one SIMD batch.  That crate carries a literal transcription of the
+//! spec alongside the optimised paths and proves them byte-identical.
 //!
 //! On intra frames every block satisfies `isIntra == 1`, `ref ==
 //! INTRA_FRAME` and `modeType == 0` (all Y modes are intra), which this
@@ -165,12 +170,24 @@ fn loop_filter_edge(
     }
 
     if lvl > 0 {
+        // The spec filters the four sample lines of this edge one at a time
+        // (`for i in 0..4`).  Those lines are independent — for a vertical
+        // edge they are four distinct rows, for a horizontal edge four
+        // distinct columns — so they are handed to the SIMD kernel as one
+        // four-lane batch.  See `oximedia_simd::av1_loopfilter`.
         let p = &mut planes[plane];
-        for i in 0..4usize {
-            let sx = xp + dy * i;
-            let sy = yp + dx * i;
-            sample_filtering(p, sx, sy, limit, blimit, thresh, dx, dy, filter_size, plane);
-        }
+        super::simd::filter_edge_4lines(
+            p,
+            xp,
+            yp,
+            dx,
+            dy,
+            filter_size,
+            plane,
+            limit,
+            blimit,
+            thresh,
+        );
     }
 }
 
@@ -227,181 +244,9 @@ fn adaptive_filter_strength(
     (lvl, limit, blimit, thresh)
 }
 
-/// Sample filtering process (spec 7.14.6.1).
-#[allow(clippy::too_many_arguments)]
-fn sample_filtering(
-    p: &mut super::recon::PlaneBuf,
-    x: usize,
-    y: usize,
-    limit: i32,
-    blimit: i32,
-    thresh: i32,
-    dx: usize,
-    dy: usize,
-    filter_size: usize,
-    plane: usize,
-) {
-    let stride = p.stride;
-    let at = |px: i32, py: i32| -> i32 { i32::from(p.data[(py as usize) * stride + px as usize]) };
-    let xi = x as i32;
-    let yi = y as i32;
-    let dxi = dx as i32;
-    let dyi = dy as i32;
-
-    // Filter mask process (spec 7.14.6.2), BitDepth = 8.
-    let q = |k: i32| at(xi + dxi * k, yi + dyi * k);
-    let pn = |k: i32| at(xi - dxi * (k + 1), yi - dyi * (k + 1));
-    let q0 = q(0);
-    let q1 = q(1);
-    let q2 = q(2);
-    let q3 = q(3);
-    let p0 = pn(0);
-    let p1 = pn(1);
-    let p2 = pn(2);
-    let p3 = pn(3);
-
-    let mut hev_mask = false;
-    hev_mask |= (p1 - p0).abs() > thresh;
-    hev_mask |= (q1 - q0).abs() > thresh;
-
-    let filter_len = if filter_size == 4 {
-        4
-    } else if plane != 0 {
-        6
-    } else if filter_size == 8 {
-        8
-    } else {
-        16
-    };
-
-    let mut mask = false;
-    mask |= (p1 - p0).abs() > limit;
-    mask |= (q1 - q0).abs() > limit;
-    mask |= (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > blimit;
-    if filter_len >= 6 {
-        mask |= (p2 - p1).abs() > limit;
-        mask |= (q2 - q1).abs() > limit;
-    }
-    if filter_len >= 8 {
-        mask |= (p3 - p2).abs() > limit;
-        mask |= (q3 - q2).abs() > limit;
-    }
-    let filter_mask = !mask;
-    if !filter_mask {
-        return;
-    }
-
-    let threshold_bd = 1i32;
-    let flat_mask = if filter_size >= 8 {
-        let mut m = false;
-        m |= (p1 - p0).abs() > threshold_bd;
-        m |= (q1 - q0).abs() > threshold_bd;
-        m |= (p2 - p0).abs() > threshold_bd;
-        m |= (q2 - q0).abs() > threshold_bd;
-        if filter_len >= 8 {
-            m |= (p3 - p0).abs() > threshold_bd;
-            m |= (q3 - q0).abs() > threshold_bd;
-        }
-        !m
-    } else {
-        false
-    };
-    let flat_mask2 = if filter_size >= 16 {
-        let q4 = q(4);
-        let q5 = q(5);
-        let q6 = q(6);
-        let p4 = pn(4);
-        let p5 = pn(5);
-        let p6 = pn(6);
-        let mut m = false;
-        m |= (p6 - p0).abs() > threshold_bd;
-        m |= (q6 - q0).abs() > threshold_bd;
-        m |= (p5 - p0).abs() > threshold_bd;
-        m |= (q5 - q0).abs() > threshold_bd;
-        m |= (p4 - p0).abs() > threshold_bd;
-        m |= (q4 - q0).abs() > threshold_bd;
-        !m
-    } else {
-        false
-    };
-
-    if filter_size == 4 || !flat_mask {
-        narrow_filter(p, xi, yi, dxi, dyi, hev_mask);
-    } else if filter_size == 8 || !flat_mask2 {
-        wide_filter(p, xi, yi, dxi, dyi, 3, plane);
-    } else {
-        wide_filter(p, xi, yi, dxi, dyi, 4, plane);
-    }
-}
-
-/// Narrow filter process (spec 7.14.6.3), BitDepth = 8.
-fn narrow_filter(p: &mut super::recon::PlaneBuf, x: i32, y: i32, dx: i32, dy: i32, hev: bool) {
-    let stride = p.stride;
-    let at = |px: i32, py: i32| -> i32 { i32::from(p.data[(py as usize) * stride + px as usize]) };
-    let put = |p: &mut super::recon::PlaneBuf, px: i32, py: i32, v: i32| {
-        p.data[(py as usize) * stride + px as usize] = v as u8;
-    };
-    #[inline]
-    fn clamp4(v: i32) -> i32 {
-        v.clamp(-128, 127)
-    }
-    let q0 = at(x, y);
-    let q1 = at(x + dx, y + dy);
-    let p0 = at(x - dx, y - dy);
-    let p1 = at(x - dx * 2, y - dy * 2);
-    let ps1 = p1 - 0x80;
-    let ps0 = p0 - 0x80;
-    let qs0 = q0 - 0x80;
-    let qs1 = q1 - 0x80;
-    let mut filter = if hev { clamp4(ps1 - qs1) } else { 0 };
-    filter = clamp4(filter + 3 * (qs0 - ps0));
-    let filter1 = clamp4(filter + 4) >> 3;
-    let filter2 = clamp4(filter + 3) >> 3;
-    let oq0 = clamp4(qs0 - filter1) + 0x80;
-    let op0 = clamp4(ps0 + filter2) + 0x80;
-    put(p, x, y, oq0);
-    put(p, x - dx, y - dy, op0);
-    if !hev {
-        let f = (filter1 + 1) >> 1;
-        let oq1 = clamp4(qs1 - f) + 0x80;
-        let op1 = clamp4(ps1 + f) + 0x80;
-        put(p, x + dx, y + dy, oq1);
-        put(p, x - dx * 2, y - dy * 2, op1);
-    }
-}
-
-/// Wide filter process (spec 7.14.6.4).
-fn wide_filter(
-    p: &mut super::recon::PlaneBuf,
-    x: i32,
-    y: i32,
-    dx: i32,
-    dy: i32,
-    log2_size: u32,
-    plane: usize,
-) {
-    let n: i32 = if log2_size == 4 {
-        6
-    } else if plane == 0 {
-        3
-    } else {
-        2
-    };
-    let n2: i32 = if log2_size == 3 && plane == 0 { 0 } else { 1 };
-    let stride = p.stride;
-    let at = |px: i32, py: i32| -> i32 { i32::from(p.data[(py as usize) * stride + px as usize]) };
-    let mut f = [0i32; 12];
-    for i in -n..n {
-        let mut t = 0i32;
-        for j in -n..=n {
-            let pos = (i + j).clamp(-(n + 1), n);
-            let tap = if j.abs() <= n2 { 2 } else { 1 };
-            t += at(x + pos * dx, y + pos * dy) * tap;
-        }
-        f[(i + n) as usize] = (t + (1 << (log2_size - 1))) >> log2_size;
-    }
-    for i in -n..n {
-        let v = f[(i + n) as usize];
-        p.data[((y + i * dy) as usize) * stride + (x + i * dx) as usize] = v as u8;
-    }
-}
+// The sample filtering process itself (spec 7.14.6.1 mask process, 7.14.6.3
+// narrow filter, 7.14.6.4 wide filter) lives in
+// `oximedia_simd::av1_loopfilter`, which carries a literal transcription of
+// the spec alongside the optimised paths and proves them byte-identical over
+// an exhaustive sweep of filter levels, sharpness values, block sizes and
+// planes.

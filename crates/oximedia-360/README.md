@@ -8,7 +8,7 @@
 
 Part of the [OxiMedia](https://github.com/cool-japan/oximedia) sovereign media framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 ## Features
 
@@ -26,7 +26,7 @@ Version: 0.2.0 — 2026-07-15 — extensively tested
 
 ```toml
 [dependencies]
-oximedia-360 = "0.1.9"
+oximedia-360 = "0.2.0"
 ```
 
 ### Equirectangular to Cubemap

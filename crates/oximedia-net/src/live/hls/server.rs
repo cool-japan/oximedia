@@ -232,8 +232,15 @@ impl HlsServer {
     ) -> Result<hyper::Response<Full<Bytes>>, hyper::Error> {
         // Server-side serve latency: time to locate the segment and build the
         // response. Real measurement replacing a hardcoded 100 ms placeholder.
-        // TODO(0.2.x): end-to-end (glass-to-glass) latency also needs client
-        // request timestamps threaded in from the connection layer.
+        //
+        // End-to-end (glass-to-glass) latency additionally needs the
+        // client's own timestamps -- see `super::client` for the estimator
+        // (segment PDT vs. client fetch/decode wall clock). Its module docs
+        // record honestly why it isn't wired to this server end-to-end yet:
+        // this handler doesn't emit `#EXT-X-PROGRAM-DATE-TIME` into served
+        // playlists (and `crate::hls::playlist::MediaPlaylist::to_m3u8`,
+        // outside this module, doesn't serialize it even if a `Segment` had
+        // one set).
         let serve_start = std::time::Instant::now();
 
         // Parse filename to get sequence number

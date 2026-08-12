@@ -78,9 +78,9 @@ pub(crate) enum CaptionsCommand {
         to_format: String,
     },
 
-    /// Burn captions into video
+    /// Burn captions into an uncompressed Y4M clip (requires --font)
     Burn {
-        /// Input video file
+        /// Input video file (uncompressed YUV4MPEG2 / .y4m)
         #[arg(long)]
         video: PathBuf,
 
@@ -88,17 +88,22 @@ pub(crate) enum CaptionsCommand {
         #[arg(long)]
         captions: PathBuf,
 
-        /// Output video file
+        /// Output video file (YUV4MPEG2 / .y4m)
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Font size
+        /// Font size in points
         #[arg(long, default_value = "24")]
         font_size: u32,
 
         /// Font color (hex)
         #[arg(long, default_value = "FFFFFF")]
         font_color: String,
+
+        /// TrueType/OpenType font used to rasterise captions (required;
+        /// OxiMedia ships no font and never picks a system one)
+        #[arg(long, value_name = "PATH")]
+        font: Option<PathBuf>,
     },
 
     /// Extract captions from media

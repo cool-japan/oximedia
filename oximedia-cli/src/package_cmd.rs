@@ -46,33 +46,35 @@ pub async fn run_package(opts: PackageOptions, json_output: bool) -> Result<()> 
         return Ok(());
     }
 
-    println!("{}", "Media Package".green().bold());
-    println!("  Input:            {}", opts.input.display());
-    println!("  Output:           {}", opts.output.display());
-    println!("  Format:           {}", format_label(&opts.format).cyan());
-    println!("  Segment duration: {}s", opts.segments);
-    println!("  Ladder entries:   {}", ladder.entries.len());
-    for entry in &ladder.entries {
+    if !crate::progress::is_quiet() {
+        println!("{}", "Media Package".green().bold());
+        println!("  Input:            {}", opts.input.display());
+        println!("  Output:           {}", opts.output.display());
+        println!("  Format:           {}", format_label(&opts.format).cyan());
+        println!("  Segment duration: {}s", opts.segments);
+        println!("  Ladder entries:   {}", ladder.entries.len());
+        for entry in &ladder.entries {
+            println!(
+                "    {}x{} @ {}kbps  [{}]",
+                entry.width,
+                entry.height,
+                entry.bitrate / 1000,
+                entry.codec
+            );
+        }
         println!(
-            "    {}x{} @ {}kbps  [{}]",
-            entry.width,
-            entry.height,
-            entry.bitrate / 1000,
-            entry.codec
+            "  Encryption:       {}",
+            if opts.encrypt == "none" {
+                "none".dimmed().to_string()
+            } else {
+                opts.encrypt.cyan().to_string()
+            }
+        );
+        println!(
+            "  Low latency:      {}",
+            if opts.low_latency { "yes" } else { "no" }
         );
     }
-    println!(
-        "  Encryption:       {}",
-        if opts.encrypt == "none" {
-            "none".dimmed().to_string()
-        } else {
-            opts.encrypt.cyan().to_string()
-        }
-    );
-    println!(
-        "  Low latency:      {}",
-        if opts.low_latency { "yes" } else { "no" }
-    );
 
     match fmt {
         PackagingFormat::HlsFmp4 | PackagingFormat::HlsTs => {
@@ -113,11 +115,13 @@ pub async fn run_package(opts: PackageOptions, json_output: bool) -> Result<()> 
                 .package(input_str)
                 .await
                 .with_context(|| "HLS packaging failed")?;
-            println!(
-                "{} HLS packaging complete: {}",
-                "✓".green(),
-                opts.output.display()
-            );
+            if !crate::progress::is_quiet() {
+                println!(
+                    "{} HLS packaging complete: {}",
+                    "✓".green(),
+                    opts.output.display()
+                );
+            }
         }
         PackagingFormat::Dash | PackagingFormat::Both => {
             let mut builder = DashPackagerBuilder::new()
@@ -141,11 +145,13 @@ pub async fn run_package(opts: PackageOptions, json_output: bool) -> Result<()> 
                 .package(input_str)
                 .await
                 .with_context(|| "DASH packaging failed")?;
-            println!(
-                "{} DASH packaging complete: {}",
-                "✓".green(),
-                opts.output.display()
-            );
+            if !crate::progress::is_quiet() {
+                println!(
+                    "{} DASH packaging complete: {}",
+                    "✓".green(),
+                    opts.output.display()
+                );
+            }
         }
     }
 

@@ -160,6 +160,7 @@ pub mod segment_list;
 pub mod segment_naming;
 pub mod segment_timeline;
 pub mod segment_validator;
+mod source_probe;
 pub mod ssai;
 pub mod streaming_output;
 pub mod subtitle_track;

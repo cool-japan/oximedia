@@ -33,6 +33,7 @@ pub(crate) mod lr;
 pub(crate) mod msac;
 pub(crate) mod pred;
 pub(crate) mod recon;
+pub(crate) mod simd;
 #[allow(dead_code)]
 pub(crate) mod tables_cdf_coef;
 #[allow(dead_code)]

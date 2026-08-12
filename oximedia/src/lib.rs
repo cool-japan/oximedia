@@ -212,6 +212,7 @@
 //! | `caption-gen` | `oximedia-caption-gen` | Advanced caption generation: speech alignment, WCAG compliance, diarization |
 //! | `image-transform` | `oximedia-image-transform` | Image transformations: affine, perspective, resize, crop, rotate, color conversion, lens distortion |
 //! | `pipeline` | `oximedia-pipeline` | Declarative media processing DSL: typed filter graph, node composition, execution planning |
+//! | `capture` | `oximedia-capture` | Live camera/device capture (AVFoundation/V4L2/Media Foundation); raw pixel formats + MJPEG passthrough |
 //! | `mjpeg` | `oximedia-codec` (mjpeg) | Motion JPEG intra-frame video codec |
 //! | `apv` | `oximedia-codec` (apv) | APV (Advanced Professional Video) intra-frame codec (ISO/IEC 23009-13) |
 //! | `full` | all of the above | Everything enabled |
@@ -1875,6 +1876,33 @@ pub mod ml {
     //! `ml-*` feature is WASM-compatible and runs on the CPU path by
     //! default (or on WebGPU via the `webgpu` feature).
     pub use oximedia_ml::*;
+}
+
+/// Pure-Rust live camera/device capture: open a camera, negotiate a format
+/// against what it advertises, and receive frames on a bounded queue.
+///
+/// Enable with `features = ["capture"]`.
+///
+/// See the [`oximedia_capture`] crate for the full API surface and its README
+/// for the honest, per-platform verification status: macOS enumeration was
+/// empirically validated against real hardware during package A5 (streaming
+/// itself is gated behind the system TCC permission prompt); Linux (V4L2)
+/// and Windows (Media Foundation) are fully implemented and pass their
+/// host-side unit and const-evaluated ABI checks, but neither has yet been
+/// exercised against a live device in this workspace's own verification.
+/// `backend_kind()` and [`oximedia_capture::CaptureError::UnsupportedPlatform`]
+/// make "no backend compiled in" and "backend present, no camera attached"
+/// two distinguishable outcomes rather than the same empty list.
+#[cfg(feature = "capture")]
+pub mod capture {
+    //! Live camera/device capture.
+    //!
+    //! Backends: AVFoundation (macOS), Video4Linux2 (Linux), Media Foundation
+    //! (Windows). Delivers raw pixel formats or an MJPEG bitstream
+    //! passthrough only — never a decode of an encumbered codec. A target
+    //! with no backend reports [`oximedia_capture::CaptureError::UnsupportedPlatform`]
+    //! rather than an empty device list.
+    pub use oximedia_capture::*;
 }
 
 /// Motion JPEG (MJPEG) intra-frame video codec.

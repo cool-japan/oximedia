@@ -25,10 +25,8 @@ pub async fn add_comment(
     text: &str,
     annotation_type: AnnotationType,
 ) -> ReviewResult<CommentId> {
-    let comment_id = CommentId::new();
-    let now = Utc::now();
-
-    // Create default author (in real implementation, would use authenticated user)
+    // Default author; real callers that have an authenticated user should
+    // use `add_comment_detailed` instead.
     let author = User {
         id: "system".to_string(),
         name: "System".to_string(),
@@ -36,25 +34,15 @@ pub async fn add_comment(
         role: UserRole::Reviewer,
     };
 
-    let _comment = Comment {
-        id: comment_id,
+    add_comment_detailed(
         session_id,
         frame,
-        text: text.to_string(),
+        text,
         annotation_type,
         author,
-        status: CommentStatus::Open,
-        priority: CommentPriority::Normal,
-        parent_id: None,
-        created_at: now,
-        updated_at: now,
-        resolved_at: None,
-        resolved_by: None,
-    };
-
-    // In a real implementation, this would persist the comment
-
-    Ok(comment_id)
+        CommentPriority::Normal,
+    )
+    .await
 }
 
 /// Add a comment with detailed information.
@@ -71,7 +59,6 @@ pub async fn add_comment(
 /// # Errors
 ///
 /// Returns error if comment cannot be added.
-#[allow(clippy::too_many_arguments)]
 pub async fn add_comment_detailed(
     session_id: SessionId,
     frame: i64,
@@ -83,7 +70,7 @@ pub async fn add_comment_detailed(
     let comment_id = CommentId::new();
     let now = Utc::now();
 
-    let _comment = Comment {
+    let comment = Comment {
         id: comment_id,
         session_id,
         frame,
@@ -99,6 +86,8 @@ pub async fn add_comment_detailed(
         resolved_by: None,
     };
 
+    let store = crate::store::default_store().await?;
+    store.insert_comment(&comment).await?;
     Ok(comment_id)
 }
 
@@ -135,19 +124,19 @@ pub async fn add_comments_batch(
 ///
 /// # Errors
 ///
-/// Returns error if comment cannot be updated.
+/// Returns [`crate::error::ReviewError::CommentNotFound`] if `comment_id`
+/// does not identify an existing comment.
 pub async fn update_comment(comment_id: CommentId, new_text: &str) -> ReviewResult<()> {
-    // In a real implementation, this would:
-    // 1. Load the comment
-    // 2. Update the text
-    // 3. Update the updated_at timestamp
-    // 4. Persist the changes
-
-    let _ = (comment_id, new_text);
-    Ok(())
+    let store = crate::store::default_store().await?;
+    store.update_comment_text(comment_id, new_text).await
 }
 
 /// Delete a comment.
+///
+/// This permanently removes the comment (and, per [`crate::comment::CommentStatus::Archived`]
+/// being a distinct status, differs from archiving -- to archive instead of
+/// delete, resolve the comment's status via [`crate::comment::resolve::archive_comment`]).
+/// Idempotent: deleting an already-absent comment is not an error.
 ///
 /// # Arguments
 ///
@@ -157,12 +146,8 @@ pub async fn update_comment(comment_id: CommentId, new_text: &str) -> ReviewResu
 ///
 /// Returns error if comment cannot be deleted.
 pub async fn delete_comment(comment_id: CommentId) -> ReviewResult<()> {
-    // In a real implementation, this would:
-    // 1. Mark comment as archived
-    // 2. Or permanently delete if allowed
-
-    let _ = comment_id;
-    Ok(())
+    let store = crate::store::default_store().await?;
+    store.delete_comment(comment_id).await
 }
 
 #[cfg(test)]
@@ -213,8 +198,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_comment() {
-        let comment_id = CommentId::new();
+        let session_id = SessionId::new();
+        let comment_id = add_comment(session_id, 100, "Original", AnnotationType::Issue)
+            .await
+            .expect("add should succeed");
+
         let result = update_comment(comment_id, "Updated text").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_comment_not_found_is_honest_error() {
+        // A comment ID that was never created must not silently succeed.
+        let comment_id = CommentId::new();
+        let result = update_comment(comment_id, "Updated text").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_comment_then_update_is_honest_error() {
+        let session_id = SessionId::new();
+        let comment_id = add_comment(session_id, 100, "Original", AnnotationType::Issue)
+            .await
+            .expect("add should succeed");
+
+        delete_comment(comment_id)
+            .await
+            .expect("delete should succeed");
+        // Deleting again is idempotent, not an error.
+        delete_comment(comment_id)
+            .await
+            .expect("re-delete should be idempotent");
+
+        let result = update_comment(comment_id, "Updated text").await;
+        assert!(result.is_err());
     }
 }

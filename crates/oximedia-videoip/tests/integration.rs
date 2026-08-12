@@ -1,13 +1,30 @@
 //! Integration tests for video-over-IP protocol.
 
 use oximedia_videoip::*;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::time::{sleep, Duration};
+
+/// Uncompressed video + PCM audio is the only combination this crate can
+/// genuinely put on the wire, so it is the one the end-to-end test uses.
+fn transmittable_configs(width: u32, height: u32) -> (VideoConfig, AudioConfig) {
+    let video = VideoConfig::new(width, height, 30.0)
+        .expect("video_config should be valid")
+        .with_codec(types::VideoCodec::Uyvy);
+    let audio = AudioConfig::new(48000, 2)
+        .expect("audio_config should be valid")
+        .with_codec(types::AudioCodec::Pcm16)
+        .expect("audio_config should be valid");
+    (video, audio)
+}
 
 #[tokio::test]
 async fn test_end_to_end_video_streaming() {
-    // Create source
-    let video_config = VideoConfig::new(640, 480, 30.0).expect("video_config should be valid");
-    let audio_config = AudioConfig::new(48000, 2).expect("audio_config should be valid");
+    // 64x48 UYVY is 6144 bytes: one packet, no fragmentation.
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 48;
+    let (video_config, audio_config) = transmittable_configs(WIDTH, HEIGHT);
+    let video_format = video_config.format.clone();
+    let audio_format = audio_config.format.clone();
 
     let mut source = VideoIpSource::new("Test Camera", video_config, audio_config)
         .await
@@ -16,57 +33,81 @@ async fn test_end_to_end_video_streaming() {
     let source_addr = source.local_addr();
 
     // Create receiver
-    let mut receiver =
-        VideoIpReceiver::connect(source_addr, types::VideoCodec::Vp9, types::AudioCodec::Opus)
-            .await
-            .expect("test expectation failed");
+    let mut receiver = VideoIpReceiver::connect(source_addr, &video_format, &audio_format)
+        .await
+        .expect("test expectation failed");
 
-    source.add_destination(receiver.local_addr());
+    // `local_addr()` reports the wildcard bind (0.0.0.0:port); sending there
+    // fails with ENETUNREACH/EHOSTUNREACH, which is why this test never
+    // actually delivered anything before. Address the loopback explicitly.
+    source.add_destination(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        receiver.local_addr().port(),
+    ));
 
-    // Send a frame
+    // Send a real, correctly sized frame and a real PCM block.
+    let pixels: Vec<u8> = (0..(WIDTH * HEIGHT * 2) as usize)
+        .map(|i| (i % 251) as u8)
+        .collect();
     let frame = codec::VideoFrame::new(
-        bytes::Bytes::from_static(b"test video data"),
-        640,
-        480,
+        bytes::Bytes::from(pixels.clone()),
+        WIDTH,
+        HEIGHT,
         true,
-        0,
+        7_000_000,
     );
 
     let samples = codec::AudioSamples::new(
-        bytes::Bytes::from_static(b"test audio data"),
-        1024,
+        bytes::Bytes::from(vec![0u8; 480 * 2 * 2]),
+        480,
         2,
         48000,
-        0,
+        7_000_000,
     );
 
-    // Send frame in background
+    // Send the same frame repeatedly in the background. `receive_frame` only
+    // drains the jitter buffer when a new datagram wakes it up, and the buffer
+    // holds each packet for its 20 ms target delay, so a single send would sit
+    // in the buffer until the receive timeout expired. Every repetition
+    // carries identical content, so whichever one is delivered first satisfies
+    // the assertions below.
     tokio::spawn(async move {
-        sleep(Duration::from_millis(10)).await;
-        source
-            .send_frame(frame, Some(samples))
-            .await
-            .expect("test expectation failed");
+        for _ in 0..8u32 {
+            sleep(Duration::from_millis(12)).await;
+            source
+                .send_frame(frame.clone(), Some(samples.clone()))
+                .await
+                .expect("test expectation failed");
+        }
     });
 
-    // Try to receive (with timeout)
-    let result = tokio::time::timeout(Duration::from_millis(200), receiver.receive_frame()).await;
+    let result = tokio::time::timeout(Duration::from_millis(500), receiver.receive_frame()).await;
 
-    // Note: This might timeout in test environment, that's OK
-    match result {
-        Ok(Ok(_)) => {
-            // Success!
-        }
-        Ok(Err(_)) | Err(_) => {
-            // Timeout or error is acceptable in test environment
-        }
+    let (video_frame, audio) = result
+        .expect("receive_frame timed out over loopback")
+        .expect("receive_frame failed");
+
+    // The receiver must report the geometry and payload that were really
+    // sent -- these used to be a hardcoded 1920x1080 and a dropped PTS.
+    assert_eq!(video_frame.width, WIDTH);
+    assert_eq!(video_frame.height, HEIGHT);
+    assert_eq!(video_frame.pts, 7_000_000);
+    assert!(video_frame.is_keyframe);
+    assert_eq!(&video_frame.data[..], &pixels[..]);
+
+    // Audio may or may not have been dequeued before the video frame
+    // completed, but whatever arrives must be really decoded PCM.
+    if let Some(audio) = audio {
+        assert_eq!(audio.sample_count, 480);
+        assert_eq!(audio.channels, 2);
+        assert_eq!(audio.sample_rate, 48000);
+        assert_eq!(audio.pts, 7_000_000);
     }
 }
 
 #[tokio::test]
 async fn test_fec_recovery() {
-    let video_config = VideoConfig::new(640, 480, 30.0).expect("video_config should be valid");
-    let audio_config = AudioConfig::new(48000, 2).expect("audio_config should be valid");
+    let (video_config, audio_config) = transmittable_configs(64, 48);
 
     let mut source = VideoIpSource::new("FEC Test", video_config, audio_config)
         .await
@@ -75,7 +116,8 @@ async fn test_fec_recovery() {
     // Enable FEC
     source.enable_fec(0.1).expect("enable_fec should succeed");
 
-    let frame = codec::VideoFrame::new(bytes::Bytes::from_static(b"test"), 640, 480, true, 0);
+    let frame =
+        codec::VideoFrame::new(bytes::Bytes::from(vec![32u8; 64 * 48 * 2]), 64, 48, true, 0);
 
     // Should not panic
     source

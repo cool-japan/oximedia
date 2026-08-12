@@ -403,6 +403,24 @@ mod tests {
     use std::thread;
 
     /// Write `data` to a temp file and return its path.
+    ///
+    /// The name has to be unique against *every other process on the machine*,
+    /// not just against the other calls in this one: the test harness runs each
+    /// test in its own process, so a per-process counter alone restarts at zero
+    /// in every one of them, and a sub-second timestamp alone is not the
+    /// tiebreaker it looks like — processes launched together reach this line
+    /// within the same narrow window and duplicate nanosecond readings are
+    /// common there. Two tests that landed on one name would truncate each
+    /// other's file, and the loser would fail reading a payload that is the
+    /// wrong length rather than reporting a collision.
+    ///
+    /// So the process id carries the uniqueness — the kernel guarantees it is
+    /// distinct across all *live* processes — the counter separates repeat
+    /// calls within one test, and the timestamp is kept only so that a file
+    /// orphaned by a killed run cannot be mistaken for ours after its pid is
+    /// recycled. `create_new` then refuses to open anything that already
+    /// exists, so a name that somehow still collides fails loudly here instead
+    /// of quietly corrupting a payload.
     fn make_temp_file(data: &[u8]) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -411,10 +429,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
+        let pid = std::process::id();
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let name = format!("oximedia_aaf_lazy_test_{now}_{seq}.bin");
+        let name = format!("oximedia_aaf_lazy_test_{pid}_{seq}_{now}.bin");
         path.push(name);
-        let mut f = std::fs::File::create(&path).expect("create temp file");
+        let mut f = std::fs::File::create_new(&path).expect("create temp file");
         f.write_all(data).expect("write temp data");
         path
     }

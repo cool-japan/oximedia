@@ -2,13 +2,13 @@
 
 ![Status: Stable (core/CENC/ClearKey)](https://img.shields.io/badge/status-stable-green)
 ![FairPlay/Widevine/PlayReady: Experimental](https://img.shields.io/badge/fairplay%2Fwidevine%2Fplayready-experimental-yellow)
-![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-blue)
+![Version: 0.2.1](https://img.shields.io/badge/version-0.2.1-blue)
 
 DRM (Digital Rights Management) and encryption support for OxiMedia streaming, implementing CENC and W3C Clear Key packaging (Stable), plus Widevine, PlayReady, and FairPlay Streaming message-format scaffolding (**Experimental / non-interoperable placeholders** — see `docs/codec_status.md` § Network & DRM crypto status: these do not perform a real Apple/Google/Microsoft license exchange and must not be represented as production-ready DRM support).
 
 Part of the [oximedia](https://github.com/cool-japan/oximedia) workspace — a comprehensive pure-Rust media processing framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 ## Features
 
@@ -43,9 +43,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-drm = "0.1.9"
+oximedia-drm = "0.2.0"
 # Enable specific DRM systems:
-oximedia-drm = { version = "0.1.9", features = ["all-drm"] }
+oximedia-drm = { version = "0.2.0", features = ["all-drm"] }
 ```
 
 ## Feature Flags

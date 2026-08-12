@@ -3,6 +3,7 @@
 pub mod aaf;
 pub mod edl;
 pub mod fcpxml;
+pub(crate) mod xmeml;
 pub mod xml;
 
 use crate::error::ConformResult;

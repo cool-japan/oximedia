@@ -2,7 +2,7 @@
 
 use crate::{
     auth::{WebhookConfig, WebhookNotifier},
-    cdn::CdnUploader,
+    cdn::CdnConfig,
     dash::{DashConfig, DashPackager},
     dvr::{DvrConfig, DvrManager},
     error::ServerResult,
@@ -48,7 +48,14 @@ pub struct StreamingServerConfig {
     pub enable_recording: bool,
 
     /// Enable CDN upload.
+    ///
+    /// Forwarded to the RTMP ingest server, which owns the single
+    /// [`CdnUploader`](crate::cdn::CdnUploader) instance. Requires
+    /// [`Self::cdn`]; server construction fails otherwise.
     pub enable_cdn_upload: bool,
+
+    /// CDN destination used when [`Self::enable_cdn_upload`] is set.
+    pub cdn: Option<CdnConfig>,
 
     /// Enable DVR.
     pub enable_dvr: bool,
@@ -77,6 +84,7 @@ impl Default for StreamingServerConfig {
             enable_transcoding: true,
             enable_recording: false,
             enable_cdn_upload: false,
+            cdn: None,
             enable_dvr: true,
             enable_webhooks: true,
             record_dir: "./recordings".to_string(),
@@ -157,9 +165,6 @@ pub struct StreamingServer {
     /// Stream recorder.
     recorder: Option<Arc<StreamRecorder>>,
 
-    /// CDN uploader.
-    cdn_uploader: Option<Arc<CdnUploader>>,
-
     /// DVR manager.
     dvr_manager: Option<Arc<DvrManager>>,
 
@@ -188,6 +193,7 @@ impl StreamingServer {
             enable_transcoding: config.enable_transcoding,
             enable_recording: config.enable_recording,
             enable_cdn_upload: config.enable_cdn_upload,
+            cdn: config.cdn.clone(),
             record_dir: config.record_dir.clone(),
             ..Default::default()
         };
@@ -211,11 +217,13 @@ impl StreamingServer {
             None
         };
 
-        let cdn_uploader = if config.enable_cdn_upload {
-            Some(Arc::new(CdnUploader::new().await?))
-        } else {
-            None
-        };
+        // NOTE: the CDN uploader is deliberately NOT duplicated here. The RTMP
+        // ingest server constructed above owns the single instance and is the
+        // only component that feeds it media; a second uploader built here was
+        // never wired to any producer, so it uploaded nothing while suggesting
+        // the streaming server had its own CDN path. `RtmpIngestServer::new`
+        // already returned an honest error above if CDN upload is enabled
+        // without a usable destination.
 
         let dvr_manager = if config.enable_dvr {
             Some(Arc::new(DvrManager::new(
@@ -239,7 +247,6 @@ impl StreamingServer {
             dash_packager,
             transcode_engine,
             recorder,
-            cdn_uploader,
             dvr_manager,
             webhook_notifier,
             metrics,

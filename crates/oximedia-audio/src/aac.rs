@@ -1,26 +1,41 @@
-//! AAC (Advanced Audio Coding) decoder.
+//! AAC (Advanced Audio Coding) — ADTS parsing only; **decoding is not
+//! implemented**.
 //!
-//! AAC patents expired in 2023, making it patent-free to implement.
-//! This module provides a pure-Rust AAC-LC (Low Complexity) decoder
-//! supporting MPEG-4 AAC-LC audio streams.
+//! # Status
 //!
-//! # Supported Profiles
-//! - AAC-LC (Low Complexity) — the most common profile
-//! - HE-AAC v1 (Spectral Band Replication) — high efficiency at low bitrates
+//! `oximedia-audio` cannot decode AAC. This module provides:
 //!
-//! # Container Formats
-//! - Raw ADTS (Audio Data Transport Stream) frames
-//! - LATM/LOAS framing
+//! - [`AdtsHeader`] — a real ADTS (Audio Data Transport Stream) transport
+//!   header parser (sync word, profile, sample rate index, channel
+//!   configuration, frame length, CRC flag).
+//! - [`AacObjectType`] — ISO 14496-3 audio object type identifiers.
+//! - [`AacDecoder`] — a stream *inspector* whose decode entry points fail
+//!   closed with [`AudioError::UnsupportedFormat`]. It implements
+//!   [`AudioDecoder`] and reports
+//!   [`CodecId::Aac`], so it can sit in a decoder
+//!   registry and be rejected honestly instead of being mistaken for a codec
+//!   OxiMedia does implement.
+//!
+//! There is no spectral (Huffman) decode, no inverse quantisation, no
+//! filterbank, and no SBR/PS. An earlier revision of this module returned an
+//! [`AudioFrame`] whose samples were derived from raw payload bit-patterns —
+//! a fabricated signal unrelated to the encoded audio — and reported
+//! `CodecId::Mp3` as its codec. Both behaviours have been removed; see
+//! `docs/codec_status.md`.
+//!
+//! Real AAC decode is expected to arrive through a separate platform
+//! extension (for example AudioToolbox on macOS), not through this module.
 //!
 //! # Patents
-//! The Fraunhofer/Via Licensing AAC patents expired in April 2023.
-//! All implementations are now patent-free.
+//! The Fraunhofer/Via Licensing AAC patents expired in April 2023, so an
+//! implementation would be patent-free; the gap here is engineering effort,
+//! not licensing.
 
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::cast_possible_truncation)]
 
-use crate::{AudioDecoder, AudioError, AudioFrame, AudioResult, ChannelLayout};
-use bytes::Bytes;
+use crate::traits::AudioDecoder;
+use crate::{AudioError, AudioFrame, AudioResult, ChannelLayout};
 use oximedia_core::{CodecId, SampleFormat};
 
 /// AAC object type (ISO 14496-3).
@@ -160,389 +175,159 @@ impl AdtsHeader {
     }
 }
 
-/// Scale factor band table entry.
-struct ScfBandEntry {
-    offset: usize,
-    count: usize,
-}
-
-/// Window type for MDCT windowing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowType {
-    /// Long window (1024 samples).
-    Long,
-    /// Short window (128 samples, 8 per long block).
-    Short,
-    /// Long→Short transition.
-    LongStartBlock,
-    /// Short→Long transition.
-    LongStopBlock,
-}
-
-/// AAC spectral coefficients for one channel.
-struct AacChannel {
-    /// Spectral coefficients (frequency domain).
-    coeffs: Vec<f32>,
-    /// Scale factors per scale factor band.
-    scale_factors: Vec<i32>,
-    /// Window type.
-    window_type: WindowType,
-    /// Previous MDCT output for overlap-add.
-    prev_block: Vec<f32>,
-    /// Whether this channel uses global gain.
-    global_gain: i32,
-}
-
-impl AacChannel {
-    fn new(frame_size: usize) -> Self {
-        Self {
-            coeffs: vec![0.0; frame_size],
-            scale_factors: Vec::new(),
-            window_type: WindowType::Long,
-            prev_block: vec![0.0; frame_size],
-            global_gain: 0,
-        }
-    }
-
-    /// Apply inverse quantization: `sign(x) * |x|^(4/3) * 2^(gain/4)`.
-    fn dequantize(&mut self) {
-        let gain_scale = 2.0_f32.powf(self.global_gain as f32 / 4.0);
-        for coeff in &mut self.coeffs {
-            let q = *coeff;
-            *coeff = if q >= 0.0 {
-                q.powf(4.0 / 3.0) * gain_scale
-            } else {
-                -((-q).powf(4.0 / 3.0)) * gain_scale
-            };
-        }
-    }
-
-    /// Apply scale factors to spectral coefficients.
-    fn apply_scale_factors(&mut self, sfb_offsets: &[usize]) {
-        for (i, sf) in self.scale_factors.iter().enumerate() {
-            let start = sfb_offsets.get(i).copied().unwrap_or(0);
-            let end = sfb_offsets
-                .get(i + 1)
-                .copied()
-                .unwrap_or(self.coeffs.len())
-                .min(self.coeffs.len());
-            if start >= end {
-                continue;
-            }
-            let scale = 2.0_f32.powf(-(*sf as f32) / 4.0);
-            for c in &mut self.coeffs[start..end] {
-                *c *= scale;
-            }
-        }
-    }
-
-    /// IMDCT (modified discrete cosine transform, inverse).
-    ///
-    /// Uses the formula: `x[n] = (2/N) * sum_{k=0}^{N/2-1} X[k] * cos(pi/N * (n + 0.5 + N/4) * (k + 0.5))`
-    fn imdct(&mut self) {
-        let n = self.coeffs.len();
-        if n == 0 {
-            return;
-        }
-        let half_n = n / 2;
-        let two_over_n = 2.0 / n as f32;
-        let pi_over_n = std::f32::consts::PI / n as f32;
-
-        let mut output = vec![0.0f32; n];
-        for nn in 0..n {
-            let mut val = 0.0f32;
-            for k in 0..half_n {
-                val += self.coeffs[k]
-                    * (pi_over_n * (nn as f32 + 0.5 + (n / 4) as f32) * (k as f32 + 0.5)).cos();
-            }
-            output[nn] = val * two_over_n;
-        }
-
-        // Windowing (use Hann-style for long blocks)
-        let window = Self::compute_window(n);
-        for (o, w) in output.iter_mut().zip(window.iter()) {
-            *o *= w;
-        }
-
-        // Overlap-add
-        let mut result = vec![0.0f32; n];
-        for i in 0..half_n {
-            result[i] = output[i + half_n] + self.prev_block[i + half_n];
-            result[i + half_n] = output[i + half_n + half_n] + self.prev_block[i];
-        }
-
-        self.prev_block = output;
-        self.coeffs = result;
-    }
-
-    /// Compute a Hann window for IMDCT.
-    fn compute_window(n: usize) -> Vec<f32> {
-        let pi_over_2n = std::f32::consts::PI / (2.0 * n as f32);
-        (0..n)
-            .map(|i| (pi_over_2n * (i as f32 + 0.5)).sin())
-            .collect()
-    }
-}
-
-/// Bit reader for AAC bitstream parsing.
-struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize, // bit position
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    fn bits_remaining(&self) -> usize {
-        self.data.len() * 8 - self.pos.min(self.data.len() * 8)
-    }
-
-    fn read_bits(&mut self, n: usize) -> AudioResult<u32> {
-        if n > 32 {
-            return Err(AudioError::InvalidData(
-                "Cannot read more than 32 bits at once".into(),
-            ));
-        }
-        if self.bits_remaining() < n {
-            return Err(AudioError::NeedMoreData);
-        }
-
-        let mut result = 0u32;
-        for _ in 0..n {
-            let byte_pos = self.pos / 8;
-            let bit_pos = 7 - (self.pos % 8);
-            let bit = (self.data[byte_pos] >> bit_pos) & 1;
-            result = (result << 1) | u32::from(bit);
-            self.pos += 1;
-        }
-        Ok(result)
-    }
-
-    fn read_bool(&mut self) -> AudioResult<bool> {
-        Ok(self.read_bits(1)? != 0)
-    }
-}
-
-/// AAC-LC decoder state.
+/// Error returned by every AAC decode entry point.
 ///
-/// This implements the core AAC-LC decoding pipeline:
-/// 1. ADTS frame sync and header parsing
-/// 2. Spectral coefficient decoding (Huffman)
-/// 3. Inverse quantization and scale factor application
-/// 4. IMDCT (time-frequency reconstruction)
-/// 5. Output channel assembly
+/// AAC decoding is **not implemented** in `oximedia-audio`. Rather than
+/// fabricating PCM, all decode paths fail closed with this error.
+fn not_implemented() -> AudioError {
+    AudioError::UnsupportedFormat(
+        "AAC decoding is not implemented in oximedia-audio: no spectral (Huffman) \
+         decode, no filterbank, no SBR/PS. Real AAC decode is planned via an \
+         external platform extension (e.g. AudioToolbox on macOS). Use ADTS \
+         header parsing (`AdtsHeader::parse`) for stream inspection only."
+            .to_string(),
+    )
+}
+
+/// AAC-LC stream inspector — **decoding is not implemented**.
+///
+/// # Status
+///
+/// This type deliberately does **not** decode AAC. Earlier revisions returned
+/// an [`AudioFrame`] filled with values derived from raw bit-patterns of the
+/// payload (a fabricated signal that was not the encoded audio) and reported
+/// [`CodecId::Mp3`] as its codec. Both behaviours were dishonest and have been
+/// removed:
+///
+/// * [`AacDecoder::send_packet`] and [`AacDecoder::receive_frame`] return
+///   [`AudioError::UnsupportedFormat`]; they never produce PCM.
+/// * The [`AudioDecoder`] implementation reports [`CodecId::Aac`] — its real
+///   identity — rather than borrowing another codec's. Every decode entry
+///   point on that trait still fails closed.
+///
+/// What *is* real here is ADTS framing: [`AdtsHeader::parse`] parses the
+/// transport header (sample rate, channel configuration, frame length), and
+/// [`AacDecoder::send_packet`] updates [`AacDecoder::sample_rate`] /
+/// [`AacDecoder::channel_layout`] from the first valid header it sees before
+/// failing, so stream inspection still works.
+///
+/// Real AAC decode is expected to arrive through a separate FFI extension
+/// crate; see `docs/codec_status.md`.
 pub struct AacDecoder {
-    /// Input buffer.
-    buffer: Vec<u8>,
-    /// Pending decoded frames.
-    frames: std::collections::VecDeque<AudioFrame>,
-    /// Current sample rate (from ADTS headers).
+    /// Sample rate observed in the most recent valid ADTS header.
     sample_rate: Option<u32>,
-    /// Current channel count.
+    /// Channel count observed in the most recent valid ADTS header.
     channels: Option<u8>,
-    /// Channel states.
-    channel_states: Vec<AacChannel>,
-    /// AAC frame size (1024 for LC, 960 for LD).
-    frame_size: usize,
-    /// Decode error count for diagnostics.
+    /// Number of packets rejected because decoding is not implemented.
     decode_errors: u32,
 }
 
 impl AacDecoder {
-    /// Create a new AAC decoder.
+    /// Create a new AAC stream inspector.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            buffer: Vec::new(),
-            frames: std::collections::VecDeque::new(),
             sample_rate: None,
             channels: None,
-            channel_states: Vec::new(),
-            frame_size: 1024,
             decode_errors: 0,
         }
     }
 
-    /// Get the number of decode errors encountered.
+    /// Honest codec identity of this module: `"aac"`.
+    ///
+    /// Equivalent to [`CodecId::Aac.name()`](oximedia_core::CodecId::name);
+    /// kept as an inherent associated function so callers can ask without
+    /// constructing a decoder or importing the trait.
+    #[must_use]
+    pub fn codec_name() -> &'static str {
+        CodecId::Aac.name()
+    }
+
+    /// Number of packets rejected because AAC decoding is not implemented.
     #[must_use]
     pub fn decode_errors(&self) -> u32 {
         self.decode_errors
     }
 
-    /// Try to find the next ADTS sync word in the buffer.
-    fn find_adts_sync(&self) -> Option<usize> {
-        if self.buffer.len() < 2 {
-            return None;
-        }
-        for i in 0..self.buffer.len() - 1 {
-            if self.buffer[i] == 0xFF && (self.buffer[i + 1] & 0xF0) == 0xF0 {
-                return Some(i);
-            }
-        }
+    /// Accept a compressed AAC packet — always fails.
+    ///
+    /// Any ADTS headers found in `data` are parsed first so that
+    /// [`Self::sample_rate`] and [`Self::channel_layout`] can report the
+    /// stream's parameters, then the call fails with
+    /// [`AudioError::UnsupportedFormat`].
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`AudioError::UnsupportedFormat`]: AAC decoding is not
+    /// implemented.
+    pub fn send_packet(&mut self, data: &[u8], _pts: i64) -> AudioResult<()> {
+        self.scan_adts_metadata(data);
+        self.decode_errors = self.decode_errors.saturating_add(1);
+        Err(not_implemented())
+    }
+
+    /// Retrieve a decoded frame — always fails.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`AudioError::UnsupportedFormat`]: there is no decoder
+    /// behind this type, so a frame can never become available.
+    pub fn receive_frame(&mut self) -> AudioResult<Option<AudioFrame>> {
+        Err(not_implemented())
+    }
+
+    /// Drop any inspection state.
+    ///
+    /// # Errors
+    ///
+    /// Never fails; the signature mirrors the decoder convention.
+    pub fn flush(&mut self) -> AudioResult<()> {
+        Ok(())
+    }
+
+    /// Reset the inspector to its initial state.
+    pub fn reset(&mut self) {
+        self.sample_rate = None;
+        self.channels = None;
+        self.decode_errors = 0;
+    }
+
+    /// Output sample format — always `None`, because nothing is ever decoded.
+    #[must_use]
+    pub fn output_format(&self) -> Option<SampleFormat> {
         None
     }
 
-    /// Attempt to decode one ADTS frame from the buffer.
-    fn decode_adts_frame(&mut self) -> AudioResult<Option<AudioFrame>> {
-        let sync_pos = match self.find_adts_sync() {
-            Some(p) => p,
-            None => {
-                // Keep up to 1 byte (partial sync word)
-                if self.buffer.len() > 1 {
-                    let keep = if self.buffer.last() == Some(&0xFF) {
-                        1
-                    } else {
-                        0
-                    };
-                    self.buffer.drain(..self.buffer.len() - keep);
-                }
-                return Ok(None);
-            }
-        };
-
-        // Skip bytes before sync word
-        if sync_pos > 0 {
-            self.buffer.drain(..sync_pos);
-        }
-
-        if self.buffer.len() < 7 {
-            return Ok(None);
-        }
-
-        let header = match AdtsHeader::parse(&self.buffer) {
-            Ok(h) => h,
-            Err(_) => {
-                // Bad frame: advance past current sync word
-                self.buffer.drain(..1);
-                self.decode_errors = self.decode_errors.saturating_add(1);
-                return Ok(None);
-            }
-        };
-
-        let total_frame_len = header.frame_length as usize;
-        if total_frame_len < header.header_size() || total_frame_len > 8192 {
-            self.buffer.drain(..1);
-            return Ok(None);
-        }
-
-        if self.buffer.len() < total_frame_len {
-            return Ok(None); // need more data
-        }
-
-        let sample_rate = header.sample_rate();
-        let channels = header.channels();
-
-        // Update cached state
-        self.sample_rate = Some(sample_rate);
-        self.channels = Some(channels);
-
-        // Ensure channel states are allocated
-        if self.channel_states.len() != channels as usize {
-            self.channel_states = (0..channels as usize)
-                .map(|_| AacChannel::new(self.frame_size))
-                .collect();
-        }
-
-        // Extract payload (after header, skip optional CRC)
-        // Copy to owned Vec to avoid borrow conflict with self.buffer
-        let payload_start = header.header_size();
-        let payload: Vec<u8> = self.buffer[payload_start..total_frame_len].to_vec();
-
-        // Decode the AAC raw data block
-        let pcm = self.decode_raw_data_block(&payload, channels)?;
-
-        // Consume the frame
-        self.buffer.drain(..total_frame_len);
-
-        // Build AudioFrame
-        let channel_layout = Self::channel_config_to_layout(channels);
-        let mut frame = AudioFrame::new(SampleFormat::F32, sample_rate, channel_layout);
-
-        // Convert planar f32 to interleaved bytes
-        let n_samples = pcm.len() / channels as usize;
-        let mut interleaved = Vec::with_capacity(pcm.len() * 4);
-        for sample_idx in 0..n_samples {
-            for ch in 0..channels as usize {
-                let sample_pos = ch * n_samples + sample_idx;
-                let s = pcm.get(sample_pos).copied().unwrap_or(0.0);
-                interleaved.extend_from_slice(&s.to_le_bytes());
-            }
-        }
-
-        use crate::frame::AudioBuffer;
-        frame.samples = AudioBuffer::Interleaved(Bytes::from(interleaved));
-
-        Ok(Some(frame))
+    /// Sample rate from the most recently parsed ADTS header, if any.
+    #[must_use]
+    pub fn sample_rate(&self) -> Option<u32> {
+        self.sample_rate
     }
 
-    /// Decode an AAC raw data block (simplified LC decoder).
-    ///
-    /// This implements a simplified AAC-LC decode path:
-    /// - Global gain parsing
-    /// - Section data / scale factor parsing (simplified)
-    /// - Inverse quantization
-    /// - IMDCT
-    fn decode_raw_data_block(&mut self, payload: &[u8], channels: u8) -> AudioResult<Vec<f32>> {
-        let frame_size = self.frame_size;
-        let mut all_samples = vec![0.0f32; frame_size * channels as usize];
-
-        if payload.is_empty() {
-            return Ok(all_samples);
-        }
-
-        let mut reader = BitReader::new(payload);
-
-        for ch in 0..channels as usize {
-            // Read individual channel stream (ICS)
-            // Global gain (8 bits)
-            let global_gain = match reader.read_bits(8) {
-                Ok(g) => g as i32 - 100, // offset by 100
-                Err(_) => break,
-            };
-
-            // ICS info
-            let _ics_reserved = reader.read_bool().unwrap_or(false);
-            let _window_shape = reader.read_bits(2).unwrap_or(0);
-            let max_sfb = reader.read_bits(6).unwrap_or(0) as usize;
-
-            // Simplified: use basic scale factors (all 0)
-            let scale_factors = vec![global_gain; max_sfb.max(1)];
-
-            // Read simplified spectral coefficients (zeroed for non-quantized data)
-            let mut coeffs = vec![0.0f32; frame_size];
-
-            // Simplified coefficient decode: read raw quantized values
-            // In a full decoder, Huffman codebooks would be used here
-            let usable_bits = reader.bits_remaining().min(frame_size * 2);
-            let quant_samples = usable_bits / 4; // 4 bits per quantized value (simplified)
-            for i in 0..quant_samples.min(frame_size) {
-                if let Ok(q) = reader.read_bits(4) {
-                    // Map 4-bit unsigned to signed
-                    let signed = if q >= 8 { q as i32 - 16 } else { q as i32 };
-                    coeffs[i] = signed as f32;
-                }
-            }
-
-            if ch < self.channel_states.len() {
-                self.channel_states[ch].coeffs = coeffs;
-                self.channel_states[ch].global_gain = global_gain;
-                self.channel_states[ch].scale_factors = scale_factors;
-                self.channel_states[ch].dequantize();
-                self.channel_states[ch].imdct();
-
-                let decoded = &self.channel_states[ch].coeffs;
-                let out_slice = &mut all_samples[ch * frame_size..(ch + 1) * frame_size];
-                let copy_len = decoded.len().min(out_slice.len());
-                out_slice[..copy_len].copy_from_slice(&decoded[..copy_len]);
-            }
-        }
-
-        Ok(all_samples)
+    /// Channel layout from the most recently parsed ADTS header, if any.
+    #[must_use]
+    pub fn channel_layout(&self) -> Option<ChannelLayout> {
+        self.channels.map(Self::channel_config_to_layout)
     }
 
-    /// Map AAC channel configuration to ChannelLayout.
+    /// Scan `data` for the first parsable ADTS header and record its stream
+    /// parameters. Purely informational; no audio is produced.
+    fn scan_adts_metadata(&mut self, data: &[u8]) {
+        if data.len() < 7 {
+            return;
+        }
+        for i in 0..=(data.len() - 7) {
+            if data[i] == 0xFF && (data[i + 1] & 0xF0) == 0xF0 {
+                if let Ok(header) = AdtsHeader::parse(&data[i..]) {
+                    self.sample_rate = Some(header.sample_rate());
+                    self.channels = Some(header.channels());
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Map an AAC channel configuration to a [`ChannelLayout`].
     fn channel_config_to_layout(channels: u8) -> ChannelLayout {
         match channels {
             1 => ChannelLayout::Mono,
@@ -559,54 +344,51 @@ impl Default for AacDecoder {
     }
 }
 
+/// [`AudioDecoder`] implementation that fails closed.
+///
+/// Every method delegates to the inherent implementation above, so the trait
+/// object behaves exactly like the concrete type: it reports
+/// [`CodecId::Aac`], surfaces ADTS stream parameters, and refuses to produce
+/// a single PCM sample.
 impl AudioDecoder for AacDecoder {
+    /// The honest codec identity: [`CodecId::Aac`].
+    ///
+    /// Reporting `Aac` here is what makes the failure legible — a caller that
+    /// receives [`AudioError::UnsupportedFormat`] knows *which* codec is
+    /// missing instead of being told a different codec failed.
     fn codec(&self) -> CodecId {
-        CodecId::Mp3 // AAC is patent-encumbered; using Mp3 as fallback codec ID
+        CodecId::Aac
     }
 
-    fn send_packet(&mut self, data: &[u8], _pts: i64) -> AudioResult<()> {
-        self.buffer.extend_from_slice(data);
-
-        // Try to decode all available frames
-        while !self.buffer.is_empty() {
-            match self.decode_adts_frame()? {
-                Some(frame) => self.frames.push_back(frame),
-                None => break,
-            }
-        }
-
-        Ok(())
+    /// Always fails; see [`AacDecoder::send_packet`].
+    fn send_packet(&mut self, data: &[u8], pts: i64) -> AudioResult<()> {
+        Self::send_packet(self, data, pts)
     }
 
+    /// Always fails; see [`AacDecoder::receive_frame`].
     fn receive_frame(&mut self) -> AudioResult<Option<AudioFrame>> {
-        Ok(self.frames.pop_front())
+        Self::receive_frame(self)
     }
 
     fn flush(&mut self) -> AudioResult<()> {
-        self.buffer.clear();
-        self.frames.clear();
-        Ok(())
+        Self::flush(self)
     }
 
     fn reset(&mut self) {
-        self.buffer.clear();
-        self.frames.clear();
-        self.sample_rate = None;
-        self.channels = None;
-        self.channel_states.clear();
-        self.decode_errors = 0;
+        Self::reset(self);
     }
 
+    /// Always `None`: nothing is ever decoded, so there is no output format.
     fn output_format(&self) -> Option<SampleFormat> {
-        Some(SampleFormat::F32)
+        Self::output_format(self)
     }
 
     fn sample_rate(&self) -> Option<u32> {
-        self.sample_rate
+        Self::sample_rate(self)
     }
 
     fn channel_layout(&self) -> Option<ChannelLayout> {
-        self.channels.map(Self::channel_config_to_layout)
+        Self::channel_layout(self)
     }
 }
 
@@ -653,55 +435,152 @@ mod tests {
         }
     }
 
+    /// Build a syntactically valid 7-byte ADTS header (MPEG-4, no CRC,
+    /// AAC-LC, 48 kHz, stereo) declaring `frame_length` bytes.
+    fn adts_header(frame_length: u16) -> [u8; 7] {
+        let mut data = [0u8; 7];
+        data[0] = 0xFF;
+        data[1] = 0xF1; // MPEG-4, layer 0, no CRC
+                        // profile(2)=1 (LC) | sfi(4)=3 (48000) | private(1)=0 | ch_cfg high bit
+        data[2] = (1 << 6) | (3 << 2);
+        data[3] = (2 << 6) | ((frame_length >> 11) & 0x03) as u8;
+        data[4] = ((frame_length >> 3) & 0xFF) as u8;
+        data[5] = (((frame_length & 0x07) << 5) | 0x1F) as u8;
+        data[6] = 0xFC;
+        data
+    }
+
     #[test]
-    fn test_aac_decoder_new() {
+    fn test_aac_decoder_new_reports_aac_codec_id() {
         let dec = AacDecoder::new();
-        assert_eq!(dec.codec(), CodecId::Mp3);
+        // The honest identity — never `CodecId::Mp3`, as an earlier revision
+        // reported.
+        assert_eq!(AacDecoder::codec_name(), "aac");
+        assert_eq!(AudioDecoder::codec(&dec), CodecId::Aac);
+        assert_ne!(AudioDecoder::codec(&dec), CodecId::Mp3);
         assert!(dec.sample_rate().is_none());
         assert!(dec.channel_layout().is_none());
+        assert!(dec.output_format().is_none());
+        assert_eq!(dec.decode_errors(), 0);
     }
 
+    /// Driving the decoder purely through the [`AudioDecoder`] trait object
+    /// must be just as honest as the inherent API: `CodecId::Aac`, no PCM,
+    /// `UnsupportedFormat` on every decode entry point.
     #[test]
-    fn test_aac_decoder_empty_packet() {
+    fn test_aac_decoder_as_trait_object_fails_closed() {
+        let mut dec: Box<dyn AudioDecoder> = Box::new(AacDecoder::new());
+        assert_eq!(dec.codec(), CodecId::Aac);
+
+        let mut packet = adts_header(64).to_vec();
+        packet.resize(64, 0);
+
+        let err = dec
+            .send_packet(&packet, 0)
+            .expect_err("AAC decode must not succeed through the trait either");
+        assert!(
+            matches!(err, AudioError::UnsupportedFormat(_)),
+            "expected UnsupportedFormat, got {err:?}"
+        );
+
+        // Stream inspection still works through the trait.
+        assert_eq!(dec.sample_rate(), Some(48_000));
+        assert_eq!(dec.channel_layout(), Some(ChannelLayout::Stereo));
+        assert!(dec.output_format().is_none());
+
+        assert!(
+            dec.receive_frame().is_err(),
+            "no fabricated frame may be handed out"
+        );
+        dec.flush().expect("flush must succeed");
+
+        dec.reset();
+        assert!(
+            dec.sample_rate().is_none(),
+            "reset must clear inspection state"
+        );
+    }
+
+    /// `AacDecoder` must satisfy the `Send` supertrait of [`AudioDecoder`].
+    #[test]
+    fn test_aac_decoder_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<AacDecoder>();
+    }
+
+    /// Decoding must fail closed, even for an empty packet — the decoder can
+    /// never produce PCM.
+    #[test]
+    fn test_aac_decoder_empty_packet_errors() {
         let mut dec = AacDecoder::new();
-        dec.send_packet(&[], 0).expect("empty packet should be ok");
-        assert!(dec.receive_frame().expect("no error").is_none());
+        let err = dec
+            .send_packet(&[], 0)
+            .expect_err("AAC decode must not succeed");
+        assert!(
+            matches!(err, AudioError::UnsupportedFormat(_)),
+            "expected UnsupportedFormat, got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("not implemented"),
+            "error must say decoding is not implemented: {err}"
+        );
+        assert!(
+            dec.receive_frame().is_err(),
+            "no frame may ever be produced"
+        );
     }
 
+    /// Garbage must not be turned into audio either.
     #[test]
-    fn test_aac_decoder_garbage_data() {
+    fn test_aac_decoder_garbage_data_errors() {
         let mut dec = AacDecoder::new();
         let garbage = vec![0x55u8; 100];
-        dec.send_packet(&garbage, 0)
-            .expect("should not error on garbage");
-        // No valid frames should be produced
-        assert!(dec.receive_frame().expect("no error").is_none());
+        assert!(
+            dec.send_packet(&garbage, 0).is_err(),
+            "garbage must not decode"
+        );
+        assert!(dec.receive_frame().is_err());
+        assert_eq!(dec.decode_errors(), 1);
+    }
+
+    /// A well-formed ADTS packet is still rejected, but its stream parameters
+    /// are surfaced for inspection.
+    #[test]
+    fn test_aac_decoder_valid_adts_errors_but_reports_parameters() {
+        let mut dec = AacDecoder::new();
+        let mut packet = adts_header(64).to_vec();
+        packet.resize(64, 0);
+
+        assert!(
+            dec.send_packet(&packet, 0).is_err(),
+            "valid ADTS must still fail: decoding is not implemented"
+        );
+        assert_eq!(dec.sample_rate(), Some(48_000));
+        assert_eq!(dec.channel_layout(), Some(ChannelLayout::Stereo));
+        assert!(
+            dec.receive_frame().is_err(),
+            "no fabricated frame may be handed out"
+        );
     }
 
     #[test]
     fn test_aac_decoder_reset() {
         let mut dec = AacDecoder::new();
-        dec.send_packet(&[0xFF, 0xF1], 0).ok();
+        let mut packet = adts_header(64).to_vec();
+        packet.resize(64, 0);
+        let _ = dec.send_packet(&packet, 0);
+        assert_eq!(dec.decode_errors(), 1);
+
         dec.reset();
         assert_eq!(dec.decode_errors(), 0);
         assert!(dec.sample_rate().is_none());
+        assert!(dec.channel_layout().is_none());
     }
 
     #[test]
-    fn test_bit_reader_basic() {
-        let data = [0b10110010u8, 0b01001100u8];
-        let mut r = BitReader::new(&data);
-        assert_eq!(r.read_bits(4).unwrap(), 0b1011);
-        assert_eq!(r.read_bits(4).unwrap(), 0b0010);
-        assert_eq!(r.read_bits(8).unwrap(), 0b01001100);
-    }
-
-    #[test]
-    fn test_bit_reader_overflow() {
-        let data = [0xFFu8];
-        let mut r = BitReader::new(&data);
-        r.read_bits(8).unwrap();
-        assert!(r.read_bits(1).is_err());
+    fn test_aac_decoder_flush_is_ok() {
+        let mut dec = AacDecoder::new();
+        dec.flush().expect("flush must succeed");
     }
 
     #[test]

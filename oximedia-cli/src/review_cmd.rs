@@ -360,7 +360,7 @@ async fn run_create(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Review Session Created".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Session ID:", session_id);
@@ -429,7 +429,7 @@ async fn run_annotate(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Annotation Added".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Annotation ID:", ann_id);
@@ -499,7 +499,7 @@ async fn run_approve(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Content Approved".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Session ID:", session_id);
@@ -551,7 +551,7 @@ async fn run_reject(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Content Rejected".red().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Session ID:", session_id);
@@ -650,7 +650,7 @@ async fn run_export(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Review Exported".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Session ID:", session_id);

@@ -1,6 +1,6 @@
 # oximedia-packager
 
-**Status: [Stable]** | Version: 0.2.0 | Tests: extensively tested | Updated: 2026-07-14
+**Status: [Stable]** | Version: 0.2.1 | Tests: extensively tested | Updated: 2026-08-12
 
 Adaptive streaming packaging (HLS/DASH) for OxiMedia. Provides comprehensive support for packaging media content into HLS and DASH adaptive streaming formats with encryption, cloud upload, and live/VOD support.
 
@@ -33,10 +33,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-packager = "0.1.9"
+oximedia-packager = "0.2.0"
 
 # Optional features
-# oximedia-packager = { version = "0.1.9", features = ["encryption", "s3"] }
+# oximedia-packager = { version = "0.2.0", features = ["encryption", "s3"] }
 ```
 
 ```rust

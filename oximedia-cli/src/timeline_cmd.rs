@@ -410,7 +410,7 @@ async fn handle_create(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Timeline Created".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Name:", project_name);
@@ -527,7 +527,7 @@ async fn handle_add_clip(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Clip Added".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Clip ID:", clip_id);
@@ -584,7 +584,7 @@ async fn handle_remove_clip(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Clip Removed".green().bold());
         println!("{:20} {}", "Clip ID:", clip_id);
     }
@@ -651,7 +651,7 @@ async fn handle_render(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Timeline Render".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Timeline:", timeline_path.display());
@@ -803,7 +803,7 @@ async fn handle_export(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Timeline Exported".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Timeline:", timeline_path.display());
@@ -888,7 +888,7 @@ async fn handle_import(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Timeline Imported".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Input:", input.display());

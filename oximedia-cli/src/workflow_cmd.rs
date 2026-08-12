@@ -44,7 +44,11 @@ pub enum WorkflowCommand {
         #[arg(long)]
         config: PathBuf,
 
-        /// Database path for persistence (not implemented yet: warns and proceeds)
+        /// SQLite database path for persistence (real: `oximedia_workflow`'s
+        /// `PersistenceManager`). Defaults to a per-user state directory
+        /// (`$XDG_STATE_HOME/oximedia/workflow.db` or platform equivalent)
+        /// when omitted, so `submit` followed by `status`/`list` without
+        /// `--db` still see the same database.
         #[arg(long)]
         db: Option<PathBuf>,
 
@@ -52,18 +56,18 @@ pub enum WorkflowCommand {
         #[arg(long, default_value = "4")]
         parallelism: usize,
 
-        /// Dry-run: validate only, do not execute
+        /// Dry-run: validate only, do not execute (also skips persistence)
         #[arg(long)]
         dry_run: bool,
     },
 
     /// Check workflow execution status
     Status {
-        /// Workflow ID to query
+        /// Workflow ID to query (a UUID, as printed by `submit`/`run`)
         #[arg(long)]
         id: String,
 
-        /// Database path
+        /// SQLite database path; see `submit --db` for the default.
         #[arg(long)]
         db: Option<PathBuf>,
 
@@ -78,37 +82,41 @@ pub enum WorkflowCommand {
         #[arg(long)]
         state: Option<String>,
 
-        /// Database path
+        /// SQLite database path; see `submit --db` for the default.
         #[arg(long)]
         db: Option<PathBuf>,
     },
 
     /// Cancel a running workflow
     Cancel {
-        /// Workflow ID to cancel
+        /// Workflow ID to cancel (a UUID, as printed by `submit`/`run`)
         #[arg(long)]
         id: String,
 
-        /// Database path
+        /// SQLite database path; see `submit --db` for the default.
         #[arg(long)]
         db: Option<PathBuf>,
 
-        /// Force cancellation without waiting for in-progress tasks
+        /// Force cancellation without waiting for in-progress tasks. No
+        /// executor runs tasks yet, so there is never an in-progress task to
+        /// wait for; recorded for forward compatibility only.
         #[arg(long)]
         force: bool,
     },
 
     /// Show workflow execution logs
     Logs {
-        /// Workflow ID to show logs for
+        /// Workflow ID to show logs for (a UUID, as printed by `submit`/`run`)
         #[arg(long)]
         id: String,
 
-        /// Show last N log entries (0 = all)
+        /// Show at most the last N per-task status lines (0 = all). There is
+        /// no execution-history event log yet (see the module-level note on
+        /// `handle_logs`); this lists each task's current persisted state.
         #[arg(long, default_value = "50")]
         tail: usize,
 
-        /// Database path
+        /// SQLite database path; see `submit --db` for the default.
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -122,7 +130,7 @@ pub enum WorkflowCommand {
         #[arg(short, long)]
         workflow: PathBuf,
 
-        /// Database path for persistence (not implemented yet: warns and proceeds)
+        /// SQLite database path; see `submit --db` for the default.
         #[arg(long)]
         db_path: Option<PathBuf>,
 
@@ -571,23 +579,214 @@ async fn handle_create(
 }
 
 // ---------------------------------------------------------------------------
-// Handler: Submit
+// Real SQLite-backed persistence (oximedia_workflow::PersistenceManager)
 // ---------------------------------------------------------------------------
+//
+// `--db` used to have no persistence layer wired behind it; every command
+// warned and returned static, always-empty data. This now opens a real
+// `oximedia_workflow::PersistenceManager` (Pure-Rust SQLite via OxiSQL — the
+// crate is already linked with the `sqlite` feature), following the same
+// real-persistence pattern `oximedia-review`'s `ReviewStore` established
+// (see `crates/oximedia-review/src/store/mod.rs`): open-or-create on every
+// call, `CREATE TABLE IF NOT EXISTS` migration, no separate migration
+// runner.
+//
+// Scope note: this closes the *persistence* gap. There is still no DAG
+// executor in `oximedia-cli` — `submit`/`run` persist a `Created`-state
+// workflow and its tasks, but nothing transitions tasks to `Running` on its
+// own. `status`/`list`/`logs` report exactly the state that was last
+// persisted, never a fabricated "running"/"progressing" value.
 
-/// `--db` has no persistence layer wired behind it yet; warn instead of
-/// silently accepting a path the command will never touch.
-// TODO(0.2.x): back the workflow state commands with the SQLite persistence
-// available in oximedia-workflow (the crate is already linked with the
-// `sqlite` feature) instead of the current in-process-only execution.
-fn warn_db_unwired(db: Option<&std::path::Path>) {
-    if let Some(path) = db {
-        eprintln!(
-            "warning: --db is not implemented yet and is ignored; workflow state is not \
-             persisted to {}",
-            path.display()
+/// Default per-user database path when `--db`/`--db-path` is omitted:
+/// `$XDG_STATE_HOME/oximedia/workflow.db` (or the platform equivalent via
+/// the `dirs` crate, falling back to the system temp dir). Mirrors the
+/// resolution order already used by `tui_cmd`/`virtual_cmd` for their own
+/// state files, so `submit` without `--db` and a later `status` without
+/// `--db` land on the same database.
+fn default_db_path() -> PathBuf {
+    let base = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("oximedia").join("workflow.db")
+}
+
+/// Resolve `--db`/`--db-path` to a concrete path, creating its parent
+/// directory if needed.
+///
+/// Does **not** open the database — see [`with_store`] for why that must
+/// happen inside `spawn_blocking`.
+fn resolve_db_path(db: Option<&std::path::Path>) -> Result<PathBuf> {
+    let path = db.map_or_else(default_db_path, std::path::Path::to_path_buf);
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create database directory: {}", parent.display())
+            })?;
+        }
+    }
+
+    Ok(path)
+}
+
+/// Open a `PersistenceManager` at `db_path` and run `f` against it on
+/// Tokio's blocking thread pool.
+///
+/// `oximedia_workflow::PersistenceManager` is backed by
+/// `oxisql_sqlite_compat::blocking::SqliteConnectionBlocking`, whose
+/// `execute`/`query` methods build and drive a *fresh* Tokio runtime on the
+/// calling thread with no reentrancy guard (`open` itself is reentrancy-safe
+/// via a different internal helper, but every query is not). Calling any
+/// `PersistenceManager` method directly from this CLI's async command
+/// handlers — which always run inside the `#[tokio::main]` runtime — panics
+/// with "Cannot start a runtime from within a runtime". `spawn_blocking`
+/// moves the call onto a dedicated non-async-worker thread, where driving a
+/// fresh nested runtime is safe. Every `PersistenceManager` access in this
+/// module goes through here; do not call its methods directly elsewhere.
+async fn with_store<T, F>(db_path: PathBuf, f: F) -> Result<T>
+where
+    F: FnOnce(
+            &oximedia_workflow::PersistenceManager,
+        ) -> std::result::Result<T, oximedia_workflow::WorkflowError>
+        + Send
+        + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let store = oximedia_workflow::PersistenceManager::new(&db_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to open workflow database at {}: {e}",
+                db_path.display()
+            )
+        })?;
+        f(&store).map_err(|e| anyhow::anyhow!("{e}"))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("workflow database task panicked: {e}"))?
+}
+
+/// Parse a `--id`/`--workflow-id` string as a UUID.
+///
+/// Workflow IDs are real `oximedia_workflow::WorkflowId`s (UUIDs) now that
+/// `submit`/`run` persist through `PersistenceManager`; the earlier
+/// `wf-<name>-<unix-timestamp>` cosmetic ID is gone.
+fn parse_workflow_id(id: &str) -> Result<oximedia_workflow::WorkflowId> {
+    uuid::Uuid::parse_str(id)
+        .map(oximedia_workflow::WorkflowId::from)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid workflow ID '{id}': {e} (workflow IDs are UUIDs, as printed by \
+                 `workflow submit`/`workflow run`)"
+            )
+        })
+}
+
+/// Build a real `oximedia_workflow::Workflow` (with `Task`s and dependency
+/// `Edge`s) from this CLI's own JSON [`WorkflowDef`].
+///
+/// `oximedia_workflow::TaskType` is a fixed, strongly-typed schema
+/// (`Transcode`/`QualityControl`/`Transfer`/`Notification`/`CustomScript`/
+/// `Analysis`/`Conditional`/`Wait`/`HttpRequest`) with no generic "custom
+/// task kind + free-form params" variant, while this CLI's workflow
+/// definitions use exactly that shape (`task_type: String`,
+/// `params: serde_json::Value`) so `create --tasks`/templates can name any
+/// step kind. Every task is therefore persisted as `TaskType::CustomScript`
+/// — chosen only because it is the least semantically-loaded variant that
+/// still round-trips without inventing input/output paths the CLI has no
+/// real value for — with the original `task_type`/`description`/`params`
+/// preserved verbatim in `Task::metadata` so nothing is silently dropped.
+/// `status`/`list`/`logs` read `metadata["task_type"]`, never the
+/// `CustomScript` tag, when describing a task to the user.
+///
+/// # Errors
+///
+/// Returns an error if a step's `depends_on` names a step ID that was not
+/// itself defined (already checked by callers, but re-validated here since
+/// this is the function that actually builds the `Edge`s).
+fn build_workflow(def: &WorkflowDef) -> Result<oximedia_workflow::Workflow> {
+    use oximedia_workflow::{Task, TaskId, TaskType, Workflow};
+    use std::collections::HashMap as StdHashMap;
+
+    let mut workflow = Workflow::new(def.name.clone());
+    if let Some(ref src) = def.source {
+        workflow.metadata.insert("source".to_string(), src.clone());
+    }
+    if let Some(ref dst) = def.destination {
+        workflow
+            .metadata
+            .insert("destination".to_string(), dst.clone());
+    }
+
+    let mut id_map: StdHashMap<String, TaskId> = StdHashMap::new();
+
+    for step in &def.steps {
+        let params_json = serde_json::to_string(&step.params).unwrap_or_else(|_| "null".into());
+
+        let mut task = Task::new(
+            step.id.clone(),
+            TaskType::CustomScript {
+                script: std::path::PathBuf::from(format!("task:{}", step.task_type)),
+                args: Vec::new(),
+                env: StdHashMap::new(),
+            },
         );
+        task.metadata.insert("step_id".to_string(), step.id.clone());
+        task.metadata
+            .insert("task_type".to_string(), step.task_type.clone());
+        task.metadata
+            .insert("description".to_string(), step.description.clone());
+        task.metadata.insert("params_json".to_string(), params_json);
+
+        id_map.insert(step.id.clone(), task.id);
+        workflow.add_task(task);
+    }
+
+    for step in &def.steps {
+        let Some(&to_id) = id_map.get(&step.id) else {
+            return Err(anyhow::anyhow!(
+                "internal: step '{}' was not registered before edge-building",
+                step.id
+            ));
+        };
+        for dep in &step.depends_on {
+            let from_id = *id_map.get(dep).ok_or_else(|| {
+                anyhow::anyhow!("Step '{}' depends on unknown step '{}'", step.id, dep)
+            })?;
+            workflow
+                .add_edge(from_id, to_id)
+                .map_err(|e| anyhow::anyhow!("Failed to link '{}' -> '{}': {e}", dep, step.id))?;
+        }
+    }
+
+    Ok(workflow)
+}
+
+/// Map a real `WorkflowState` onto this CLI's four-value `--state` filter
+/// vocabulary (`pending`/`running`/`done`/`failed`), which predates
+/// `oximedia_workflow`'s richer seven-state machine. `Created`/`Scheduled`
+/// bucket under `pending`; `Running`/`Paused` under `running` (a paused
+/// workflow is not finished); `Completed` is `done`; `Failed`/`Cancelled`
+/// bucket under `failed`. The *actual* state name (e.g. "Paused",
+/// "Cancelled") is always shown in full elsewhere in the same output — this
+/// mapping only drives `--state <filter>` matching.
+fn state_filter_bucket(state: oximedia_workflow::WorkflowState) -> &'static str {
+    use oximedia_workflow::WorkflowState;
+    match state {
+        WorkflowState::Created | WorkflowState::Scheduled => "pending",
+        WorkflowState::Running | WorkflowState::Paused => "running",
+        WorkflowState::Completed => "done",
+        WorkflowState::Failed | WorkflowState::Cancelled => "failed",
     }
 }
+
+/// Real state name for display (`Debug`-derived, e.g. "Created", "Running").
+fn state_display(state: oximedia_workflow::WorkflowState) -> String {
+    format!("{state:?}")
+}
+
+// ---------------------------------------------------------------------------
+// Handler: Submit
+// ---------------------------------------------------------------------------
 
 async fn handle_submit(
     config: &std::path::Path,
@@ -596,7 +795,6 @@ async fn handle_submit(
     dry_run: bool,
     json_output: bool,
 ) -> Result<()> {
-    warn_db_unwired(db);
     if !config.exists() {
         return Err(anyhow::anyhow!(
             "Config file not found: {}",
@@ -620,15 +818,22 @@ async fn handle_submit(
         }
     }
 
-    // Generate a deterministic-ish workflow ID from name + timestamp
-    let workflow_id = format!(
-        "wf-{}-{}",
-        def.name.to_lowercase().replace(' ', "-"),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    );
+    let workflow = build_workflow(&def)?;
+    let workflow_id = workflow.id.to_string();
+
+    // `dry_run` means "validate only" — the DAG and every step were already
+    // validated above (and by `build_workflow`'s edge construction); skip
+    // persistence so a dry run never creates a row `status`/`list` would
+    // then report as a real, submitted workflow.
+    let db_path = if dry_run {
+        None
+    } else {
+        let path = resolve_db_path(db)?;
+        with_store(path.clone(), move |store| store.save_workflow(&workflow))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to persist workflow {workflow_id}: {e}"))?;
+        Some(path)
+    };
 
     if json_output {
         let result = serde_json::json!({
@@ -639,6 +844,7 @@ async fn handle_submit(
             "steps": def.steps.len(),
             "parallelism": parallelism,
             "dry_run": dry_run,
+            "db": db_path.as_ref().map(|p| p.display().to_string()),
             "status": if dry_run { "validated" } else { "submitted" },
         });
         let json_str =
@@ -656,6 +862,9 @@ async fn handle_submit(
         println!("{:20} {}", "Config:", config.display());
         println!("{:20} {}", "Steps:", def.steps.len());
         println!("{:20} {}", "Parallelism:", parallelism);
+        if let Some(ref path) = db_path {
+            println!("{:20} {}", "Database:", path.display());
+        }
         if dry_run {
             println!("{:20} {}", "Mode:", "dry-run (validate only)".yellow());
         }
@@ -663,7 +872,8 @@ async fn handle_submit(
             println!();
             println!(
                 "{}",
-                "Use 'oximedia workflow status --id <id>' to check progress.".dimmed()
+                format!("Use 'oximedia workflow status --id {workflow_id}' to check progress.")
+                    .dimmed()
             );
         }
     }
@@ -681,15 +891,47 @@ async fn handle_status(
     detailed: bool,
     json_output: bool,
 ) -> Result<()> {
-    warn_db_unwired(db);
+    let id = parse_workflow_id(workflow_id)?;
+    let path = resolve_db_path(db)?;
+    let workflow = with_store(path, move |store| store.load_workflow(id))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load workflow {workflow_id}: {e}"))?;
+
+    let tasks_total = workflow.tasks.len();
+    let tasks_completed = workflow
+        .tasks
+        .values()
+        .filter(|t| t.state == oximedia_workflow::TaskState::Completed)
+        .count();
+    let progress = if tasks_total > 0 {
+        tasks_completed as f64 / tasks_total as f64
+    } else {
+        0.0
+    };
+    let state_name = state_display(workflow.state);
+
+    let mut tasks: Vec<&oximedia_workflow::Task> = workflow.tasks.values().collect();
+    tasks.sort_by(|a, b| a.name.cmp(&b.name));
+
     if json_output {
         let result = serde_json::json!({
             "workflow_id": workflow_id,
-            "state": "idle",
-            "progress": 0.0,
-            "tasks_completed": 0,
-            "tasks_total": 0,
+            "name": workflow.name,
+            "state": state_name,
+            "progress": progress,
+            "tasks_completed": tasks_completed,
+            "tasks_total": tasks_total,
             "detailed": detailed,
+            "tasks": if detailed {
+                tasks.iter().map(|t| serde_json::json!({
+                    "id": t.name,
+                    "state": format!("{:?}", t.state),
+                    "task_type": t.metadata.get("task_type"),
+                    "description": t.metadata.get("description"),
+                })).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            },
         });
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
@@ -698,14 +940,25 @@ async fn handle_status(
         println!("{}", "Workflow Status".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Workflow ID:", workflow_id);
-        println!("{:20} idle", "State:");
-        println!("{:20} 0%", "Progress:");
-        println!("{:20} 0 / 0", "Tasks:");
+        println!("{:20} {}", "Name:", workflow.name);
+        println!("{:20} {}", "State:", state_name);
+        println!("{:20} {:.0}%", "Progress:", progress * 100.0);
+        println!("{:20} {} / {}", "Tasks:", tasks_completed, tasks_total);
         if detailed {
             println!();
             println!("{}", "Task Details".cyan().bold());
             println!("{}", "-".repeat(40));
-            println!("{}", "(No tasks found for this workflow ID.)".dimmed());
+            if tasks.is_empty() {
+                println!("{}", "(No tasks found for this workflow ID.)".dimmed());
+            }
+            for task in &tasks {
+                let ty = task
+                    .metadata
+                    .get("task_type")
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
+                println!("  [{:?}] {} ({ty})", task.state, task.name);
+            }
         }
     }
 
@@ -721,7 +974,6 @@ async fn handle_list(
     db: Option<&std::path::Path>,
     json_output: bool,
 ) -> Result<()> {
-    warn_db_unwired(db);
     // Validate state filter if provided
     if let Some(s) = state_filter {
         match s {
@@ -735,11 +987,42 @@ async fn handle_list(
         }
     }
 
+    let path = resolve_db_path(db)?;
+    // `list_workflows` returns bare IDs; each needs its own load to report a
+    // real name/state/step-count. A workflow that fails to load (corrupt
+    // row) is skipped with a stderr warning rather than aborting the whole
+    // listing over one bad entry. Both steps run inside one `spawn_blocking`
+    // call since `PersistenceManager` cannot cross an `.await` safely (see
+    // `with_store`).
+    let mut workflows: Vec<oximedia_workflow::Workflow> = with_store(path, move |store| {
+        let ids = store.list_workflows()?;
+        let mut workflows = Vec::new();
+        for id in ids {
+            match store.load_workflow(id) {
+                Ok(wf) => workflows.push(wf),
+                Err(e) => eprintln!("warning: skipping workflow {id}: {e}"),
+            }
+        }
+        Ok(workflows)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to list workflows: {e}"))?;
+
+    if let Some(filter) = state_filter {
+        workflows.retain(|wf| state_filter_bucket(wf.state) == filter);
+    }
+    workflows.sort_by(|a, b| a.name.cmp(&b.name));
+
     if json_output {
         let result = serde_json::json!({
-            "workflows": [],
+            "workflows": workflows.iter().map(|wf| serde_json::json!({
+                "id": wf.id.to_string(),
+                "name": wf.name,
+                "state": state_display(wf.state),
+                "steps": wf.tasks.len(),
+            })).collect::<Vec<_>>(),
             "filter": state_filter,
-            "total": 0,
+            "total": workflows.len(),
         });
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
@@ -750,12 +1033,24 @@ async fn handle_list(
             println!("{}", format!("(filtered by state: {})", s).dimmed());
         }
         println!("{}", "=".repeat(60));
-        println!("{}", "No workflows found.".dimmed());
-        println!();
-        println!(
-            "{}",
-            "Submit a workflow with: oximedia workflow submit --config <file.json>".dimmed()
-        );
+        if workflows.is_empty() {
+            println!("{}", "No workflows found.".dimmed());
+            println!();
+            println!(
+                "{}",
+                "Submit a workflow with: oximedia workflow submit --config <file.json>".dimmed()
+            );
+        } else {
+            for wf in &workflows {
+                println!(
+                    "  {} [{}] {} ({} step(s))",
+                    wf.id.to_string().cyan(),
+                    state_display(wf.state),
+                    wf.name,
+                    wf.tasks.len()
+                );
+            }
+        }
     }
 
     Ok(())
@@ -771,12 +1066,28 @@ async fn handle_cancel(
     force: bool,
     json_output: bool,
 ) -> Result<()> {
-    warn_db_unwired(db);
+    use oximedia_workflow::WorkflowState;
+
+    let id = parse_workflow_id(workflow_id)?;
+    let path = resolve_db_path(db)?;
+    // Load, mutate, and save inside one `spawn_blocking` call — splitting it
+    // across two `with_store` calls would race against a concurrent cancel.
+    let was_terminal = with_store(path, move |store| {
+        let mut workflow = store.load_workflow(id)?;
+        let was_terminal = workflow.state.is_terminal();
+        workflow.state = WorkflowState::Cancelled;
+        store.save_workflow(&workflow)?;
+        Ok(was_terminal)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to cancel workflow {workflow_id}: {e}"))?;
+
     if json_output {
         let result = serde_json::json!({
             "action": "cancel",
             "workflow_id": workflow_id,
             "force": force,
+            "was_already_terminal": was_terminal,
             "status": "cancelled",
         });
         let json_str =
@@ -786,6 +1097,12 @@ async fn handle_cancel(
         println!("{}", "Workflow Cancelled".green().bold());
         println!("{:20} {}", "Workflow ID:", workflow_id);
         println!("{:20} {}", "Force:", force);
+        if was_terminal {
+            println!(
+                "{}",
+                "Note: this workflow had already reached a terminal state.".yellow()
+            );
+        }
     }
 
     Ok(())
@@ -795,21 +1112,46 @@ async fn handle_cancel(
 // Handler: Logs
 // ---------------------------------------------------------------------------
 
+/// `oximedia_workflow::persistence` already creates an `execution_history`
+/// table (state transitions with timestamps) and a `task_results` table
+/// (per-task output/error/duration) in its schema, but `PersistenceManager`
+/// exposes no public read (or write) method for either yet — only
+/// `save_workflow`/`load_workflow`/`list_workflows`/`delete_workflow`. That
+/// is a real gap in `oximedia-workflow` itself (out of this CLI's edit
+/// scope), so `logs` cannot show a real chronological event log. What *is*
+/// real and persisted is each task's current state, which this reports as
+/// one line per task — an honest, if coarser, substitute for a log tail,
+/// not a fabricated event stream.
 async fn handle_logs(
     workflow_id: &str,
     tail: usize,
     db: Option<&std::path::Path>,
     json_output: bool,
 ) -> Result<()> {
-    warn_db_unwired(db);
-    // In a full implementation this would query the persistence layer.
-    // Here we return a well-structured empty response.
+    let id = parse_workflow_id(workflow_id)?;
+    let path = resolve_db_path(db)?;
+    let workflow = with_store(path, move |store| store.load_workflow(id))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load workflow {workflow_id}: {e}"))?;
+
+    let mut tasks: Vec<&oximedia_workflow::Task> = workflow.tasks.values().collect();
+    tasks.sort_by(|a, b| a.name.cmp(&b.name));
+    if tail > 0 && tasks.len() > tail {
+        tasks = tasks.split_off(tasks.len() - tail);
+    }
+
     if json_output {
         let result = serde_json::json!({
             "workflow_id": workflow_id,
             "tail": tail,
-            "entries": [],
-            "total": 0,
+            "note": "per-task current state, not a chronological event log \
+                     (oximedia_workflow::PersistenceManager exposes no execution-history read API yet)",
+            "entries": tasks.iter().map(|t| serde_json::json!({
+                "task": t.name,
+                "state": format!("{:?}", t.state),
+                "task_type": t.metadata.get("task_type"),
+            })).collect::<Vec<_>>(),
+            "total": tasks.len(),
         });
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
@@ -823,7 +1165,22 @@ async fn handle_logs(
             println!("{:20} all entries", "Showing:");
         }
         println!("{}", "=".repeat(60));
-        println!("{}", "No log entries found for this workflow.".dimmed());
+        if tasks.is_empty() {
+            println!("{}", "No tasks found for this workflow.".dimmed());
+        } else {
+            println!(
+                "{}",
+                "(per-task current state — no execution-history event log yet)".dimmed()
+            );
+            for task in &tasks {
+                let ty = task
+                    .metadata
+                    .get("task_type")
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
+                println!("  [{:?}] {} ({ty})", task.state, task.name);
+            }
+        }
     }
 
     Ok(())
@@ -883,7 +1240,6 @@ async fn handle_run(
     parallelism: usize,
     json_output: bool,
 ) -> Result<()> {
-    warn_db_unwired(db_path);
     if !workflow_path.exists() {
         return Err(anyhow::anyhow!(
             "Workflow file not found: {}",
@@ -907,15 +1263,31 @@ async fn handle_run(
         }
     }
 
+    let workflow = build_workflow(&def)?;
+    let workflow_id = workflow.id.to_string();
+
+    // Same "dry run skips persistence" rule as `submit` (see there for why).
+    let resolved_db_path = if dry_run {
+        None
+    } else {
+        let path = resolve_db_path(db_path)?;
+        with_store(path.clone(), move |store| store.save_workflow(&workflow))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to persist workflow {workflow_id}: {e}"))?;
+        Some(path)
+    };
+
     if json_output {
         let result = serde_json::json!({
             "action": "run",
+            "workflow_id": workflow_id,
             "workflow": workflow_path.display().to_string(),
             "name": def.name,
             "steps": def.steps.len(),
             "parallelism": parallelism,
             "dry_run": dry_run,
-            "status": if dry_run { "validated" } else { "started" },
+            "db": resolved_db_path.as_ref().map(|p| p.display().to_string()),
+            "status": if dry_run { "validated" } else { "submitted" },
         });
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
@@ -924,19 +1296,25 @@ async fn handle_run(
         if dry_run {
             println!("{}", "Workflow Validated (dry run)".green().bold());
         } else {
-            println!("{}", "Workflow Started".green().bold());
+            println!("{}", "Workflow Submitted".green().bold());
         }
         println!("{}", "=".repeat(60));
+        println!("{:20} {}", "Workflow ID:", workflow_id.cyan());
         println!("{:20} {}", "Name:", def.name);
         println!("{:20} {}", "Steps:", def.steps.len());
         println!("{:20} {}", "Parallelism:", parallelism);
         println!("{:20} {}", "Dry run:", dry_run);
+        if let Some(ref path) = resolved_db_path {
+            println!("{:20} {}", "Database:", path.display());
+        }
 
         if !dry_run {
             println!();
             println!(
                 "{}",
-                "Note: Workflow executor requires runtime task scheduling.".yellow()
+                "Note: no executor runs tasks yet; this persists the workflow definition. \
+                 Use 'oximedia workflow status --id <id>' to inspect it."
+                    .yellow()
             );
         }
     }
@@ -1200,15 +1578,296 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_handle_cancel_json_output() {
-        let result = handle_cancel("wf-001", None, false, true).await;
-        assert!(result.is_ok());
+    // ── Real SQLite persistence ────────────────────────────────────────────
+
+    /// A unique-per-test scratch directory under `std::env::temp_dir()`.
+    /// Each test uses its own literal name (not shared) so parallel test
+    /// threads never contend over the same SQLite file.
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("oximedia_workflow_cmd_test_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn test_default_db_path_is_sane() {
+        let path = default_db_path();
+        assert!(
+            path.ends_with("workflow.db"),
+            "expected a workflow.db leaf, got: {}",
+            path.display()
+        );
+        assert!(
+            path.to_string_lossy().contains("oximedia"),
+            "expected an oximedia subdirectory, got: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn test_parse_workflow_id_rejects_non_uuid() {
+        let err = parse_workflow_id("wf-001").expect_err("legacy-format ID must be rejected");
+        assert!(
+            err.to_string().contains("UUID"),
+            "error should explain UUIDs are required: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_workflow_id_accepts_uuid() {
+        let id = oximedia_workflow::WorkflowId::new();
+        let parsed = parse_workflow_id(&id.to_string()).expect("real UUID should parse");
+        assert_eq!(parsed.to_string(), id.to_string());
+    }
+
+    #[test]
+    fn test_state_filter_bucket_mapping() {
+        use oximedia_workflow::WorkflowState;
+        assert_eq!(state_filter_bucket(WorkflowState::Created), "pending");
+        assert_eq!(state_filter_bucket(WorkflowState::Scheduled), "pending");
+        assert_eq!(state_filter_bucket(WorkflowState::Running), "running");
+        assert_eq!(state_filter_bucket(WorkflowState::Paused), "running");
+        assert_eq!(state_filter_bucket(WorkflowState::Completed), "done");
+        assert_eq!(state_filter_bucket(WorkflowState::Failed), "failed");
+        assert_eq!(state_filter_bucket(WorkflowState::Cancelled), "failed");
+    }
+
+    #[test]
+    fn test_build_workflow_creates_tasks_and_edges() {
+        let mut def = WorkflowDef::new("build-test");
+        def.steps.push(WorkflowStepDef {
+            id: "a".to_string(),
+            task_type: "qc".to_string(),
+            description: "first".to_string(),
+            depends_on: vec![],
+            params: serde_json::json!({"check": "format"}),
+        });
+        def.steps.push(WorkflowStepDef {
+            id: "b".to_string(),
+            task_type: "transcode".to_string(),
+            description: "second".to_string(),
+            depends_on: vec!["a".to_string()],
+            params: serde_json::json!({"codec": "av1"}),
+        });
+
+        let workflow = build_workflow(&def).expect("build_workflow should succeed");
+        assert_eq!(workflow.tasks.len(), 2);
+        assert_eq!(workflow.edges.len(), 1);
+
+        let task_a = workflow
+            .tasks
+            .values()
+            .find(|t| t.name == "a")
+            .expect("task 'a' must exist");
+        let task_b = workflow
+            .tasks
+            .values()
+            .find(|t| t.name == "b")
+            .expect("task 'b' must exist");
+        assert_eq!(
+            task_a.metadata.get("task_type").map(String::as_str),
+            Some("qc")
+        );
+        assert_eq!(
+            task_b.metadata.get("task_type").map(String::as_str),
+            Some("transcode")
+        );
+
+        let edge = &workflow.edges[0];
+        assert_eq!(edge.from, task_a.id, "edge must run a -> b");
+        assert_eq!(edge.to, task_b.id, "edge must run a -> b");
+    }
+
+    #[test]
+    fn test_build_workflow_unknown_dependency_errs() {
+        let mut def = WorkflowDef::new("bad-dep");
+        def.steps.push(WorkflowStepDef {
+            id: "only".to_string(),
+            task_type: "qc".to_string(),
+            description: String::new(),
+            depends_on: vec!["ghost".to_string()],
+            params: serde_json::Value::Null,
+        });
+
+        let err = build_workflow(&def).expect_err("unknown dependency must be rejected");
+        assert!(err.to_string().contains("ghost"));
     }
 
     #[tokio::test]
-    async fn test_handle_logs_json_output() {
-        let result = handle_logs("wf-001", 20, None, true).await;
-        assert!(result.is_ok());
+    async fn test_submit_persists_and_status_reads_it_back() {
+        let dir = scratch_dir("submit_status");
+        let db_path = dir.join("wf.db");
+        let config_path = dir.join("wf.json");
+        get_template("qc")
+            .expect("qc template")
+            .save(&config_path)
+            .expect("save workflow def");
+
+        handle_submit(&config_path, Some(&db_path), 4, false, true)
+            .await
+            .expect("submit should succeed");
+
+        // Verify the real side effect directly against the persistence
+        // layer, independent of what handle_submit printed. Loading must go
+        // through `with_store` here too — see its doc comment.
+        let (id0, workflow) = with_store(db_path.clone(), |store| {
+            let ids = store.list_workflows()?;
+            assert_eq!(ids.len(), 1, "exactly one workflow should be persisted");
+            let workflow = store.load_workflow(ids[0])?;
+            Ok((ids[0], workflow))
+        })
+        .await
+        .expect("verify persisted workflow");
+        assert_eq!(workflow.name, "qc");
+        assert_eq!(workflow.tasks.len(), 3);
+        assert_eq!(workflow.state, oximedia_workflow::WorkflowState::Created);
+
+        // `status` must succeed against that same real, persisted ID.
+        let id_str = id0.to_string();
+        handle_status(&id_str, Some(&db_path), true, true)
+            .await
+            .expect("status should find the persisted workflow");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_submit_dry_run_does_not_persist() {
+        let dir = scratch_dir("dry_run");
+        let db_path = dir.join("wf.db");
+        let config_path = dir.join("wf.json");
+        get_template("proxy")
+            .expect("proxy template")
+            .save(&config_path)
+            .expect("save workflow def");
+
+        handle_submit(&config_path, Some(&db_path), 4, true, true)
+            .await
+            .expect("dry run should succeed");
+
+        assert!(!db_path.exists(), "dry-run must not create a database file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_transitions_state_to_cancelled() {
+        let dir = scratch_dir("cancel");
+        let db_path = dir.join("wf.db");
+        let config_path = dir.join("wf.json");
+        get_template("archive")
+            .expect("archive template")
+            .save(&config_path)
+            .expect("save workflow def");
+
+        handle_submit(&config_path, Some(&db_path), 4, false, true)
+            .await
+            .expect("submit");
+
+        let id0 = with_store(db_path.clone(), |store| Ok(store.list_workflows()?[0]))
+            .await
+            .expect("list persisted workflow");
+        let id_str = id0.to_string();
+
+        handle_cancel(&id_str, Some(&db_path), false, true)
+            .await
+            .expect("cancel should succeed");
+
+        let reloaded = with_store(db_path.clone(), move |store| store.load_workflow(id0))
+            .await
+            .expect("reload after cancel");
+        assert_eq!(reloaded.state, oximedia_workflow::WorkflowState::Cancelled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_status_unknown_id_errs() {
+        let dir = scratch_dir("status_unknown");
+        let db_path = dir.join("wf.db");
+        // Open (and thus create) an empty database first.
+        with_store(db_path.clone(), |_store| Ok(()))
+            .await
+            .expect("create empty db");
+
+        let random_id = oximedia_workflow::WorkflowId::new().to_string();
+        let result = handle_status(&random_id, Some(&db_path), false, true).await;
+        assert!(
+            result.is_err(),
+            "status for an ID absent from the database must error, not fabricate idle/0%"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_status_invalid_id_format_errs() {
+        let result = handle_status("not-a-uuid", None, false, true).await;
+        let err = result.expect_err("non-UUID id must be rejected before touching any database");
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[tokio::test]
+    async fn test_logs_reports_real_task_states() {
+        let dir = scratch_dir("logs");
+        let db_path = dir.join("wf.db");
+        let config_path = dir.join("wf.json");
+        get_template("transcode")
+            .expect("transcode template")
+            .save(&config_path)
+            .expect("save workflow def");
+
+        handle_submit(&config_path, Some(&db_path), 4, false, true)
+            .await
+            .expect("submit");
+
+        let id0 = with_store(db_path.clone(), |store| Ok(store.list_workflows()?[0]))
+            .await
+            .expect("list persisted workflow");
+        let id_str = id0.to_string();
+
+        handle_logs(&id_str, 0, Some(&db_path), true)
+            .await
+            .expect("logs should find the persisted workflow's tasks");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_list_reflects_persisted_workflows() {
+        let dir = scratch_dir("list");
+        let db_path = dir.join("wf.db");
+        let config_path = dir.join("wf.json");
+        get_template("qc")
+            .expect("qc template")
+            .save(&config_path)
+            .expect("save workflow def");
+
+        handle_submit(&config_path, Some(&db_path), 4, false, true)
+            .await
+            .expect("submit");
+
+        // Unfiltered list must succeed and the store must show the row.
+        handle_list(None, Some(&db_path), true)
+            .await
+            .expect("list should succeed");
+        let count = with_store(db_path.clone(), |store| Ok(store.list_workflows()?.len()))
+            .await
+            .expect("list persisted workflows");
+        assert_eq!(count, 1);
+
+        // A freshly submitted workflow is `Created`, which buckets as
+        // "pending"; filtering by "done" must exclude it, "pending" must not.
+        handle_list(Some("pending"), Some(&db_path), true)
+            .await
+            .expect("pending filter should succeed");
+        handle_list(Some("done"), Some(&db_path), true)
+            .await
+            .expect("done filter should succeed (even with zero matches)");
+        let invalid = handle_list(Some("bogus"), Some(&db_path), true).await;
+        assert!(invalid.is_err(), "unknown --state value must be rejected");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

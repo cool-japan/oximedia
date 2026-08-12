@@ -102,8 +102,8 @@ pub async fn generate_thumbnails(options: ThumbnailOptions) -> Result<()> {
         return Err(anyhow!("Quality must be between 0 and 100"));
     }
 
-    // Print thumbnail plan
-    if !options.json_output {
+    // Print thumbnail plan (status output; suppressed by --quiet)
+    if !options.json_output && !crate::progress::is_quiet() {
         print_thumbnail_plan(&options);
     }
 
@@ -114,7 +114,7 @@ pub async fn generate_thumbnails(options: ThumbnailOptions) -> Result<()> {
     if options.json_output {
         let result = create_result(&output_files, &options)?;
         println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         print_thumbnail_summary(&output_files, &options);
     }
 

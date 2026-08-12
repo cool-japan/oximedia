@@ -565,21 +565,28 @@ where
     F: FnMut(u32) -> std::result::Result<T, E>,
     E: std::fmt::Debug,
 {
+    // `RetryPolicy::max_attempts` is a plain `pub` field with no lower-bound
+    // enforcement, so a caller-constructed policy could set it to 0. Clamp
+    // to at least one attempt so the loop below is provably non-empty
+    // instead of relying on an unenforced caller invariant.
+    let max_attempts = policy.max_attempts.max(1);
     let mut last_err: Option<E> = None;
-    for attempt in 0..policy.max_attempts {
+    for attempt in 0..max_attempts {
         match op(attempt) {
             Ok(value) => return Ok(value),
             Err(e) => {
                 tracing::warn!("Attempt {} failed: {:?}", attempt + 1, e);
                 last_err = Some(e);
-                if attempt + 1 < policy.max_attempts {
+                if attempt + 1 < max_attempts {
                     std::thread::sleep(policy.delay_for_attempt(attempt));
                 }
             }
         }
     }
-    // SAFETY: loop runs at least once (max_attempts >= 1 ensured by caller).
-    Err(last_err.expect("max_attempts must be > 0"))
+    // The loop above always runs at least once now (`max_attempts >= 1`),
+    // so `last_err` is guaranteed `Some` here — the `Ok` arm above is the
+    // only other way out of the function.
+    Err(last_err.expect("max_attempts clamped to >= 1 above, so the loop ran at least once"))
 }
 
 #[cfg(test)]
@@ -713,5 +720,24 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(call_count, 3);
+    }
+
+    #[test]
+    fn test_execute_with_retry_zero_max_attempts_errs_instead_of_panicking() {
+        // `max_attempts` is a public field with no lower-bound enforcement;
+        // a misconfigured policy of 0 must return an `Err`, not panic.
+        let policy = RetryPolicy {
+            max_attempts: 0,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+        };
+        let mut call_count = 0u32;
+        let result: std::result::Result<i32, &str> = execute_with_retry(&policy, |_attempt| {
+            call_count += 1;
+            Err("always fails")
+        });
+        assert!(result.is_err());
+        // Clamped to at least one attempt rather than silently doing nothing.
+        assert_eq!(call_count, 1);
     }
 }

@@ -224,7 +224,7 @@ fn run_extract(
             "extracted_count": extracted,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "AAF Media Extraction".green().bold());
         println!("  Input:     {}", input.display());
         println!("  Output:    {}", output.display());
@@ -279,7 +279,7 @@ fn run_convert(
             "status": "converted",
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "AAF Conversion".green().bold());
         println!("  Input:  {}", input.display());
         println!("  Output: {}", output.display());
@@ -400,7 +400,7 @@ fn run_merge(inputs: &[PathBuf], output: &PathBuf, json_output: bool) -> Result<
             "status": "merged",
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "AAF Merge".green().bold());
         println!("  Inputs: {} files", inputs.len());
         for p in inputs {

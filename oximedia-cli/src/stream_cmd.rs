@@ -340,15 +340,19 @@ async fn run_record(
         return Ok(());
     }
 
-    println!("{}", "OxiMedia Stream Record".green().bold());
-    println!("  Input:    {}", input.display().to_string().cyan());
-    println!("  Output:   {}", output.display().to_string().cyan());
-    println!("  Format:   {}", format.to_uppercase().yellow());
-    println!("  Segment:  {}s", segment_duration);
-    if low_latency {
-        println!("  Mode:     {}", "Low-latency".yellow());
+    let quiet = crate::progress::is_quiet();
+
+    if !quiet {
+        println!("{}", "OxiMedia Stream Record".green().bold());
+        println!("  Input:    {}", input.display().to_string().cyan());
+        println!("  Output:   {}", output.display().to_string().cyan());
+        println!("  Format:   {}", format.to_uppercase().yellow());
+        println!("  Segment:  {}s", segment_duration);
+        if low_latency {
+            println!("  Mode:     {}", "Low-latency".yellow());
+        }
+        println!();
     }
-    println!();
 
     let input_str = input
         .to_str()
@@ -363,7 +367,9 @@ async fn run_record(
                 .build()
                 .map_err(|e| anyhow::anyhow!("Failed to build HLS packager: {}", e))?;
 
-            println!("  {} Packaging to HLS...", "→".blue());
+            if !quiet {
+                println!("  {} Packaging to HLS...", "→".blue());
+            }
             packager
                 .package(input_str)
                 .await
@@ -376,7 +382,9 @@ async fn run_record(
                 .build()
                 .map_err(|e| anyhow::anyhow!("Failed to build DASH packager: {}", e))?;
 
-            println!("  {} Packaging to DASH...", "→".blue());
+            if !quiet {
+                println!("  {} Packaging to DASH...", "→".blue());
+            }
             packager
                 .package(input_str)
                 .await
@@ -384,18 +392,20 @@ async fn run_record(
         }
     };
 
-    match result {
-        Ok(()) => {
-            println!("  {} Packaging complete", "✓".green());
-            println!("  {} Output: {}", "✓".green(), output.display());
-        }
-        Err(e) => {
-            println!("  {} Packaging error: {}", "!".yellow(), e);
-            println!(
-                "  {} Segments directory created: {}",
-                "✓".green(),
-                output.display()
-            );
+    if !quiet {
+        match result {
+            Ok(()) => {
+                println!("  {} Packaging complete", "✓".green());
+                println!("  {} Output: {}", "✓".green(), output.display());
+            }
+            Err(e) => {
+                println!("  {} Packaging error: {}", "!".yellow(), e);
+                println!(
+                    "  {} Segments directory created: {}",
+                    "✓".green(),
+                    output.display()
+                );
+            }
         }
     }
 

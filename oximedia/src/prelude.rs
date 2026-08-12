@@ -742,3 +742,15 @@ pub use oximedia_pipeline::{
     builder::{NodeChain, PipelineBuilder},
     PipelineError,
 };
+
+// ── Capture ───────────────────────────────────────────────────────────────────
+
+/// Live camera/device capture types. `enumerate()`/`open()` themselves are
+/// deliberately not re-exported here (free functions of that shape collide
+/// too easily in a shared prelude); reach them via `oximedia::capture::` or
+/// `oximedia_capture::` directly.
+#[cfg(feature = "capture")]
+pub use oximedia_capture::{
+    CaptureConfig, CaptureDevice, CaptureError, CaptureFrame, CaptureSession, CaptureStream,
+    DeviceSelector, DropPolicy,
+};

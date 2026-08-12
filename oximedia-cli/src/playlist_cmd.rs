@@ -152,7 +152,7 @@ async fn cmd_generate(
             "default_duration_secs": default_duration_secs,
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!(
             "{} Playlist generated: {}",
             "OK".green().bold(),

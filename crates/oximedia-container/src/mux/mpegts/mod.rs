@@ -159,6 +159,13 @@ pub struct MpegTsMuxer<S: MediaSource> {
     streams: Vec<ElementaryStream>,
     /// Stream lookup by index.
     stream_by_index: HashMap<usize, usize>,
+    /// Public [`StreamInfo`] for each added stream, in insertion order.
+    ///
+    /// Mirrors `streams` (which stores the muxer's internal per-stream
+    /// packetization state, not `StreamInfo` itself) so that
+    /// [`Muxer::streams`](crate::Muxer::streams) can hand back real,
+    /// caller-supplied information instead of an empty slice.
+    stream_infos: Vec<StreamInfo>,
     /// PAT continuity counter.
     pat_continuity_counter: u8,
     /// PMT continuity counter.
@@ -182,6 +189,7 @@ impl<S: MediaSource> MpegTsMuxer<S> {
             config,
             streams: Vec::new(),
             stream_by_index: HashMap::new(),
+            stream_infos: Vec::new(),
             pat_continuity_counter: 0,
             pmt_continuity_counter: 0,
             pcr_pid: None,
@@ -347,12 +355,20 @@ impl<S: MediaSource> MpegTsMuxer<S> {
             section.push(0x00);
         }
 
-        // Update section length
+        // Update section length.
+        //
+        // `section_length_pos` is captured *after* the table_id byte is pushed,
+        // so it already points at the first of the two length bytes. Offsetting
+        // by +1/+2 wrote the length one byte late: `section_length` read back as
+        // 0x0B0 (176) and the low byte overwrote `program_number`'s high byte,
+        // so every emitted PMT was non-conformant and failed a demuxer's CRC
+        // check. Covered by
+        // `oximedia_server::hls::segment::tests::segment_reparses_with_correct_stream_type`.
         let section_length = section.len() - 3 + 4; // +4 for CRC
         #[allow(clippy::cast_possible_truncation)]
         {
-            section[section_length_pos + 1] = ((section_length >> 8) as u8 & 0x0F) | 0xB0;
-            section[section_length_pos + 2] = (section_length & 0xFF) as u8;
+            section[section_length_pos] = ((section_length >> 8) as u8 & 0x0F) | 0xB0;
+            section[section_length_pos + 1] = (section_length & 0xFF) as u8;
         }
 
         // CRC32
@@ -491,6 +507,7 @@ impl<S: MediaSource> Muxer for MpegTsMuxer<S> {
         }
 
         let stream_index = info.index;
+        self.stream_infos.push(info.clone());
         let es = ElementaryStream::new(info, pid, stream_type_info.stream_type);
 
         let internal_index = self.streams.len();
@@ -574,10 +591,7 @@ impl<S: MediaSource> Muxer for MpegTsMuxer<S> {
     }
 
     fn streams(&self) -> &[StreamInfo] {
-        // Convert internal streams to StreamInfo slice
-        // This is a bit awkward - we'd need to maintain a separate Vec<StreamInfo>
-        // For now, return empty slice (this is mainly for informational purposes)
-        &[]
+        &self.stream_infos
     }
 
     fn config(&self) -> &MuxerConfig {
@@ -624,5 +638,32 @@ mod tests {
             .expect("operation should succeed");
         assert_eq!(index, 0);
         assert_eq!(muxer.streams.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_streams_reports_added_streams() {
+        // `Muxer::streams()` used to unconditionally return `&[]`. Verify it
+        // now reflects every stream actually registered via `add_stream`,
+        // in insertion order, with the right codec for each.
+        let source = MemorySource::new(bytes::Bytes::new());
+        let config = MuxerConfig::new();
+        let mut muxer = MpegTsMuxer::new(source, config);
+
+        assert!(
+            muxer.streams().is_empty(),
+            "no streams added yet, must report empty"
+        );
+
+        muxer
+            .add_stream(StreamInfo::new(0, CodecId::Av1, Rational::new(1, 90000)))
+            .expect("operation should succeed");
+        muxer
+            .add_stream(StreamInfo::new(1, CodecId::Opus, Rational::new(1, 48000)))
+            .expect("operation should succeed");
+
+        let infos = muxer.streams();
+        assert_eq!(infos.len(), 2, "both added streams must be reported");
+        assert_eq!(infos[0].codec, CodecId::Av1);
+        assert_eq!(infos[1].codec, CodecId::Opus);
     }
 }

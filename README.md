@@ -4,10 +4,10 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.87+-orange.svg)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-v0.2.0-green.svg)](https://github.com/cool-japan/oximedia)
-[![Released](https://img.shields.io/badge/last%20release-0.1.9%20(2026--07--14)-brightgreen.svg)](https://github.com/cool-japan/oximedia)
-[![Crates](https://img.shields.io/badge/crates-114-blue.svg)](https://github.com/cool-japan/oximedia)
-[![SLOC](https://img.shields.io/badge/SLOC-~2.95M-blueviolet.svg)](https://github.com/cool-japan/oximedia)
+[![Version](https://img.shields.io/badge/version-v0.2.1-green.svg)](https://github.com/cool-japan/oximedia)
+[![Released](https://img.shields.io/badge/last%20release-0.2.0%20(2026--07--15)-brightgreen.svg)](https://github.com/cool-japan/oximedia)
+[![Crates](https://img.shields.io/badge/crates-115-blue.svg)](https://github.com/cool-japan/oximedia)
+[![SLOC](https://img.shields.io/badge/SLOC-~3.05M-blueviolet.svg)](https://github.com/cool-japan/oximedia)
 
 [![OxiScope — four Pure-Rust WebAssembly video scopes running live in the browser](docs/assets/oxiscope-hero.png)](https://cooljapan.tech/oxiscope/)
 
@@ -21,7 +21,7 @@ OxiMedia is a **clean room, Pure Rust reconstruction** of both **FFmpeg** (multi
 
 ### FFmpeg Domain
 
-Codec encoding and decoding for patent-free formats (AV1, VP9, VP8, Theora, Opus, Vorbis, FLAC, MP3 — encoders are functional across the board; decoder maturity varies per codec, from Verified down to bitstream-parsing-only for Vorbis (AV1, VP9 and VP8 keyframe/intra decode is now real and bit-exact against reference decoders; inter-frame decode is the remaining gap for all three): see the [Codec Matrix](#codec-matrix)), container muxing/demuxing (MP4, MKV, MPEG-TS, OGG, AVI, FLV), streaming protocols (HLS, DASH, RTMP, SRT, WebRTC, SMPTE 2110), transcoding pipelines, filter graphs (DAG-based), audio metering (EBU R128), loudness normalization, packaging (CMAF, DRM/CENC), and server-side media delivery.
+Codec encoding and decoding for patent-free formats (AV1, VP9, VP8, Theora, Opus, Vorbis, FLAC, MP3 — decoder maturity varies per codec, from Verified down to bitstream-parsing-only. VP8 and VP9 now decode **key frames and inter frames** bit-exactly against libvpx, and FLAC is bit-exact against libFLAC/ffmpeg in both directions; AV1 decode is keyframe/intra only, and the in-tree Opus codec is untrustworthy in both directions — the wired surfaces refuse rather than pass its output on: see the [Codec Matrix](#codec-matrix) and [docs/codec_status.md](docs/codec_status.md)), container muxing/demuxing (MP4, MKV, MPEG-TS, OGG, AVI, FLV), streaming protocols (HLS, DASH, RTMP, SRT, WebRTC, SMPTE 2110), transcoding pipelines, filter graphs (DAG-based), audio metering (EBU R128), loudness normalization, packaging (CMAF, DRM/CENC), and server-side media delivery.
 
 ### OpenCV Domain
 
@@ -67,15 +67,15 @@ Computer vision (object detection, motion tracking, video enhancement, quality a
 
 ## Project Scale
 
-OxiMedia is a **production-grade** framework at **v0.2.0** (active cycle):
+OxiMedia is a **production-grade** framework at **v0.2.1** (active cycle):
 
 | Metric | Value |
 |--------|-------|
-| Total workspace crates | 114 (110 library crates under `crates/` + `oximedia` facade + CLI + WASM + internal benchmark harness) |
-| Published to crates.io | 111 (Python bindings ship to PyPI, WASM to npm; benchmark harness is internal) |
-| Total SLOC (Rust) | ~2,951,000 (2,951,319 lines of code per `tokei`, verified 2026-07-13) |
-| Tests passing | 101,814 with `--all-features` / 100,160 with default features (0 failures, 0 warnings — `cargo nextest run --workspace`, verified 2026-07-13) |
-| Stable crates | 110 |
+| Total workspace crates | 115 (111 library crates under `crates/` + `oximedia` facade + CLI + WASM + internal benchmark harness; confirmed via `cargo metadata --no-deps`, verified 2026-08-12) |
+| Published to crates.io | 112 (3 of 115 crates carry `publish = false` — Python bindings ship to PyPI instead, WASM to npm instead, benchmark harness is internal-only; confirmed via `cargo metadata`) |
+| Total SLOC (Rust) | ~3,048,000 (3,048,416 lines of code per `tokei . --exclude target --exclude web`, verified 2026-08-12) |
+| Tests passing | 104,693 with `--all-features` (0 failures, 155 skipped) / 103,322 with default features (0 failures, 144 skipped) — `cargo nextest run --workspace`, 0 compiler warnings in both runs, verified 2026-08-12 |
+| Stable crates | 111 |
 | Alpha crates | 0 |
 | Partial crates | 0 |
 | License | Apache 2.0 |
@@ -102,7 +102,7 @@ pulls in **zero** ONNX symbols and stays C/Fortran-free.
 
 ```toml
 [dependencies]
-oximedia = { version = "0.1.9", features = ["ml", "ml-scene-classifier", "ml-onnx"] }
+oximedia = { version = "0.2.1", features = ["ml", "ml-scene-classifier", "ml-onnx"] }
 ```
 
 ```rust,ignore
@@ -152,19 +152,30 @@ See [`docs/ml_guide.md`](docs/ml_guide.md) for the full feature matrix,
 per-pipeline I/O contracts, device selection details, WASM support
 matrix, and roadmap.
 
-## What's New in v0.1.9
+## What's New in v0.2.1
 
-Released 2026-07-14. Theme: **Sovereign default build, Pure-Rust infrastructure migrations, and deep correctness hardening (Waves 21–30)**.
+Released 2026-08-12. Theme: **The audio loudness stack is now standards-accurate and honest, OxiMedia gains Pure-Rust live camera/device capture, VP8 and VP9 decode inter frames bit-exactly, FLAC is conformant in both directions, and a workspace-wide sweep replaced fabricated success with real work or an honest error**.
 
-- **100% Pure Rust default build**: `cargo check --workspace` now compiles zero C/C++/Fortran. All C-backed integrations moved behind opt-in, non-default Cargo features: `aws-sdk` (oximedia-cloud), `vulkan-backend` (oximedia-accel), `lua-scripting` (oximedia-automation), `quic-quinn` (oximedia-videoip).
-- **SQLite via Pure-Rust oxisql**: every SQLite-backed persistence path migrated from `rusqlite`/`libsqlite3-sys` to [`oxisql-sqlite-compat`](https://crates.io/crates/oxisql-sqlite-compat) — the `sqlite` features are now Pure Rust too.
-- **No external `protoc` required**: gRPC schema compilation in `oximedia-farm` and `oximedia-distributed` migrated to the pure-Rust [`protox`](https://crates.io/crates/protox) parser; the system Protocol Buffers compiler is no longer a build prerequisite.
-- **Real least-squares color calibration** (`oximedia-calibrate`): 3×3 color-matching matrix solved via least squares (B·A⁻¹ with adjugate inverse, conditioning, and rank-deficiency guards), replacing the previous identity stub; ΔE2000 < 2.0 on known-answer tests.
-- **Polymorphic `.cube` LUT loader** (`oximedia-lut`): 1D and 3D `.cube` files load through a single detection path.
-- **Broadcast-audio correctness fixes**: EBU R128 gating power-normalization underread (~42.8 dB) fixed in `oximedia-audio`; STFT gain (~14 dB) and wow/flutter fixes in `oximedia-restore`; Hann-window and synthesis attenuation fixes in `oximedia-audio-analysis`; sub-frame f64 timecode drift eliminated in `oximedia-timecode`.
-- **New pro features across Waves 21–30**: DTW forced lyric alignment (`oximedia-mir`), hand-emitted PDF QC reports (`oximedia-qc`), CEA-608 odd-parity encode/decode (`oximedia-captions`), mmap-backed HLS/DASH segment store (`oximedia-server`), BS.1770-4 golden-reference metering tests, anycast/BGP-style CDN routing, ORB/BRIEF cross-frame descriptor caching (`oximedia-align`), and JWT/webhook fixes in `oximedia-server`.
-- **101,814 tests passing** with `--all-features` (100,160 with default features), 0 failures, 0 clippy warnings, 0 rustfmt diffs, all doctests green — verified 2026-07-13.
-- **`oxiarc-archive` 0.3.6 sibling-version mismatch (fixed 2026-07-14):** a same-day bump on 2026-07-13 briefly left `oxiarc-archive` calling APIs not yet present in sibling crates `oxiarc-brotli`/`oxiarc-bzip2`/`oxiarc-lzma`/`oxiarc-snappy` (then still 0.3.5). Those siblings have since published matching 0.3.6 releases, and `cargo check --workspace --all-features` now passes clean.
+- **EBU R128 loudness measurement and normalization are now standards-accurate** (`oximedia-metering`, `oximedia-audio`): the default K-weighting filter chain was wrong by up to ±35 dB against ITU-R BS.1770-4 Table 1 (a mis-implemented highpass stage, and a 3.9998 **dB** shelf gain used as a linear multiplier), stereo/multichannel programmes measured a flat 3.01 LU too quiet from a channel-averaging bug instead of the spec's channel sum, the crate-root `EbuR128Meter` alias resolved to the approximate meter instead of the accurate one, and `LoudnessNormalizer::normalize()` computed a correct gain and then silently discarded it, returning the input audio byte-identical. All four are fixed and pinned with new ITU-R BS.1770-4 conformance tests.
+- **VP8 and VP9 now decode inter frames bit-exactly against libvpx** (`oximedia-codec`): VP9 gained cross-frame reference/probability state, inter mode and motion-vector entropy decode, eight-tap motion compensation and compound prediction — 10 of 10 conformance streams bit-exact through the public decoder API (inter-frame segmentation and reference scaling remain deferred behind a pinned, honest `Err`). VP8 gained motion-vector entropy decode, sub-pixel motion compensation and last/golden/altref reference management — bit-exact on 5 multi-frame streams, including one with a hidden altref frame. Both move to **Verified** decode in the Codec Matrix.
+- **FLAC is now conformant in both directions** (`oximedia-codec`): the encoder and decoder had been a self-consistent toy pair that panicked on a real `ffmpeg`-produced file; both were rebuilt against RFC 9639 (subframe header bit-layout, the Rice unary convention, LPC precision/shift fields, stereo decorrelation, escaped partitions) and now round-trip against `libFLAC` and `ffmpeg` in both directions, promoting FLAC to **Verified**.
+- **AVIF decodes to real pixels** (`oximedia-codec`): 8-bit 4:2:0 colour items decode through the AV1 keyframe decoder and are byte-identical to ffmpeg/dav1d on a real libaom fixture; alpha (real-world AVIF encodes it as monochrome AV1) and 10/12-bit items return an honest `Err` instead of fabricated output.
+- **New `oximedia-capture` crate**: Pure-Rust live camera/device capture, the `libavdevice` equivalent, with AVFoundation (macOS), Video4Linux2 (Linux) and Media Foundation (Windows) backends and no C/C++/Fortran compiled on any of them. Verification is honestly per-platform rather than uniform — macOS is hardware-verified against real devices; Linux and Windows are compile- and host-tested, with live-device runs still open. Delivers raw pixel formats or untouched MJPEG only, so it cannot produce a Red List codec even in principle.
+- **Workspace-wide fabricated-success elimination sweep**: nine areas that reported success without doing the work now either do the real work or refuse honestly — `oximedia-videoip`'s hardcoded fake decoders/encoders, `oximedia-mam`'s S3/Azure/GCS backends that logged and returned `Ok` unconditionally, `oximedia-server`'s CDN uploads and unsigned "presigned" URLs, `oximedia-workflow` tasks that returned `Ok(())` without executing, `oximedia-farm` sleeping instead of transcoding, and more. The count of `TODO(0.2.x)` markers in Rust source fell from **123 to 22**, with every survivor enumerated by `file:line` in `TODO.md`'s "Deferred (0.2.x)" section.
+- **The in-tree Opus codec is demoted to Bitstream-parsing.** Fed real libopus packets for the first time this cycle, decode returned silence or out-of-range output and the encoder emitted a TOC byte that misdescribed its own payload. This is a label correction, not a new regression — every wired consumer (`oximedia-videoip`, the loudness normalizer, the frame-level transcode path) already refused to pass Opus through, and continues to. Treat Opus as untrustworthy in both directions until a conformant implementation lands.
+
+## What's New in v0.2.0
+
+Released 2026-07-15. Theme: **A real frame-level transcode engine, bit-exact AV1/VP9/VP8 key-frame video decoding, and a broad "real or honest error" sweep across the packager, network, workflow, Python bindings, and CLI layers**.
+
+- **Real frame-level transcode engine** (`oximedia-transcode`): a genuine decode → filter → encode pipeline behind `TranscodePipeline`'s `requires_frame_level()` gate, replacing the previous stream-copy-only path for jobs that actually need re-encoding. WAV/FLAC input re-encodes through OxiMedia's own FLAC codec bit-exact on round-trip, Y4M decode is wired in, `-r` frame-rate conversion is a real drop/duplicate resampler, and new file muxers (`RawEsFileMuxer`, `FlacFileMuxer`, `CafAlacFileMuxer`, `Y4mFileMuxer`) back real outputs.
+- **AV1 key-frame/intra-frame decoder** (`oximedia-codec`): a full port of the AV1 intra decode path — symbol/range decoder, header parsing, transform-coefficient decode, intra prediction (incl. CFL), inverse transforms, deblocking, CDEF, and loop restoration — verified bit-exact (0 differing Y/U/V pixels) against `dav1d` 1.5.1 and `aomdec`/libaom v3.12.1 on 13 keyframe test vectors.
+- **VP9 key-frame/intra-frame decoder**: an exact port of libvpx's intra decode path (boolean decoder, inverse DCT/ADST/Walsh-Hadamard transforms, loop filter), verified bit-exact against `ffmpeg`/libvpx reference decodes.
+- **VP8 key-frame decoder**: the full RFC 6386 §11–§15 intra pipeline, cross-checked against OxiMedia's own production-verified WebP/VP8 still-image decoder and bit-exact against libwebp reference output. Inter-frame decode for all three codecs is the remaining gap, tracked for 0.2.x.
+- **Real CENC/`cbcs` packager encryption** (`oximedia-packager`): genuine full-sample AES-128-CTR for CENC, and the real ISO/IEC 23001-7 §9.6 `cbcs` pattern (1 encrypted block per 9 clear, CBC chain reset per sample) for SAMPLE-AES — the format FairPlay/Shaka/hls.js/dash.js actually expect — replacing a mislabeled full-buffer CBC path that no real client could decrypt.
+- **~40 `oximedia-cli` flags verified real**: `--map`, `-ss`/`-t`, `-vf`, `-af`, `-r`, `--crf`, `--normalize-audio`, `probe --hash`/`--quality-snapshot`, `validate --loudness-check`, `mam --extract-metadata`, `batch-engine --priority`/`--config`/`--state`, `workflow --source`/`--destination`, `edl parse --format`, `recommend --bitrate`/`--resolution`, and a global `--quiet` flag now do what they say instead of silently no-opping; the already-dead `transcode --resume` flag (never wired to any resume capability) was removed rather than left as a silent no-op.
+- **Fabricated-success elimination sweep**: Python bindings (`oximedia-py`), the RTMP relay (`oximedia-net`), the `oximedia-effects` shelf EQ filters, and a dozen more "returns `Ok` with fake data" paths across `oximedia-renderfarm`, `oximedia-stabilize`, `oximedia-vfx`, `oximedia-access`, `oximedia-captions`, `oximedia-automation`, `oximedia-conform`, and `oximedia-accel` now return an honest `Err` instead, each pinned by a new regression test. A related `oximedia-workflow` scheduler bug that silently dropped non-root tasks while still reporting the workflow `Completed` is also fixed.
+- **Security hardening**: parser bounds/allocation caps against malicious input added across MP4 box nesting, DVB subtitle regions, RTSP bodies, RTMP chunks, WebRTC SCTP reassembly, and AAF essence ranges; the SRT key exchange's RFC 3394 AES key wrap was rewritten from a masquerading stub into the real six-round algorithm, verified against the RFC 3394 §4.1 test vector.
 
 ## What's New in v0.1.8
 
@@ -285,6 +296,7 @@ Released 2026-04-20.
 | `oximedia-subtitle` | Subtitle/caption rendering (SRT, WebVTT, CEA-608/708) | Stable |
 | `oximedia-timecode` | LTC and VITC timecode reading/writing | Stable |
 | `oximedia-compat-ffmpeg` | FFmpeg CLI argument compatibility layer (80+ codec mappings) | Stable |
+| `oximedia-capture` | Live camera/device capture — the `libavdevice` equivalent: AVFoundation (macOS), V4L2 (Linux), Media Foundation (Windows); raw pixel formats + MJPEG passthrough only. Receive is synchronous by default; the opt-in `tokio` feature adds `CaptureStream::into_async` (a bounded bridge that preserves the ring's drop policy as backpressure) | macOS hardware-verified during package A5 (enumeration exercised against real devices); Linux/Windows implemented and compile-/host-tested, no live-device run yet — see [crate README](crates/oximedia-capture/README.md). **Note:** the facade forwards the async path via its `capture-tokio` feature (`capture` alone stays synchronous) |
 
 > **DRM honesty note.** ClearKey (W3C EME JSON) and CENC/AES-128 encryption
 > packaging are real, fully implemented paths. The Widevine, PlayReady, and
@@ -447,9 +459,9 @@ breakdown, what is missing, and the effort required to close each gap.
 
 | Category | Codec | Encode | Decode | Notes |
 |----------|-------|--------|--------|-------|
-| Video | AV1 | Functional | **Functional** (keyframe/intra only) | Alliance for Open Media, royalty-free. Keyframe/intra-frame decode real, bit-exact vs dav1d/aomdec (8-bit 4:2:0 profile 0), including deblocking, CDEF and loop restoration; super-resolution, film grain, palette mode, intra block copy, quantizer matrices, 10/12-bit and inter-frame decode are not yet implemented and return an honest `Err`. |
-| Video | VP9 | Functional | **Functional** (keyframe/intra only) | Google, royalty-free. Keyframe/intra-frame decode real, bit-exact vs libvpx (8-bit 4:2:0); inter-frame decode not yet implemented, returns an honest `Err`. |
-| Video | VP8 | Functional | **Functional** (keyframe/intra only) | Google, royalty-free. Keyframe/intra-frame decode real (full RFC 6386 §11-§15 pipeline), bit-exact vs libwebp reference; inter-frame decode not yet implemented, returns an honest `Err`. |
+| Video | AV1 | **Not usable** | **Functional** (keyframe/intra only) | Alliance for Open Media, royalty-free. Keyframe/intra-frame decode real, bit-exact vs dav1d/aomdec (8-bit 4:2:0 profile 0), including deblocking, CDEF and loop restoration; super-resolution, film grain, palette mode, intra block copy, quantizer matrices, 10/12-bit and inter-frame decode are not yet implemented and return an honest `Err`. The encoder does not emit a valid bitstream — a reference decoder either rejects its output or decodes it to something different from the input; see [docs/rate_control.md](docs/rate_control.md) for the measurements. |
+| Video | VP9 | **Not usable** | **Verified** (key + intra-only + inter frames) | Google, royalty-free. Full decode: cross-frame reference/probability state, MV reference scan, inter mode + motion-vector entropy decode, eight-tap motion compensation across all four filter sets, compound prediction, backward probability adaptation, `show_existing_frame` and superframes — bit-exact vs libvpx on 10 conformance streams through the public API (8-bit 4:2:0). Inter-frame segmentation and reference scaling are deferred and refuse at a pinned packet with an honest `Err`. The encoder does not emit a valid bitstream — a reference decoder either rejects its output or decodes it to something different from the input; see [docs/rate_control.md](docs/rate_control.md) for the measurements. |
+| Video | VP8 | **Not usable** | **Verified** (key + inter frames) | Google, royalty-free. Full RFC 6386 decode: the §11-§15 intra pipeline (bit-exact vs libwebp) plus §16-§18 inter frames — motion-vector entropy decode, sub-pixel motion compensation and last/golden/altref reference management — bit-exact vs libvpx on 5 multi-frame conformance streams (incl. a hidden altref frame). The encoder does not emit a valid bitstream — a reference decoder either rejects its output or decodes it to something different from the input; see [docs/rate_control.md](docs/rate_control.md) for the measurements. |
 | Video | Theora | Functional | Functional | Xiph.org, royalty-free. Real DCT/IDCT, quantization, intra prediction; self-consistent encode↔decode round-trip tests (≤8 LSB at Q48). P-frame/inter paths not yet exercised; not conformance-verified against libtheora. |
 | Video | MJPEG | Functional | Functional | Motion JPEG via `oximedia-image` JPEG baseline; ≥28 dB PSNR at Q85. |
 | Video | APV | Functional | Functional | ISO/IEC 23009-13 royalty-free intra-frame; real DCT + entropy decode. |
@@ -461,16 +473,16 @@ breakdown, what is missing, and the effort required to close each gap.
 | Video | JPEG XS | Functional | Functional | ISO/IEC 21122-1 (SMPTE ST 2110-22) encode+decode; byte-exact lossless round-trip; NLT Extended transform deferred (feature `jpegxs`, opt-in). |
 | Image | JPEG 2000 | Functional | Functional | ISO/IEC 15444-1; lossless 5-3 + lossy 9-7 encode/decode, multi-tile. Single-layer LRCP only; multi-layer/progressive deferred (feature `jpeg2000`, opt-in). |
 | Image | JPEG-LS | Functional | Functional | ISO/IEC 14495-1 LOCO-I; regular + RUN modes, near-lossless (NEAR>0), ILV 0/1/2 (feature `jpegls`, opt-in). HP patents expired 2017–2019. |
-| Audio | Opus | Functional | Functional (CELT + SILK + Hybrid) | Xiph.org/IETF, royalty-free. All three decode paths are real and wired (RFC 6716 §4.2 SILK, §4.5 Hybrid); no bit-exact conformance fixtures against libopus yet. |
+| Audio | Opus | **Not usable** | **Bitstream-parsing** | Xiph.org/IETF, royalty-free. CELT/SILK/Hybrid decode paths exist and are wired, but on **real libopus packets** decode returns silence (0 non-zero of 49,920 samples) or out-of-range output, and the encoder emits a TOC byte that misdescribes its own payload. Every wired consumer (videoip, normalize, frame-level transcode) refuses with an honest `Err` rather than passing this on. `oximedia-audio` has a separate, unaudited implementation. |
 | Audio | Vorbis | Functional | **Bitstream-parsing** | Xiph.org, royalty-free. Headers parse; `decode_audio_packet` returns an honest `Err` (not fabricated empty samples). |
-| Audio | FLAC | Functional | Functional / Verified | Lossless, royalty-free; CRC-16 verified, real LPC decode. |
+| Audio | FLAC | **Verified** | **Verified** | Lossless, royalty-free. Encoder and decoder rebuilt to RFC 9639 and verified in **both** directions against libFLAC/ffmpeg (this crate decodes stock ffmpeg output sample-exactly; `flac -d`/ffmpeg decode this crate's output sample-exactly). All four stereo decorrelation modes, both residual coding methods, constant/fixed/LPC/verbatim subframes. |
 | Audio | ALAC | Functional | Functional | Apple Lossless (reference Apache-2.0 since 2011, royalty-free); byte-exact 16/20/24-bit round-trip. 32-bit and rare extended predictor modes unsupported (feature `alac`, opt-in). |
 | Audio | PCM | Verified | Verified | Unencumbered; trivial round-trip verified. |
 | Audio | MP3 | — | Functional | Playback-only (patents expired 2017). Full Huffman/IMDCT/synthesis filterbank. |
 | Image | PNG/APNG | Functional | Functional | Unencumbered; real unfilter + RGBA conversion. |
 | Image | GIF | Functional | Functional | Unencumbered; real LZW decode. |
-| Image | WebP (VP8L) | Functional | Functional | Google, royalty-free. Lossless only — no VP8 lossy WebP decoder. |
-| Image | AVIF | Functional | **Bitstream-parsing** | AOM, royalty-free. Container validates; `decode()` returns an honest `Err` — not yet wired to the new AV1 keyframe/intra decoder. |
+| Image | WebP | Functional | Functional (VP8L lossless + VP8 lossy) | Google, royalty-free. Lossless (VP8L) and lossy (`VP8 ` chunk → the bit-exact VP8 key-frame decoder, bit-exact vs `dwebp -yuv`). Uncompressed `ALPH` alpha merges into RGBA32; VP8L-compressed `ALPH` returns an honest `Err`. The lossy encoder was rebuilt to RFC 6386 in 0.2.1 and round-trips through this crate's own VP8 decoder within a small luma-error bound; no external libwebp validation of the encoder yet. |
+| Image | AVIF | Functional | **Functional** (8-bit 4:2:0 colour items) | AOM, royalty-free. `decode()` is wired to the AV1 keyframe decoder and byte-identical to ffmpeg/dav1d on a real libaom fixture. Alpha (real-world AVIF encodes it as monochrome AV1) and 10/12-bit items return an honest `Err` — both tracked under AV1, not AVIF. |
 | Image | JPEG-XL (AJXL) | Functional | Functional | Animated JPEG-XL via ISOBMFF; real modular decoder. |
 
 ## Red List (Rejected Codecs)
@@ -484,6 +496,15 @@ These codecs are **NEVER** supported due to patent encumbrance:
 - AC-3/E-AC-3 (Dolby)
 - DTS (DTS Inc)
 - MP3 (encoding — Fraunhofer)
+
+> **Capture note.** `oximedia-capture` (live camera/device ingest) cannot
+> produce a Red List codec even in principle: its `CaptureEncoding` type has
+> exactly two variants, `Raw(PixelFormat)` and `Mjpeg`, so there is no value
+> of that type that could represent H.264/HEVC/VVC/AC-3/DTS. A camera's other
+> native modes — including any compressed mode this crate does not model —
+> are skipped during enumeration rather than guessed at. What a capture
+> session hands back is always either an uncompressed pixel buffer or an
+> untouched MJPEG bitstream (Green List; see the Codec Matrix above).
 
 ## Quick Start
 
@@ -535,7 +556,7 @@ or pin the version and pick features in `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia = { version = "0.1.9", features = ["full"] }
+oximedia = { version = "0.2.1", features = ["full"] }
 ```
 
 ### Python (PyPI)
@@ -627,19 +648,19 @@ limitations, and [`web/TODO.md`](web/TODO.md) for milestone status.
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| Stable | 110 | Feature-complete, tested, production-ready |
+| Stable | 111 | Feature-complete, tested, production-ready |
 | Alpha | 0 | Core functionality implemented, API may change |
 | Partial | 0 | Under active development, incomplete |
-| **Total** | **110** | Library crates under `crates/` (top-level `oximedia` facade, `oximedia-cli`, `oximedia-wasm`, and the internal `oximedia-benchmarks` harness counted separately — 114 workspace members in all) |
+| **Total** | **111** | Library crates under `crates/` (top-level `oximedia` facade, `oximedia-cli`, `oximedia-wasm`, and the internal `oximedia-benchmarks` harness counted separately — 115 workspace members in all) |
 
 ### Detailed Status Breakdown
 
-**Stable (110 crates):**
+**Stable (111 crates):**
 `oximedia-360`, `oximedia-aaf`, `oximedia-accel`, `oximedia-access`, `oximedia-align`,
 `oximedia-analysis`, `oximedia-analytics`, `oximedia-archive`, `oximedia-archive-pro`,
 `oximedia-audio`, `oximedia-audio-analysis`, `oximedia-audiopost`, `oximedia-auto`,
 `oximedia-automation`, `oximedia-batch`, `oximedia-bench`, `oximedia-bitstream`, `oximedia-cache`,
-`oximedia-calibrate`, `oximedia-caption-gen`, `oximedia-captions`, `oximedia-cdn`,
+`oximedia-calibrate`, `oximedia-caption-gen`, `oximedia-captions`, `oximedia-capture`, `oximedia-cdn`,
 `oximedia-clips`, `oximedia-cloud`, `oximedia-codec`, `oximedia-collab`, `oximedia-colormgmt`,
 `oximedia-compat-cv2`, `oximedia-compat-ffmpeg`, `oximedia-conform`, `oximedia-container`,
 `oximedia-convert`, `oximedia-core`, `oximedia-cv`, `oximedia-dedup`, `oximedia-denoise`,
@@ -777,7 +798,7 @@ If you find OxiMedia useful, please consider sponsoring the project to support c
 **[https://github.com/sponsors/cool-japan](https://github.com/sponsors/cool-japan)**
 
 Your sponsorship helps us:
-- Maintain and improve 114 crates (~2.95M SLOC)
+- Maintain and improve 115 crates (~3.05M SLOC)
 - Implement new royalty-free codecs and CV algorithms
 - Keep the entire COOLJAPAN ecosystem (OxiBLAS, OxiFFT, SciRS2, etc.) 100% Pure Rust
 - Provide long-term support and security updates

@@ -1,0 +1,75 @@
+layout: switch  (source: switch.ivf)
+IVF header: 100x68  fourcc=VP90  timebase=25/1  declared_frame_count=10
+actual IVF packet count parsed: 10
+
+N     pkt/sf        size    type   show  intra  er  dims       q    seg  interp          refresh  ref_idx  hsib
+----------------------------------------------------------------------------------------------------------------------------------
+   0  pkt0   sf0     2795B  key    show=1  intra_only=0  er=0  dims=100x68     q= 16  seg=off  interp=-               refresh=0xff  ref_idx=[-]  hsib=90  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=-  adapt=no
+        loop_filter deltas: ref=[1, None, -1, -1] mode=[None, None]
+   1  pkt1   sf0      314B  inter  show=1  intra_only=0  er=0  dims=100x68     q= 96  seg=off  interp=SWITCHABLE      refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=10  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=no
+        loop_filter deltas: ref=None mode=None
+   2  pkt2   sf0      357B  inter  show=1  intra_only=0  er=0  dims=100x68     q= 96  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=10  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=no
+        loop_filter deltas: ref=None mode=None
+   3  pkt3   sf0      366B  inter  show=1  intra_only=0  er=0  dims=100x68     q= 96  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=7  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=no
+        loop_filter deltas: ref=None mode=None
+   4  pkt4   sf0      477B  inter  show=1  intra_only=0  er=0  dims=100x68     q= 96  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=5  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=no
+        loop_filter deltas: ref=None mode=None
+   5  pkt5   sf0      426B  inter  show=1  intra_only=0  er=0  dims=100x68     q= 96  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=no
+        loop_filter deltas: ref=None mode=None
+   6  pkt6   sf0      404B  inter  show=1  intra_only=0  er=0  dims=100x68     q= 96  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=no
+        loop_filter deltas: ref=None mode=None
+   7  pkt7   sf0      347B  inter  show=1  intra_only=0  er=0  dims=100x68     q= 96  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=5  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=no
+        loop_filter deltas: ref=None mode=None
+   8  pkt8   sf0      401B  inter  show=1  intra_only=0  er=0  dims=100x68     q= 96  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=no
+        loop_filter deltas: ref=None mode=None
+   9  pkt9   sf0      348B  inter  show=1  intra_only=0  er=0  dims=100x68     q= 96  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=1  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=no
+        loop_filter deltas: ref=None mode=None
+----------------------------------------------------------------------------------------------------------------------------------
+
+frame accounting
+----------------------------------------
+IVF packets:       10
+coded frames:      10  (key=1, inter=9, of which show_existing_frame=0)
+hidden coded frames (show_frame=0, not show_existing_frame): 0
+output pictures:   10  = count(show_existing_frame==1) [0] + count(show_existing_frame==0 && show_frame==1) [10]
+
+coded-frame-index -> output-picture-index mapping (n/a rows contribute no output picture)
+coded_idx  pkt  show_existing  show_frame  output_idx  dims
+        0    0              0  1           0           100x68
+        1    1              0  1           1           100x68
+        2    2              0  1           2           100x68
+        3    3              0  1           3           100x68
+        4    4              0  1           4           100x68
+        5    5              0  1           5           100x68
+        6    6              0  1           6           100x68
+        7    7              0  1           7           100x68
+        8    8              0  1           8           100x68
+        9    9              0  1           9           100x68
+
+switch.ref.yuv: homogeneous 100x68 (4:2:0 planar, 10200 bytes/frame) x 10 output pictures = 102000 bytes total (byte-offset table omitted: offset = output_idx * frame_bytes)
+
+stream-level summary
+----------------------------------------
+key frames: 1  (task requires exactly 1, at coded index 0)
+hidden frames (show_frame=0): 0
+distinct frame-level interpolation_filter values seen: ['EIGHTTAP', 'SWITCHABLE']
+frames with segmentation_enabled=1: []
+distinct coded (width,height) seen: [(100, 68)]
+distinct profile values seen: [0]
+
+stream notes / expected+observed reference-frame coverage:
+  100x68: non-8-aligned in both dimensions (MiCols=13 with a partial last MI column,
+  MiRows=9 with a partial last MI row; Sb64Cols=Sb64Rows=2, i.e. also a partial second
+  superblock column/row) -- exercises partial superblocks and partial 8x8 MI at the
+  right/bottom edges as required. Encoder defaults (no auto-alt-ref/tile/frame-parallel
+  overrides). Expected+observed: frame-level interpolation_filter is NOT constant across
+  the stream -- frame 1 is SWITCHABLE (per-block filter selection enabled for that
+  frame), frames 2-9 are fixed EIGHTTAP: 2 distinct frame-level values, satisfying
+  'more than one interp filter actually appears' on the first attempt (no retry needed).
+  NOT statically verified (honest scope boundary, same as splitmv in Wave 2): actual
+  per-block filter choice within a SWITCHABLE frame requires per-block compressed-header
+  decode; this parser only reaches the frame-level uncompressed-header field.
+  NOTE: frame_parallel_decoding_mode=1 on every frame (ffmpeg's libvpx-vp9 default
+  'auto' resolved to 1, not overridden here since this stream's purpose does not
+  require backward adaptation) -- adapt=no throughout. Do not use this stream as an
+  adaptation fixture; see compound for that.

@@ -188,7 +188,7 @@ impl ProgressTracker {
             }
 
             let first = times[0];
-            let last = *times.last().expect("invariant: len >= 2 checked above");
+            let last = times.last().copied().unwrap_or(first);
             let duration = last.duration_since(first);
 
             if duration.as_secs_f64() > 0.0 {

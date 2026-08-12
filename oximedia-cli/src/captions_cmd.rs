@@ -50,16 +50,19 @@ pub struct CaptionsConvertOptions {
 
 /// Options for the `captions burn` subcommand.
 pub struct CaptionsBurnOptions {
-    /// Input video file.
+    /// Input video file (uncompressed YUV4MPEG2 / .y4m).
     pub video: PathBuf,
     /// Input caption file.
     pub captions: PathBuf,
-    /// Output video file.
+    /// Output video file (YUV4MPEG2 / .y4m).
     pub output: PathBuf,
-    /// Font size.
+    /// Font size in points.
     pub font_size: u32,
     /// Font color (hex, e.g. "FFFFFF").
     pub font_color: String,
+    /// TrueType/OpenType font used to rasterise captions (required;
+    /// OxiMedia ships no font and never picks a system one).
+    pub font: Option<PathBuf>,
 }
 
 /// Options for the `captions extract` subcommand.
@@ -801,76 +804,248 @@ pub async fn run_captions_convert(opts: CaptionsConvertOptions, json_output: boo
     Ok(())
 }
 
+/// Operation label used in the frame harness's error messages.
+const CAPTIONS_BURN_OP: &str = "captions burn";
+
+/// Fraction of frame height each stacked caption row occupies, matching
+/// `oximedia_captions::caption_renderer::CaptionRenderer::render`'s own
+/// internal `row_offset` step exactly (rows only stack correctly with the
+/// two kept in sync).
+const CAPTION_ROW_STEP_FRACTION: f32 = 0.08;
+
 /// Run the `captions burn` subcommand.
 ///
-/// Validates the input video and caption file for real (the video must
-/// exist, the caption file must actually parse, and the track must be
-/// non-empty), then returns an honest error rather than a rendered video.
+/// A real decode -> composite -> encode pass, run on the blocking pool
+/// (burn-in is CPU-bound and fully synchronous, matching `timecode burn` and
+/// `subtitle burn`).
 ///
-/// Burning captions into video pixels needs a decode -> rasterize-glyphs ->
-/// composite -> re-encode pipeline. `oximedia-graph` has a real, working,
-/// `fontdue`-backed rasterizer (`oximedia_graph::filters::video::timecode::TimecodeFilter`,
-/// used for timecode burn-in), and `oximedia_captions::caption_renderer`
-/// provides caption layout math -- but neither is wired into any
-/// CLI-reachable execution path: `oximedia-cli`'s real `-vf`/`-af` transcode
-/// filters are limited to `scale=`/`volume=` (see `transcode.rs`), and there
-/// is no decode/encode round trip callable from this handler. Copying the
-/// input to the output (the previous behaviour) would silently ship an
-/// un-captioned video while claiming success, so we refuse instead.
-// TODO(0.2.x): wire a real burn-in pipeline once a CLI-reachable
-// decode -> composite -> encode path exists. `oximedia-graph`'s
-// `TimecodeFilter` is the closest existing font-rasterization building
-// block to model a `CaptionFilter` node on.
+/// # Pipeline
+///
+/// 1. Parse the caption file with the existing real `oximedia_captions`
+///    importer (already used by `extract`/`sync`/`validate`), giving
+///    `CaptionTrack.captions` with microsecond `Timestamp` start/end.
+/// 2. Validate the input contract in the same order `timecode burn` does:
+///    Y4M header -> chroma-divisibility (`require_compositable`) -> font.
+/// 3. [`crate::frame_harness::process_frames`] demuxes one frame at a time;
+///    for each frame's timestamp, every caption whose range covers it has
+///    its lines positioned by a real
+///    [`oximedia_captions::caption_renderer::CaptionRenderer::render_lines`]
+///    (safe-area-aware, [`oximedia_captions::caption_renderer::SafeAreaInsets::standard`])
+///    and alpha-composited with real `fontdue` glyphs from the user's
+///    `--font` via [`crate::frame_harness::text::TextRenderer`].
+///    Simultaneously-active captions stack their row positions instead of
+///    overlapping.
+///
+/// # Errors
+///
+/// Returns an error if the video/caption files don't exist, the caption
+/// file doesn't parse or has no cues, `--font-color` is not valid hex, the
+/// input is not Y4M, `--font` is missing/invalid, no caption overlaps the
+/// clip's time range, or the overlay rasterised to nothing. No output file
+/// is written unless the whole clip succeeds.
 pub async fn run_captions_burn(opts: CaptionsBurnOptions, json_output: bool) -> Result<()> {
+    tokio::task::spawn_blocking(move || cmd_burn_captions(&opts, json_output))
+        .await
+        .map_err(|join_err| anyhow::anyhow!("captions burn-in task panicked: {join_err}"))?
+}
+
+/// Synchronous implementation of `captions burn`, run inside `spawn_blocking`
+/// by [`run_captions_burn`].
+fn cmd_burn_captions(opts: &CaptionsBurnOptions, json_output: bool) -> Result<()> {
+    use crate::frame_harness::text::{TextColor, TextRenderer};
+    use oximedia_captions::caption_renderer::{
+        CaptionRenderConfig, CaptionRenderer, RenderTarget, SafeAreaInsets,
+    };
+
     if !opts.video.exists() {
-        return Err(anyhow::anyhow!(
-            "Input video not found: {}",
-            opts.video.display()
-        ));
+        anyhow::bail!("Input video not found: {}", opts.video.display());
     }
+    if opts.font_size == 0 {
+        anyhow::bail!("--font-size must be greater than zero");
+    }
+    let color = TextColor::from_hex(&opts.font_color)
+        .with_context(|| "Invalid --font-color".to_string())?;
 
     let caption_data = std::fs::read(&opts.captions)
         .with_context(|| format!("Failed to read captions: {}", opts.captions.display()))?;
-
     let track = oximedia_captions::import::Importer::import_auto(&caption_data)
         .map_err(|e| anyhow::anyhow!("Failed to parse captions: {e}"))?;
-
-    let caption_count = track.count();
-    if caption_count == 0 {
-        return Err(anyhow::anyhow!(
+    if track.captions.is_empty() {
+        anyhow::bail!(
             "Caption file '{}' contains no captions to burn",
             opts.captions.display()
-        ));
-    }
-
-    if json_output {
-        let diag = serde_json::json!({
-            "video": opts.video.to_string_lossy(),
-            "captions": opts.captions.to_string_lossy(),
-            "output": opts.output.to_string_lossy(),
-            "font_size": opts.font_size,
-            "font_color": opts.font_color,
-            "captions_parsed": caption_count,
-            "status": "error",
-            "error": "caption burn-in pixel rendering is not implemented",
-        });
-        eprintln!(
-            "{}",
-            serde_json::to_string_pretty(&diag).unwrap_or_else(|_| diag.to_string())
         );
     }
 
-    Err(anyhow::anyhow!(
-        "Caption burn-in is not yet implemented: parsed {caption_count} caption(s) from '{}' \
-         successfully (requested {}px, #{}), but oximedia-cli has no reachable video decode -> \
-         text-rasterize -> re-encode pipeline to composite them onto '{}'. Refusing to fabricate \
-         '{}' by copying the input.",
-        opts.captions.display(),
-        opts.font_size,
-        opts.font_color,
-        opts.video.display(),
-        opts.output.display()
-    ))
+    // Input contract: Y4M in / Y4M out, checked before the font so a wrong
+    // input format is reported before a missing font (mirrors `timecode
+    // burn`'s validation order).
+    let (header, layout) = crate::frame_harness::peek_y4m_header(CAPTIONS_BURN_OP, &opts.video)?;
+    crate::frame_harness::adapt::require_compositable(CAPTIONS_BURN_OP, &layout)?;
+    let font_bytes = crate::frame_harness::font::load_font(opts.font.as_deref())?;
+
+    let fps = f64::from(header.fps_num.max(1)) / f64::from(header.fps_den.max(1));
+    let frame_w = layout.luma_w as u32;
+    let frame_h = layout.luma_h as u32;
+
+    let render_config = CaptionRenderConfig {
+        target: RenderTarget::FrameBuffer {
+            width: frame_w,
+            height: frame_h,
+        },
+        font_size_pt: opts.font_size as f32,
+        safe_area: SafeAreaInsets::standard(),
+        ..CaptionRenderConfig::default()
+    };
+    let caption_renderer = CaptionRenderer::new(render_config);
+    let mut text_renderer = TextRenderer::new(font_bytes)?;
+    let max_text_width = frame_w as f32 * 0.8;
+
+    let mut composited_frames = 0usize;
+    let stats = crate::frame_harness::process_frames(
+        CAPTIONS_BURN_OP,
+        &opts.video,
+        &opts.output,
+        |index, frame| {
+            let t_ms = (index as f64 * 1000.0 / fps).round() as i64;
+            let active: Vec<&oximedia_captions::Caption> = track
+                .captions
+                .iter()
+                .filter(|c| c.start.as_millis() <= t_ms && t_ms < c.end.as_millis())
+                .collect();
+            if active.is_empty() {
+                return Ok(());
+            }
+
+            let mut painted_here = 0usize;
+            let mut row_offset = 0.0f32;
+            for caption in &active {
+                let mut lines: Vec<&str> = caption.text.lines().collect();
+                if lines.is_empty() {
+                    lines.push(caption.text.as_str());
+                }
+                let rendered = caption_renderer.render_lines(&lines);
+                for (line_text, rc) in lines.iter().zip(rendered.iter()) {
+                    let glyphs = text_renderer.layout(
+                        line_text,
+                        opts.font_size as f32,
+                        Some(max_text_width),
+                    );
+                    let (tw, th) = TextRenderer::bounds(&glyphs);
+                    // `rc.x` is always the frame-horizontal centre (0.5);
+                    // `rc.y` is this row's bottom edge as a fraction of frame
+                    // height, already offset from the bottom by the safe
+                    // area and the row's own index within its caption.
+                    let cx = frame_w as f32 * rc.x;
+                    let bottom_y = frame_h as f32 * (rc.y - row_offset);
+                    let x = (cx - tw / 2.0).round() as i32;
+                    let y = (bottom_y - th).round() as i32;
+                    painted_here +=
+                        text_renderer.paint(frame, &glyphs, opts.font_size as f32, x, y, color)?;
+                }
+                // Stack the *next* caption's rows above this one's, instead
+                // of overlapping at the same safe-area position.
+                row_offset += CAPTION_ROW_STEP_FRACTION * rendered.len() as f32;
+            }
+            if painted_here > 0 {
+                composited_frames += 1;
+            }
+            Ok(())
+        },
+    )?;
+
+    if composited_frames == 0 {
+        let _ = std::fs::remove_file(&opts.output);
+        let clip_duration_s = stats.frame_count as f64 / fps;
+        let cap_min_s = track
+            .captions
+            .iter()
+            .map(|c| c.start.as_millis())
+            .min()
+            .unwrap_or(0) as f64
+            / 1000.0;
+        let cap_max_s = track
+            .captions
+            .iter()
+            .map(|c| c.end.as_millis())
+            .max()
+            .unwrap_or(0) as f64
+            / 1000.0;
+        anyhow::bail!(
+            "captions burn-in composited no captions onto any frame: the clip covers \
+             0.00s-{:.2}s ({} frames at {:.3} fps), but the {} caption(s) in '{}' span \
+             {:.2}s-{:.2}s, which does not overlap. No output was written to {}.",
+            clip_duration_s,
+            stats.frame_count,
+            fps,
+            track.captions.len(),
+            opts.captions.display(),
+            cap_min_s,
+            cap_max_s,
+            opts.output.display()
+        );
+    }
+    if stats.bytes_changed == 0 {
+        let _ = std::fs::remove_file(&opts.output);
+        anyhow::bail!(
+            "captions burn-in composited captions onto {composited_frames} frame(s) but changed \
+             no pixels, so no output was written to {}: the overlay rasterised to nothing (font \
+             '{}' may have no glyphs for this text, or --font-size {} may be too small for a \
+             {}x{} frame). Refusing to report a successful burn-in.",
+            opts.output.display(),
+            opts.font
+                .as_ref()
+                .map_or_else(|| "<none>".to_string(), |p| p.display().to_string()),
+            opts.font_size,
+            frame_w,
+            frame_h
+        );
+    }
+
+    let caption_count = track.count();
+    if json_output {
+        let obj = serde_json::json!({
+            "video": opts.video.to_string_lossy(),
+            "captions": opts.captions.to_string_lossy(),
+            "output": opts.output.to_string_lossy(),
+            "operation": "captions-burn",
+            "input_format": "y4m",
+            "output_format": "y4m",
+            "width": frame_w,
+            "height": frame_h,
+            "font": opts.font.as_ref().map(|p| p.display().to_string()),
+            "font_size": opts.font_size,
+            "font_color": opts.font_color,
+            "captions_parsed": caption_count,
+            "frames_with_captions": composited_frames,
+            "frame_count": stats.frame_count,
+            "input_size_bytes": stats.bytes_in,
+            "output_size_bytes": stats.bytes_out,
+            "bytes_changed": stats.bytes_changed,
+            "note": "Real glyphs rasterised with the user-supplied font (fontdue-backed \
+                     oximedia_subtitle::font) at positions from CaptionRenderer::render_lines \
+                     (safe-area-aware), alpha-composited onto every frame whose timestamp falls \
+                     inside a caption's [start, end) range.",
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+        return Ok(());
+    }
+
+    println!("{}", "Caption Burn-In Complete".green().bold());
+    println!("  Video:    {}", opts.video.display());
+    println!("  Captions: {}", opts.captions.display());
+    println!("  Output:   {}", opts.output.display());
+    println!("  Video:    {}x{} @ {:.3} fps", frame_w, frame_h, fps);
+    println!(
+        "  Captions: {} caption(s), {} frame(s) with a caption drawn",
+        caption_count, composited_frames
+    );
+    println!(
+        "  Output size: {} bytes ({} bytes changed, {} frames)",
+        stats.bytes_out, stats.bytes_changed, stats.frame_count
+    );
+
+    Ok(())
 }
 
 /// Run the `captions extract` subcommand.
@@ -1214,6 +1389,26 @@ fn render_validation_report(
 mod tests {
     use super::*;
 
+    /// PID-scoped scratch directory for this test process's fixtures.
+    ///
+    /// The PID matters: this module is compiled into *both* the `oximedia`
+    /// binary and the `oximedia-cli` lib target, so every test here runs
+    /// twice in two concurrent processes (and `cargo nextest` gives each
+    /// test its own process on top of that). A bare `std::env::temp_dir()`
+    /// is shared across all of them, so fixed file names would let one
+    /// copy's cleanup (`remove_file`) delete another copy's still-in-use
+    /// fixture mid-test — this is not hypothetical, it reproduces as a real,
+    /// intermittent failure on the burn-in tests, whose real font decode +
+    /// glyph rasterisation pass is slow enough to widen the collision
+    /// window. Scoping every fixture under the calling process's PID
+    /// removes the shared path entirely.
+    fn temp_dir_for_test() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("oximedia_captions_cmd_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
     // ── Feature-gating error tests ────────────────────────────────────────────
 
     /// Without the `caption-gen` feature the function must return an error
@@ -1221,7 +1416,7 @@ mod tests {
     #[cfg(not(feature = "caption-gen"))]
     #[tokio::test]
     async fn test_run_captions_generate_no_feature_error() {
-        let tmp = std::env::temp_dir();
+        let tmp = temp_dir_for_test();
         let opts = CaptionsGenerateOptions {
             input: tmp.join("nonexistent_input.wav"),
             output: tmp.join("out.srt"),
@@ -1245,7 +1440,7 @@ mod tests {
     #[cfg(feature = "caption-gen")]
     #[tokio::test]
     async fn test_run_captions_generate_no_model_error() {
-        let tmp = std::env::temp_dir();
+        let tmp = temp_dir_for_test();
         // Create a minimal valid WAV so we don't fail at the read step.
         let wav_path = tmp.join("oximedia_cli_test_captions_gen_no_model.wav");
         let _ = std::fs::write(&wav_path, minimal_wav_bytes());
@@ -1331,7 +1526,7 @@ mod tests {
     #[test]
     fn test_render_validation_report() {
         let report = oximedia_captions::validation::ValidationReport::new();
-        let path = std::env::temp_dir().join("test.srt");
+        let path = temp_dir_for_test().join("test.srt");
         let text = render_validation_report(&report, &path, "fcc");
         assert!(text.contains("Caption Validation Report"));
         assert!(text.contains("fcc"));
@@ -1426,7 +1621,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_captions_extract_non_matroska_input_errors() {
-        let tmp = std::env::temp_dir();
+        let tmp = temp_dir_for_test();
         let input = tmp.join("oximedia_cli_test_extract_not_mkv.bin");
         let output = tmp.join("oximedia_cli_test_extract_not_mkv_out.srt");
         std::fs::write(&input, b"this is not a media container, just text").expect("write fixture");
@@ -1452,7 +1647,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_captions_extract_real_matroska_subtitle_track() {
-        let tmp = std::env::temp_dir();
+        let tmp = temp_dir_for_test();
         let input = tmp.join("oximedia_cli_test_extract_real.webm");
         let output = tmp.join("oximedia_cli_test_extract_real_out.srt");
         let data =
@@ -1490,7 +1685,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_captions_extract_track_out_of_range() {
-        let tmp = std::env::temp_dir();
+        let tmp = temp_dir_for_test();
         let input = tmp.join("oximedia_cli_test_extract_range.webm");
         let output = tmp.join("oximedia_cli_test_extract_range_out.srt");
         let data = build_test_webm_subtitle("S_TEXT/UTF8", &[(0, "Only cue")]);
@@ -1514,7 +1709,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_captions_extract_unsupported_codec_errors() {
-        let tmp = std::env::temp_dir();
+        let tmp = temp_dir_for_test();
         let input = tmp.join("oximedia_cli_test_extract_ass.webm");
         let output = tmp.join("oximedia_cli_test_extract_ass_out.srt");
         let data = build_test_webm_subtitle("S_TEXT/ASS", &[(0, "0,0,Default,,0,0,0,,Hello")]);
@@ -1540,7 +1735,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_captions_burn_missing_video_errors() {
-        let tmp = std::env::temp_dir();
+        let tmp = temp_dir_for_test();
         let video = tmp.join("oximedia_cli_test_burn_missing_video.mkv");
         let captions = tmp.join("oximedia_cli_test_burn_missing_video.srt");
         let output = tmp.join("oximedia_cli_test_burn_missing_video_out.mkv");
@@ -1555,6 +1750,7 @@ mod tests {
             output: output.clone(),
             font_size: 24,
             font_color: "FFFFFF".to_string(),
+            font: None,
         };
         let err = run_captions_burn(opts, false)
             .await
@@ -1565,9 +1761,11 @@ mod tests {
         std::fs::remove_file(&captions).ok();
     }
 
+    /// A non-Y4M video is refused with the shared, actionable error, before
+    /// the (missing) font is even considered.
     #[tokio::test]
-    async fn test_run_captions_burn_real_captions_returns_honest_err_no_output_file() {
-        let tmp = std::env::temp_dir();
+    async fn test_run_captions_burn_requires_y4m_input() {
+        let tmp = temp_dir_for_test();
         let video = tmp.join("oximedia_cli_test_burn_video.mkv");
         let captions = tmp.join("oximedia_cli_test_burn_captions.srt");
         let output = tmp.join("oximedia_cli_test_burn_output.mkv");
@@ -1586,18 +1784,17 @@ mod tests {
             output: output.clone(),
             font_size: 32,
             font_color: "FFFFFF".to_string(),
+            font: None,
         };
         let err = run_captions_burn(opts, false)
             .await
-            .expect_err("burn-in must not fabricate success");
+            .expect_err("burn-in must not fabricate success on a non-Y4M input");
         let msg = err.to_string();
+        assert!(msg.contains("YUV4MPEG2"), "got: {msg}");
+        assert!(msg.contains("oximedia transcode"), "got: {msg}");
         assert!(
-            msg.contains("not yet implemented"),
-            "error should be honest about the missing pipeline, got: {msg}"
-        );
-        assert!(
-            !msg.contains("Caption Burn Complete"),
-            "must not resurrect the old fabricated success banner text"
+            !msg.contains("Caption Burn-In Complete"),
+            "must not resurrect a fabricated success banner"
         );
         assert!(
             !output.exists(),
@@ -1606,5 +1803,123 @@ mod tests {
 
         std::fs::remove_file(&video).ok();
         std::fs::remove_file(&captions).ok();
+    }
+
+    /// Write a flat 4:2:0 Y4M clip.
+    fn write_flat_y4m_burn_fixture(path: &std::path::Path, w: u32, h: u32, frames: usize, y: u8) {
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let mut buf = format!("YUV4MPEG2 W{w} H{h} F25:1 Ip A1:1 C420jpeg\n").into_bytes();
+        for _ in 0..frames {
+            buf.extend_from_slice(b"FRAME\n");
+            buf.extend(std::iter::repeat_n(y, (w * h) as usize));
+            buf.extend(std::iter::repeat_n(128u8, (cw * ch * 2) as usize));
+        }
+        std::fs::write(path, buf).expect("write y4m fixture");
+    }
+
+    /// Without `--font` the command refuses honestly and writes nothing.
+    /// This test always runs: it needs no font precisely because the point
+    /// is that OxiMedia ships none.
+    #[tokio::test]
+    async fn test_run_captions_burn_without_font_errors_honestly() {
+        let tmp = temp_dir_for_test();
+        let video = tmp.join("oximedia_cli_test_burn_nofont_video.y4m");
+        let captions = tmp.join("oximedia_cli_test_burn_nofont_captions.srt");
+        let output = tmp.join("oximedia_cli_test_burn_nofont_output.y4m");
+        write_flat_y4m_burn_fixture(&video, 32, 32, 3, 128);
+        std::fs::write(
+            &captions,
+            "1\n00:00:00,000 --> 00:00:02,000\nHello world\n\n",
+        )
+        .expect("write srt fixture");
+        let _ = std::fs::remove_file(&output);
+
+        let opts = CaptionsBurnOptions {
+            video: video.clone(),
+            captions: captions.clone(),
+            output: output.clone(),
+            font_size: 24,
+            font_color: "FFFFFF".to_string(),
+            font: None,
+        };
+        let err = run_captions_burn(opts, false)
+            .await
+            .expect_err("burn-in without a font must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--font"),
+            "error must name the flag, got: {msg}"
+        );
+        assert!(
+            !output.exists(),
+            "no output may be fabricated without a font"
+        );
+
+        std::fs::remove_file(&video).ok();
+        std::fs::remove_file(&captions).ok();
+    }
+
+    /// Real glyph rasterisation: burns captions into every overlapping frame
+    /// and checks the overlay actually landed in the pixels.
+    ///
+    /// Needs a font: set `OXIMEDIA_TEST_FONT=/path/to/font.ttf`.
+    #[tokio::test]
+    async fn test_run_captions_burn_renders_real_glyphs() {
+        let Some(font) = std::env::var_os("OXIMEDIA_TEST_FONT").map(PathBuf::from) else {
+            eprintln!(
+                "SKIP test_run_captions_burn_renders_real_glyphs: no font available. Re-run \
+                 with OXIMEDIA_TEST_FONT=/path/to/font.ttf."
+            );
+            return;
+        };
+
+        let tmp = temp_dir_for_test();
+        let video = tmp.join("oximedia_cli_test_burn_real_video.y4m");
+        let captions = tmp.join("oximedia_cli_test_burn_real_captions.srt");
+        let output = tmp.join("oximedia_cli_test_burn_real_output.y4m");
+        // Flat mid-grey so any change is unambiguously the overlay.
+        write_flat_y4m_burn_fixture(&video, 320, 96, 3, 128);
+        std::fs::write(
+            &captions,
+            "1\n00:00:00,000 --> 00:00:02,000\nHello world\n\n",
+        )
+        .expect("write srt fixture");
+        let _ = std::fs::remove_file(&output);
+
+        let opts = CaptionsBurnOptions {
+            video: video.clone(),
+            captions: captions.clone(),
+            output: output.clone(),
+            font_size: 28,
+            font_color: "FFFFFF".to_string(),
+            font: Some(font),
+        };
+        run_captions_burn(opts, false)
+            .await
+            .expect("burn-in must succeed with a real font");
+
+        let bytes = std::fs::read(&output).expect("read output");
+        assert!(bytes.starts_with(b"YUV4MPEG2 W320 H96"));
+
+        let mut demuxer =
+            oximedia_container::demux::y4m::Y4mDemuxer::new(std::io::Cursor::new(bytes.as_slice()))
+                .expect("parse output y4m");
+        let frames = demuxer.read_all_frames().expect("read output frames");
+        assert_eq!(frames.len(), 3, "every frame must be re-encoded");
+
+        let luma_len = 320 * 96;
+        for (i, frame) in frames.iter().enumerate() {
+            let changed = frame[..luma_len].iter().filter(|&&s| s != 128).count();
+            assert!(
+                changed > 50,
+                "frame {i} must carry a rasterised overlay, but only {changed} luma samples \
+                 differ from the flat background"
+            );
+        }
+
+        std::fs::remove_file(&video).ok();
+        std::fs::remove_file(&captions).ok();
+        std::fs::remove_file(&output).ok();
     }
 }

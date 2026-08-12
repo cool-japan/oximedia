@@ -45,6 +45,25 @@ pub enum VideoIpError {
     #[error("Codec error: {0}")]
     Codec(String),
 
+    /// A codec direction has no real implementation available to this crate.
+    ///
+    /// Returned instead of fabricating output. `oximedia-videoip` never ships
+    /// raw frames as a compressed bitstream, and never invents dimensions,
+    /// sample counts or sample rates for data it did not actually decode — if
+    /// the backing implementation in `oximedia-codec` cannot do the work, the
+    /// factory in [`crate::codec`] fails here with `details` naming the exact
+    /// gap and how it was verified.
+    #[error("{codec} {operation} is not implemented: {details}")]
+    CodecUnimplemented {
+        /// Codec name as it appears in [`crate::types::VideoCodec`] /
+        /// [`crate::types::AudioCodec`], e.g. `"VP9"` or `"Opus"`.
+        codec: &'static str,
+        /// Direction that is missing: `"encode"` or `"decode"`.
+        operation: &'static str,
+        /// Precise description of what is missing and how that was verified.
+        details: String,
+    },
+
     /// FEC error.
     #[error("FEC error: {0}")]
     Fec(String),

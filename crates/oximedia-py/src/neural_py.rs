@@ -1,16 +1,30 @@
 //! `oximedia.neural` submodule — Python bindings for `oximedia-neural`.
 //!
-//! Wraps the pure-Rust tensor type and the pre-built media inference models
-//! (scene classifier, thumbnail ranker, 2x super-resolution upscaler, and a
-//! HOG-like feature extractor) behind PyO3 classes with real delegation to
-//! [`oximedia_neural`]. All weights are zero-initialised at construction
-//! (this crate ships inference scaffolding, not pre-trained weights or a
-//! training loop), so `classify`/`score`/`extract`/`upscale_2x` are exact
-//! passthroughs to the underlying Rust math rather than fabricated results.
+//! This file wraps the pure-Rust tensor type and the pre-built media
+//! inference models (scene classifier, thumbnail ranker, 2x
+//! super-resolution upscaler, and a HOG-like feature extractor) behind
+//! PyO3 classes with real delegation to [`oximedia_neural`]. All weights
+//! are zero-initialised at construction (this crate ships inference
+//! scaffolding, not pre-trained weights or a training loop), so
+//! `classify`/`score`/`extract`/`upscale_2x` are exact passthroughs to the
+//! underlying Rust math rather than fabricated results.
 //!
 //! Inputs/outputs are plain flat `list[float]` buffers (row-major), matching
 //! the underlying Rust API exactly (no numpy dependency required for this
-//! surface).
+//! surface) — a convention every sibling submodule below follows too.
+//!
+//! The rest of `oximedia.neural`'s surface lives in sibling files, each
+//! registered into this same Python submodule by
+//! [`register_submodule`]: [`crate::neural_attention_py`] (multi-head /
+//! scaled-dot-product / flash attention, positional encodings),
+//! [`crate::neural_recurrent_py`] (GRU / LSTM), [`crate::neural_quant_py`]
+//! (INT`n` quantization), [`crate::neural_layers_py`] (`LinearLayer`,
+//! `Conv2dLayer`, batch norm, pooling), [`crate::neural_graph_py`]
+//! (`Sequential` / `ModelGraph` model builders driven by Python-callable
+//! layers), [`crate::neural_detect_py`] (object/face detection, optical
+//! flow), [`crate::neural_zoo_py`] (`MediaModelZoo` architecture
+//! catalogue), and [`crate::neural_onnx_py`] (ONNX introspection +
+//! execution, with an `onnx`-feature-gated full engine).
 
 use oximedia_neural::{
     FeatureExtractor, NeuralError, SceneClass, SceneClassifier, SrUpscaler, Tensor, ThumbnailRanker,
@@ -22,7 +36,7 @@ use pyo3::prelude::*;
 // Error conversion
 // ---------------------------------------------------------------------------
 
-fn neural_err(err: NeuralError) -> PyErr {
+pub(crate) fn neural_err(err: NeuralError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
@@ -279,21 +293,13 @@ pub fn scene_class_name(idx: usize) -> String {
     format!("{:?}", SceneClass::from_index(idx))
 }
 
-// TODO(0.2.x): expose oximedia_neural::onnx / onnx_backend / onnx_runtime (arbitrary
-// ONNX model loading + graph execution) once a stable Python-facing model-loading API
-// is designed.
-// TODO(0.2.x): expose oximedia_neural::attention (MultiHeadAttention, flash_attention,
-// rotary/sinusoidal positional encodings) for transformer-style pipelines.
-// TODO(0.2.x): expose oximedia_neural::recurrent (GRU/LSTM) sequence layers.
-// TODO(0.2.x): expose oximedia_neural::quantization/quantize (INT8 quantized inference).
-// TODO(0.2.x): expose oximedia_neural::graph (declarative ExecutionGraph/Sequential
-// model-graph builder).
-// TODO(0.2.x): expose oximedia_neural::layers directly (Conv2dLayer, LinearLayer,
-// BatchNorm1d/2d, MaxPool2d/AvgPool2d/GlobalAvgPool) for custom architectures beyond
-// the four built-in media models.
-// TODO(0.2.x): expose oximedia_neural::object_detector / face_detection / optical_flow
-// higher-level media pipelines.
-// TODO(0.2.x): expose oximedia_neural::model_zoo::MediaModelZoo.
+// The neural module families below (ONNX loading/execution, attention,
+// recurrent layers, quantization, declarative graph builders, individual
+// `layers`, object/face/flow detectors, and the model zoo) are implemented
+// as sibling submodules and registered in `register_submodule` below —
+// see `neural_attention_py`, `neural_recurrent_py`, `neural_quant_py`,
+// `neural_graph_py`, `neural_layers_py`, `neural_detect_py`, `neural_onnx_py`,
+// and `neural_zoo_py`.
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -309,6 +315,15 @@ pub fn register_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySrUpscaler>()?;
     m.add_class::<PyFeatureExtractor>()?;
     m.add_function(wrap_pyfunction!(scene_class_name, &m)?)?;
+
+    crate::neural_recurrent_py::register(&m)?;
+    crate::neural_attention_py::register(&m)?;
+    crate::neural_quant_py::register(&m)?;
+    crate::neural_layers_py::register(&m)?;
+    crate::neural_graph_py::register(&m)?;
+    crate::neural_detect_py::register(&m)?;
+    crate::neural_zoo_py::register(&m)?;
+    crate::neural_onnx_py::register(&m)?;
 
     parent.add_submodule(&m)?;
     Ok(())

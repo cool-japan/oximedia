@@ -118,6 +118,9 @@ pub enum TargetPreset {
 
     /// ReplayGain reference: 89 dB SPL ≈ -18 LUFS, -1 dBTP.
     ReplayGain,
+
+    /// TikTok short-form video delivery: -14 LUFS ±1 LU, -1 dBTP.
+    TikTok,
 }
 
 impl TargetPreset {
@@ -126,7 +129,7 @@ impl TargetPreset {
         match self {
             Self::EbuR128 => -23.0,
             Self::AtscA85 => -24.0,
-            Self::Spotify | Self::YouTube | Self::Tidal | Self::AmazonMusic => -14.0,
+            Self::Spotify | Self::YouTube | Self::Tidal | Self::AmazonMusic | Self::TikTok => -14.0,
             Self::AppleMusic | Self::Podcast => -16.0,
             Self::Deezer => -15.0,
             Self::NetflixDrama => -27.0,
@@ -150,7 +153,8 @@ impl TargetPreset {
             | Self::AppleMusic
             | Self::BbcIPlayer
             | Self::Podcast
-            | Self::ReplayGain => -1.0,
+            | Self::ReplayGain
+            | Self::TikTok => -1.0,
             Self::AtscA85
             | Self::NetflixDrama
             | Self::NetflixLoud
@@ -172,7 +176,8 @@ impl TargetPreset {
             | Self::Deezer
             | Self::AppleMusic
             | Self::Podcast
-            | Self::ReplayGain => 1.0,
+            | Self::ReplayGain
+            | Self::TikTok => 1.0,
             Self::AtscA85 | Self::NetflixDrama | Self::NetflixLoud | Self::AmazonPrime => 2.0,
             Self::AmazonMusic => 1.0,
             Self::CdMastering | Self::StreamingMastering => 0.5,
@@ -198,6 +203,7 @@ impl TargetPreset {
             Self::CdMastering => "CD Mastering",
             Self::StreamingMastering => "Streaming Mastering",
             Self::ReplayGain => "ReplayGain",
+            Self::TikTok => "TikTok",
         }
     }
 
@@ -234,6 +240,7 @@ impl TargetPreset {
             Self::AppleMusic | Self::Podcast => Standard::AppleMusic,
             Self::NetflixDrama | Self::NetflixLoud => Standard::Netflix,
             Self::AmazonPrime => Standard::AmazonPrime,
+            Self::TikTok => Standard::TikTok,
             _ => Standard::Custom {
                 target_lufs: self.target_lufs(),
                 max_peak_dbtp: self.max_peak_dbtp(),
@@ -261,6 +268,7 @@ impl TargetPreset {
             Self::CdMastering,
             Self::StreamingMastering,
             Self::ReplayGain,
+            Self::TikTok,
         ]
     }
 }
@@ -320,5 +328,31 @@ mod tests {
         assert!(!presets.is_empty());
         assert!(presets.contains(&TargetPreset::EbuR128));
         assert!(presets.contains(&TargetPreset::Spotify));
+        assert!(presets.contains(&TargetPreset::TikTok));
+    }
+
+    /// TikTok delivery target: -14 LUFS integrated, -1 dBTP ceiling, ±1 LU.
+    #[test]
+    fn test_tiktok_preset() {
+        let preset = TargetPreset::TikTok;
+        assert_eq!(preset.target_lufs(), -14.0);
+        assert_eq!(preset.max_peak_dbtp(), -1.0);
+        assert_eq!(preset.tolerance_lu(), 1.0);
+        assert_eq!(preset.name(), "TikTok");
+
+        let target = preset.to_target();
+        assert_eq!(target.target_lufs, -14.0);
+        assert_eq!(target.max_peak_dbtp, -1.0);
+        assert_eq!(target.tolerance_lu, 1.0);
+        assert_eq!(target.name, "TikTok");
+        assert!(target.is_compliant(-14.5));
+        assert!(!target.is_compliant(-12.0));
+
+        // The metering standard must carry the same numbers.
+        let standard = preset.to_standard();
+        assert_eq!(standard, Standard::TikTok);
+        assert_eq!(standard.target_lufs(), -14.0);
+        assert_eq!(standard.max_true_peak_dbtp(), -1.0);
+        assert_eq!(standard.tolerance_lu(), 1.0);
     }
 }

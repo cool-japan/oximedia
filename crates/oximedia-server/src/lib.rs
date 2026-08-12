@@ -188,6 +188,9 @@ pub mod cdn;
 pub mod dash;
 pub mod dvr;
 pub mod hls;
+/// Depacketizes Enhanced-RTMP ingest into elementary samples plus
+/// container-ready decoder-configuration records.
+pub mod ingest_depacketizer;
 pub mod metrics;
 /// Cursor-based pagination for stable, scalable API responses.
 pub mod pagination;

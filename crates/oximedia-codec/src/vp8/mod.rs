@@ -5,7 +5,7 @@
 //! royalty-free video codec developed by Google as part of the `WebM`
 //! project.
 //!
-//! # Honest status: key frames decode to pixels; inter frames not yet
+//! # Status: key frames and inter frames both decode to pixels
 //!
 //! Key-frame (intra) decoding is **fully implemented**: `Vp8Decoder`
 //! reconstructs real YUV 4:2:0 pixels via the complete RFC 6386 intra
@@ -18,11 +18,18 @@
 //! `oximedia-image` WebP/VP8 decoder (a WebP lossy image *is* a VP8 key
 //! frame).
 //!
-//! Inter frames (P-frames) need motion-vector entropy decoding and
-//! golden/altref reference-frame management, which are **not implemented**;
-//! `Vp8Decoder::send_packet` returns an honest
-//! [`CodecError`](crate::error::CodecError)`::UnsupportedFeature` error for
-//! them instead of fabricating pixel data.
+//! Inter frames (P-frames) are **also fully implemented**, on top of that
+//! same pipeline: per-macroblock prediction records and the near-motion-
+//! vector survey (§16), motion-vector entropy decoding (§17), sub-pixel
+//! motion compensation (§18), and last/golden/altref reference-frame
+//! management with the cross-frame entropy, segmentation and loop-filter
+//! state an inter frame inherits (§9.3-§9.10). Both frame types are
+//! verified bit-exact against libvpx on multi-frame conformance streams
+//! (see `docs/codec_status.md`).
+//!
+//! A frame coded with `show_frame == 0` (an invisible alternate-reference
+//! frame) is decoded and updates the reference buffers, but is never
+//! emitted: `send_packet` returns `Ok(())` and queues nothing.
 //!
 //! This module also exposes standalone primitives (boolean decoder,
 //! DCT/WHT transforms, prediction, motion-compensation and loop-filter
@@ -76,10 +83,11 @@
 //! assert_eq!(decoder.dimensions(), Some((320, 240)));
 //! assert!(decoder.receive_frame()?.is_none());
 //!
-//! // Inter frames are not implemented yet: honest error, no fake frames.
+//! // An inter frame needs reference frames: with no key frame decoded
+//! // there are none, so it errors honestly rather than inventing pixels.
 //! let inter = [0x11, 0x00, 0x00, 0x00];
 //! let result = decoder.send_packet(&inter, 1);
-//! assert!(matches!(result, Err(CodecError::UnsupportedFeature(_))));
+//! assert!(matches!(result, Err(CodecError::InvalidBitstream(_))));
 //! # Ok(())
 //! # }
 //! ```
@@ -91,14 +99,29 @@
 
 mod bool_decoder;
 mod dct;
+mod dec;
 mod decoder;
 mod encoder;
 mod frame_header;
-mod keyframe;
 mod loopfilter;
 mod mb_mode;
 mod motion;
 mod prediction;
+
+/// Crate-internal re-export of the *sequence* (key + inter frame) decode
+/// entry point, for the same path-visibility reason as the line above.
+pub(crate) use dec::Vp8SequenceDecoder;
+/// Crate-internal re-export of the key-frame decode entry point and its
+/// output type. `dec` is a private submodule, so — even though
+/// `dec::decode_keyframe`/`dec::DecodedImage` are themselves declared
+/// `pub(crate)` — sibling modules outside `vp8` (e.g. `crate::webp`, which
+/// wires a lossy WebP `VP8 ` chunk to this same decoder: a lossy WebP image
+/// *is* a VP8 key frame per RFC 6386) cannot name `crate::vp8::dec::...`
+/// directly, because path resolution requires every segment to be visible
+/// from the call site, and `dec` itself is not. This re-export fixes only
+/// that path-visibility gap; it does not change what is public API (still
+/// `pub(crate)`, not `pub`).
+pub(crate) use dec::{decode_keyframe, DecodedImage};
 
 pub use bool_decoder::BoolDecoder;
 pub use dct::{dequantize_block, dequantize_coeff, idct4x4, iwht4x4, Block4x4, PixelBlock4x4};
@@ -109,9 +132,16 @@ pub use loopfilter::{
     calculate_filter_params, filter_horizontal_edge, filter_vertical_edge, LoopFilterConfig,
     MAX_LOOP_FILTER, MAX_SHARPNESS,
 };
+// `mb_mode` and `motion` are deprecated (0.2.1, defective early seeds
+// superseded by the internal RFC 6386 pipeline behind `Vp8Decoder`; see
+// their module docs). Re-exporting a deprecated item from a non-deprecated
+// `pub use` still names it, so this internal reference site needs a
+// targeted allow.
+#[allow(deprecated)]
 pub use mb_mode::{
     ChromaMode, InterMode, IntraMode16, IntraMode4, MacroblockType, PartitionType, RefFrame,
     NUM_CHROMA_MODES, NUM_I16_MODES, NUM_I4_MODES, NUM_MV_MODES,
 };
+#[allow(deprecated)]
 pub use motion::{clamp_mv, motion_compensate, MotionVector};
 pub use prediction::{predict_chroma, predict_intra_16x16, predict_intra_4x4};

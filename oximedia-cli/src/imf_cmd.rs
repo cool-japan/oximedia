@@ -266,10 +266,12 @@ fn run_package(
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build IMF package: {e}"))?;
 
-    println!("{}", "IMF Package Created".green().bold());
-    println!("  Output: {}", output.display());
-    println!("  Title:  {title}");
-    println!("  Rate:   {edit_rate}");
+    if !crate::progress::is_quiet() {
+        println!("{}", "IMF Package Created".green().bold());
+        println!("  Output: {}", output.display());
+        println!("  Title:  {title}");
+        println!("  Rate:   {edit_rate}");
+    }
     Ok(())
 }
 
@@ -371,7 +373,7 @@ fn run_extract(
             "sequences_matched": extracted_count,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "IMF Track Extraction".green().bold());
         println!("  Input:  {}", input.display());
         println!("  Output: {}", output.display());
@@ -408,7 +410,7 @@ fn run_create(
             "status": "created",
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "IMF Composition Created".green().bold());
         println!("  Output:  {}", output.display());
         println!("  Title:   {title}");

@@ -1,6 +1,6 @@
 # oximedia-profiler
 
-**Status: [Stable]** | Version: 0.2.0 | Tests: extensively tested | Updated: 2026-07-14
+**Status: [Stable]** | Version: 0.2.1 | Tests: extensively tested | Updated: 2026-08-12
 
 Performance profiling and optimization tools for OxiMedia. Provides comprehensive profiling capabilities including CPU, memory, GPU, frame timing, bottleneck detection, cache analysis, and flame graph generation.
 
@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-profiler = "0.1.9"
+oximedia-profiler = "0.2.0"
 ```
 
 ```rust

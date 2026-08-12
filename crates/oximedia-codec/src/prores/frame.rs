@@ -38,6 +38,12 @@ pub enum FrameError {
     /// Frame header declared an interlace_mode value the spec doesn't define.
     #[error("invalid ProRes interlace_mode code: {0}")]
     BadInterlaceMode(u8),
+
+    /// Slice header declared a `quant_scale` outside the spec-defined
+    /// range. RDD 36 §6.5.3 defines `quant_scale` as an 8-bit field whose
+    /// valid range is 1..=224 (0 and 225..=255 are reserved / unused).
+    #[error("invalid ProRes quant_scale: {0} (valid range per RDD 36 §6.5.3 is 1..=224)")]
+    BadQuantScale(u8),
 }
 
 /// Outer ProRes frame container: 4-byte size + 'icpf' + frame payload.

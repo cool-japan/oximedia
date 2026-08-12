@@ -135,6 +135,8 @@ mod builder;
 mod codec_config;
 pub mod codec_dispatch;
 pub mod codec_mapping;
+#[cfg(not(target_arch = "wasm32"))]
+mod container_audio;
 pub mod crf_optimizer;
 mod filters;
 pub mod flac_bitstream;

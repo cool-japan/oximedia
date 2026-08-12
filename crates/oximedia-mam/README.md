@@ -1,9 +1,9 @@
 # oximedia-mam
 
 ![Status: Stable](https://img.shields.io/badge/status-stable-green)
-![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-blue)
+![Version: 0.2.1](https://img.shields.io/badge/version-0.2.1-blue)
 ![Tests: 983](https://img.shields.io/badge/tests-983-brightgreen)
-![Updated: 2026-07-14](https://img.shields.io/badge/updated-2026--07--14-blue)
+![Updated: 2026-08-12](https://img.shields.io/badge/updated-2026--08--12-blue)
 
 Media Asset Management (MAM) system for OxiMedia, providing PostgreSQL-backed asset storage, full-text search, workflow engines, and comprehensive media library management.
 
@@ -41,7 +41,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-mam = "0.1.9"
+oximedia-mam = "0.2.0"
 ```
 
 ```rust

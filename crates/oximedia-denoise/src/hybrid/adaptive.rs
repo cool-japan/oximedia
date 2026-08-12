@@ -42,7 +42,7 @@ pub fn adaptive_denoise(frame: &VideoFrame, strength: f32) -> DenoiseResult<Vide
 
             adaptive_filter_plane(
                 input_plane.data.as_ref(),
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 &activity_map,
                 width as usize,
                 height as usize,

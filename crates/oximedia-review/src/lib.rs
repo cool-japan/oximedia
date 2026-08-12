@@ -100,6 +100,7 @@ pub mod review_tag;
 pub mod review_template;
 pub mod session;
 pub mod status;
+pub mod store;
 pub mod task;
 pub mod timeline_note;
 pub mod version;
@@ -115,6 +116,7 @@ pub use compare::{
 };
 pub use error::{ReviewError, ReviewResult};
 pub use session::ReviewSession;
+pub use store::{set_default_store, ReviewStore};
 pub use timeline_note::{NoteType, TimeRange, TimelineNote, TimelineNoteCollection};
 
 /// Unique identifier for a review session.
@@ -147,6 +149,14 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+impl std::str::FromStr for SessionId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
+    }
+}
+
 /// Unique identifier for a comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommentId(Uuid);
@@ -174,6 +184,14 @@ impl Default for CommentId {
 impl std::fmt::Display for CommentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for CommentId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
     }
 }
 
@@ -237,6 +255,14 @@ impl std::fmt::Display for TaskId {
     }
 }
 
+impl std::str::FromStr for TaskId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
+    }
+}
+
 /// Unique identifier for a version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VersionId(Uuid);
@@ -264,6 +290,14 @@ impl Default for VersionId {
 impl std::fmt::Display for VersionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for VersionId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
     }
 }
 
@@ -443,6 +477,30 @@ mod tests {
         let id1 = CommentId::new();
         let id2 = CommentId::new();
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_id_from_str_roundtrip() {
+        let session_id = SessionId::new();
+        let parsed: SessionId = session_id.to_string().parse().expect("should parse");
+        assert_eq!(session_id, parsed);
+
+        let comment_id = CommentId::new();
+        let parsed: CommentId = comment_id.to_string().parse().expect("should parse");
+        assert_eq!(comment_id, parsed);
+
+        let task_id = TaskId::new();
+        let parsed: TaskId = task_id.to_string().parse().expect("should parse");
+        assert_eq!(task_id, parsed);
+
+        let version_id = VersionId::new();
+        let parsed: VersionId = version_id.to_string().parse().expect("should parse");
+        assert_eq!(version_id, parsed);
+    }
+
+    #[test]
+    fn test_id_from_str_rejects_garbage() {
+        assert!("not-a-uuid".parse::<SessionId>().is_err());
     }
 
     #[test]

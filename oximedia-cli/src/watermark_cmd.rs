@@ -137,7 +137,7 @@ fn cmd_embed(
             "samples_processed": watermarked.len(),
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!(
             "{} Watermark embedded: {} -> {}",
             "OK".green().bold(),

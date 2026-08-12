@@ -1,6 +1,6 @@
 # oximedia-neural
 
-**Status: [Stable]** | Version: 0.2.0 | Tests: extensively tested | Updated: 2026-07-14
+**Status: [Stable]** | Version: 0.2.1 | Tests: extensively tested | Updated: 2026-08-12
 
 Lightweight neural network inference for media processing — pure Rust tensor ops, conv2d, and pre-defined media models
 
@@ -24,7 +24,7 @@ Part of the [OxiMedia](https://github.com/cool-japan/oximedia) sovereign media f
 
 ```toml
 [dependencies]
-oximedia-neural = "0.1.9"
+oximedia-neural = "0.2.0"
 ```
 
 ```rust

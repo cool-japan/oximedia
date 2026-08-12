@@ -70,7 +70,7 @@ fn spatial_box_filter(frame: &VideoFrame, strength: f32) -> DenoiseResult<VideoF
 
             box_filter_plane(
                 input_plane.data.as_ref(),
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,

@@ -4,7 +4,7 @@
 
 Part of the [OxiMedia](https://github.com/cool-japan/oximedia) multimedia framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 ## Features
 
@@ -22,7 +22,7 @@ Version: 0.2.0 — 2026-07-15 — extensively tested
 
 ```toml
 [dependencies]
-oximedia-bitstream = { version = "0.1.9" }
+oximedia-bitstream = { version = "0.2.0" }
 ```
 
 ### Reading bits

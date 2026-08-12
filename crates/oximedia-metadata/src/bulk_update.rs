@@ -487,6 +487,23 @@ fn detect_embeddable_format(data: &[u8]) -> Option<MetadataFormat> {
     if data.len() >= 8 && &data[0..8] == b"APETAGEX" {
         return Some(MetadataFormat::Apev2);
     }
+    // Container formats whose tag vocabulary is free-form name/value pairs, so
+    // the engine's arbitrary keys map onto them directly. `crate::embed` splices
+    // all three container-aware (FLAC metadata blocks, Ogg comment-packet
+    // re-lacing, EBML `Tags`).
+    if data.len() >= 4 && &data[0..4] == b"fLaC" {
+        return Some(MetadataFormat::VorbisComments);
+    }
+    if data.len() >= 4 && &data[0..4] == b"OggS" {
+        return Some(MetadataFormat::VorbisComments);
+    }
+    if data.len() >= 4 && data[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        return Some(MetadataFormat::Matroska);
+    }
+    // JPEG is deliberately absent: its bytes alone do not say whether the caller
+    // means Exif, XMP or IPTC, and guessing one would write the tags where the
+    // caller cannot find them. MP4 is absent because iTunes atom names are
+    // four-byte identifiers that these free-form keys do not map onto.
     None
 }
 
@@ -530,6 +547,15 @@ fn data_to_metadata(data: &HashMap<String, String>, format: MetadataFormat) -> M
                 // writer enforces the 4-char frame ID constraint.
                 _ => continue,
             }
+        } else if matches!(
+            format,
+            MetadataFormat::VorbisComments | MetadataFormat::Matroska
+        ) {
+            // Vorbis comments and Matroska `SimpleTag` names are conventionally
+            // uppercase (TITLE, ARTIST, …), and the Vorbis reader upper-cases
+            // field names on parse, so writing them uppercase keeps a write →
+            // read round-trip key-stable.
+            k.to_uppercase()
         } else {
             k.clone()
         };
@@ -784,6 +810,65 @@ mod tests {
         assert!(r.error.is_some(), "error field should be populated");
 
         // Cleanup
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_bulk_write_embed_flac_writes_a_real_comment_block() {
+        use std::fs;
+
+        // A minimal but well-formed FLAC stream: "fLaC" + a last STREAMINFO
+        // block + opaque audio frames.
+        let mut flac = b"fLaC".to_vec();
+        flac.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]); // last block, STREAMINFO, 34 bytes
+        flac.extend_from_slice(&[0u8; 34]);
+        flac.extend_from_slice(b"AUDIOFRAMES");
+
+        let tmp = std::env::temp_dir().join("oximedia_bulk_write_embed_flac");
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        let path = tmp.join("track.flac");
+        fs::write(&path, &flac).expect("write flac fixture");
+
+        let mut data = HashMap::new();
+        data.insert("title".to_string(), "Bulk Embedded".to_string());
+        let engine = BulkUpdateEngine::with_data(data);
+
+        let results = engine.write_batch(&[path.as_path()], BulkWriteMode::Embed);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].success,
+            "FLAC embed should succeed: {:?}",
+            results[0].error
+        );
+
+        // The file on disk must now carry a readable VORBIS_COMMENT block, and
+        // its audio frames must be untouched.
+        let written = fs::read(&path).expect("read patched flac");
+        assert!(written.ends_with(b"AUDIOFRAMES"));
+        let mut pos = 4usize;
+        let mut comment_block = None;
+        loop {
+            let is_last = written[pos] & 0x80 != 0;
+            let block_type = written[pos] & 0x7F;
+            let len = (usize::from(written[pos + 1]) << 16)
+                | (usize::from(written[pos + 2]) << 8)
+                | usize::from(written[pos + 3]);
+            if block_type == 4 {
+                comment_block = Some(written[pos + 4..pos + 4 + len].to_vec());
+            }
+            pos += 4 + len;
+            if is_last {
+                break;
+            }
+        }
+        let comment_block = comment_block.expect("VORBIS_COMMENT block present");
+        let parsed = crate::vorbis::parse(&comment_block).expect("parse comment block");
+        assert_eq!(
+            parsed.get("TITLE").and_then(MetadataValue::as_text),
+            Some("Bulk Embedded"),
+            "free-form keys must be written uppercase so the reader finds them"
+        );
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

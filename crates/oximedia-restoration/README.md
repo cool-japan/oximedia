@@ -1,13 +1,13 @@
 # oximedia-restoration
 
 ![Status: Stable](https://img.shields.io/badge/status-stable-green)
-![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-blue)
+![Version: 0.2.1](https://img.shields.io/badge/version-0.2.1-blue)
 
 Image restoration algorithms for OxiMedia: blind deconvolution and content-aware inpainting.
 
 Part of the [oximedia](https://github.com/cool-japan/oximedia) workspace — a comprehensive pure-Rust media processing framework.
 
-Version: 0.2.0 — 2026-07-15 — 6 tests
+Version: 0.2.1 — 2026-08-12 — 6 tests
 
 > Note: this crate is distinct from `oximedia-restore`, which covers audio/video
 > *artifact* restoration (click removal, hum removal, deband, dropout fix, etc.).
@@ -35,7 +35,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-restoration = "0.1.9"
+oximedia-restoration = "0.2.0"
 ```
 
 ```rust

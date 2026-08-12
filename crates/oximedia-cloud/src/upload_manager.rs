@@ -458,22 +458,23 @@ where
     E: Send,
 {
     let concurrency = concurrency.max(1);
-    let pool = rayon::ThreadPoolBuilder::new()
+    match rayon::ThreadPoolBuilder::new()
         .num_threads(concurrency)
         .build()
-        .unwrap_or_else(|_| {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .expect("rayon default pool must be creatable")
-        });
-
-    pool.install(|| {
-        parts
-            .par_chunks(1)
-            .map(|chunk| upload_fn(&chunk[0]))
-            .collect()
-    })
+    {
+        Ok(pool) => pool.install(|| {
+            parts
+                .par_chunks(1)
+                .map(|chunk| upload_fn(&chunk[0]))
+                .collect()
+        }),
+        Err(_) => {
+            // Thread pool creation failed (e.g. OS resource exhaustion) —
+            // fall back to sequential execution instead of requiring a
+            // second pool-creation attempt to succeed.
+            parts.iter().map(|p| upload_fn(p)).collect()
+        }
+    }
 }
 
 #[cfg(test)]

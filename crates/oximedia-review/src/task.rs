@@ -113,7 +113,7 @@ pub async fn create_task(
 ) -> ReviewResult<Task> {
     let now = Utc::now();
 
-    Ok(Task {
+    let task = Task {
         id: TaskId::new(),
         session_id,
         title,
@@ -126,7 +126,11 @@ pub async fn create_task(
         created_at: now,
         updated_at: now,
         completed_at: None,
-    })
+    };
+
+    let store = crate::store::default_store().await?;
+    store.insert_task(&task).await?;
+    Ok(task)
 }
 
 /// List tasks for a session.
@@ -135,9 +139,8 @@ pub async fn create_task(
 ///
 /// Returns error if listing fails.
 pub async fn list_tasks(session_id: SessionId) -> ReviewResult<Vec<Task>> {
-    // In a real implementation, this would query database
-    let _ = session_id;
-    Ok(Vec::new())
+    let store = crate::store::default_store().await?;
+    store.list_tasks_by_session(session_id).await
 }
 
 #[cfg(test)]

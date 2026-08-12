@@ -128,6 +128,7 @@ oximedia-caption-gen = { workspace = true, optional = true }
 oximedia-image-transform = { workspace = true, optional = true }
 oximedia-pipeline = { workspace = true, optional = true }
 oximedia-ml = { workspace = true, optional = true }
+oximedia-capture = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -156,7 +157,12 @@ streaming-stack = ["net", "packager", "drm", "stream", "cdn", "cache", "server"]
 audio = ["dep:oximedia-audio"]
 
 ## Enable video codec support (AV1, VP9, VP8)
-video = ["dep:oximedia-codec"]
+##
+## The workspace pins `oximedia-codec` with `default-features = false`, so the
+## facade must forward the codec sub-features explicitly (every other
+## workspace consumer does the same); without this list the feature would
+## compile but reach zero codecs.
+video = ["dep:oximedia-codec", "oximedia-codec/av1", "oximedia-codec/vp9", "oximedia-codec/vp8"]
 
 ## Enable filter graph pipeline
 graph = ["dep:oximedia-graph"]
@@ -467,6 +473,16 @@ ml-face-embedder = ["ml", "oximedia-ml/face-embedder"]
 ## ML runtime: enable the pure-Rust ONNX inference backend
 ml-onnx = ["ml", "oximedia-ml/onnx"]
 
+## Enable Pure-Rust live camera/device capture (AVFoundation on macOS, V4L2 on
+## Linux, Media Foundation on Windows; raw pixel formats + MJPEG passthrough,
+## never an encumbered codec). See `oximedia-capture`'s own README for the
+## per-platform verification status.
+capture = ["dep:oximedia-capture"]
+
+## Enable the Tokio-native async receive path of `capture`
+## (`CaptureStream::into_async`); forwards `oximedia-capture/tokio`.
+capture-tokio = ["capture", "oximedia-capture/tokio"]
+
 ## Enable Motion JPEG (MJPEG) intra-frame video codec
 mjpeg = ["dep:oximedia-codec", "oximedia-codec/mjpeg"]
 
@@ -581,6 +597,7 @@ full = [
     "ml-aesthetic-score",
     "ml-object-detector",
     "ml-face-embedder",
+    "capture",
     "mjpeg",
     "apv",
 ]

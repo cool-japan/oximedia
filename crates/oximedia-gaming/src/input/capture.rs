@@ -1,6 +1,6 @@
 //! Input device capture.
 
-use crate::GamingResult;
+use crate::{GamingError, GamingResult};
 
 /// Input capture for keyboard and mouse.
 pub struct InputCapture {
@@ -75,8 +75,26 @@ impl InputCapture {
     }
 
     /// Poll for input events.
+    ///
+    /// Real keyboard/mouse capture requires an OS-level input hook (Win32
+    /// `SetWindowsHookEx`, macOS `CGEventTap`, Linux `evdev`/libinput, ...).
+    /// This crate has no such hook wired up anywhere -- `capture::hooks`
+    /// only covers screen-capture region/FPS/pre-post-capture hooks, an
+    /// unrelated concept despite the similar name -- so there is no
+    /// event-source machinery here to poll. Returning `Ok(vec![])` would
+    /// misrepresent "no hook exists" as "no input happened".
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`GamingError::UnsupportedPlatform`] until an OS
+    /// input-hook backend is implemented.
     pub fn poll_events(&self) -> GamingResult<Vec<InputEvent>> {
-        Ok(Vec::new())
+        Err(GamingError::UnsupportedPlatform(
+            "input capture requires an OS-level keyboard/mouse event hook; oximedia-gaming does \
+             not implement one (Win32 SetWindowsHookEx / macOS CGEventTap / Linux evdev are all \
+             unimplemented)"
+                .to_string(),
+        ))
     }
 }
 
@@ -104,5 +122,18 @@ mod tests {
         assert!(!capture.keyboard_enabled);
         capture.enable_keyboard();
         assert!(capture.keyboard_enabled);
+    }
+
+    #[test]
+    fn test_poll_events_is_honest_unsupported_err() {
+        let capture = InputCapture::new();
+        let result = capture.poll_events();
+        assert!(
+            matches!(result, Err(GamingError::UnsupportedPlatform(_))),
+            "poll_events must not fabricate Ok(vec![]) when no OS input hook exists"
+        );
+        let err = result.expect_err("checked above");
+        let message = err.to_string();
+        assert!(message.contains("event hook"), "message: {message}");
     }
 }

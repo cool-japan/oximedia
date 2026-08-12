@@ -12,6 +12,18 @@ use oximedia_cache::lru_cache::{CacheStats, LruCache};
 use pyo3::prelude::*;
 use std::time::Duration;
 
+// Family submodules — each owns a `register(m)` that adds its classes and
+// functions directly into the `oximedia.cache` Python namespace built by
+// `register_submodule` below. Living under `cache_py/` (Rust 2018+ file
+// module + sibling directory) keeps every family's binding code out of this
+// file without requiring any change to `lib.rs`.
+mod bloom;
+mod content_aware_write_behind;
+mod distributed;
+mod eviction;
+mod tiered;
+mod warming;
+
 // ---------------------------------------------------------------------------
 // LruCache
 // ---------------------------------------------------------------------------
@@ -211,20 +223,15 @@ impl PyCacheStats {
     }
 }
 
-// TODO(0.2.x): expose oximedia_cache::tiered_cache (multi-tier L1/L2/disk cache with
-// pluggable eviction policies, compression, and automatic promotion).
-// TODO(0.2.x): expose oximedia_cache::bloom_filter (standard / counting / scalable
-// probabilistic membership filters).
-// TODO(0.2.x): expose oximedia_cache::distributed_cache (consistent-hash ring,
-// per-node client, quorum replication).
-// TODO(0.2.x): expose oximedia_cache::cache_warming (access-pattern-driven predictive
-// warmup planning).
-// TODO(0.2.x): expose oximedia_cache::eviction_policies (standalone LFU / TinyLFU /
-// ARC ghost-list trackers) and oximedia_cache::two_queue (2Q scan-resistant policy).
-// TODO(0.2.x): expose oximedia_cache::content_aware_cache, write_behind_cache,
-// sharded_lru, cache_partitioning, cache_serialization, slab_allocator, prefetch,
-// cache_metrics, admission_filter, adaptive, negative, segment_cache, weighted_cache,
-// write_through, and tier_compressor.
+// Bound in `cache_py/`: tiered_cache (`tiered`), bloom_filter (`bloom`),
+// distributed_cache (`distributed`), cache_warming (`warming`),
+// eviction_policies (`eviction`), content_aware_cache + write_behind_cache
+// (`content_aware_write_behind`).
+//
+// TODO(0.2.x): expose oximedia_cache::two_queue (2Q scan-resistant policy),
+// sharded_lru, cache_partitioning, cache_serialization, slab_allocator,
+// prefetch, cache_metrics, admission_filter, adaptive, negative,
+// segment_cache, weighted_cache, write_through, and tier_compressor.
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -236,6 +243,14 @@ pub fn register_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PyLruCache>()?;
     m.add_class::<PyCacheStats>()?;
+
+    // Family submodules (each adds its own classes/functions into `m`).
+    tiered::register(&m)?;
+    bloom::register(&m)?;
+    distributed::register(&m)?;
+    warming::register(&m)?;
+    eviction::register(&m)?;
+    content_aware_write_behind::register(&m)?;
 
     parent.add_submodule(&m)?;
     Ok(())

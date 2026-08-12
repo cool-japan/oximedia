@@ -20,10 +20,16 @@ pub enum ProgressFormat {
 
 /// Process-wide `--quiet` state.
 ///
-/// When set, status/banner printers (transcode plan and summary, extract
-/// plan, image status output) suppress their human-oriented stdout text.
-/// Command *results* — probe data, analysis values, `--json` / `--ndjson`
-/// payloads — are never suppressed, and errors always go to stderr.
+/// When set, status/banner printers across most subcommand handlers (plans,
+/// completion summaries, and other decoration around action commands —
+/// transcode plan/summary, extract plan, image status, archive-pro
+/// ingest/migrate/report, cloud upload/download, collab create/join/.../
+/// export, distributed start-coordinator/start-worker/submit/cancel, drm
+/// encrypt/decrypt/keys-generate, edl export, and more) suppress their
+/// human-oriented stdout text. Command *results* — probe data, analysis
+/// values, query/report output (info/status/list/verify/validate/...),
+/// `--json` / `--ndjson` payloads — are never suppressed, and errors always
+/// go to stderr.
 static QUIET: AtomicBool = AtomicBool::new(false);
 
 /// Record the global `--quiet` flag. Called once from each binary's `main`.
@@ -32,9 +38,17 @@ pub fn set_quiet(quiet: bool) {
 }
 
 /// Whether `--quiet` was passed; status/banner printers consult this.
-// TODO(0.2.x): sweep the remaining subcommand handlers (~50 files print
-// decorative banners with bare `println!`) to consult `is_quiet()`; today
-// the guarantee covers logging + transcode/extract/image status output.
+///
+/// SLICE 4F (0.2.x) swept most subcommand handlers' action-command banners
+/// (create/ingest/migrate/upload/export/submit/... — anything whose real
+/// deliverable is a side effect, not the printed text) onto this mechanism.
+/// Query/report commands (info/status/list/verify/validate/...)
+/// deliberately print unconditionally: their text *is* the requested
+/// result, not decoration, so `--quiet` must not touch it (see the module
+/// doc above). Nine frame-harness-territory handlers were left for a later
+/// pass: `scaling_cmd.rs`, `denoise_cmd.rs`, `stabilize_cmd.rs`,
+/// `multicam_cmd.rs`, `subtitle_cmd.rs`, `timecode_cmd.rs`,
+/// `captions_cmd.rs`, `restore_cmd.rs`, `transcode.rs`.
 pub fn is_quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
 }

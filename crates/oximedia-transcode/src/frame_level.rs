@@ -13,27 +13,50 @@
 //! # Support matrix (everything else returns a descriptive error — output
 //! is never fabricated)
 //!
-//! | Input          | Target codec       | Output container        |
-//! |----------------|--------------------|-------------------------|
-//! | WAV, FLAC      | FLAC               | `.flac`, `.mka`/`.mkv`  |
-//! | WAV, FLAC      | PCM (s16le)        | `.wav`, `.mka`/`.mkv`   |
-//! | WAV, FLAC      | ALAC               | `.caf`                  |
-//! | Y4M (4:2:0)    | MJPEG              | `.mkv` (`V_MJPEG`)      |
-//! | Y4M (4:2:0)    | APV                | `.mkv` (VFW/`apv1`)     |
-//! | Y4M (4:2:0)    | MPEG-2 (intra)     | `.m2v`/`.mpg` (raw ES)  |
-//! | Y4M (4:2:0)    | rawvideo           | `.y4m`                  |
+//! | Input                    | Target codec       | Output container        |
+//! |---------------------------|--------------------|-------------------------|
+//! | WAV, FLAC                 | FLAC               | `.flac`, `.mka`/`.mkv`  |
+//! | WAV, FLAC                 | PCM (s16le)        | `.wav`, `.mka`/`.mkv`   |
+//! | WAV, FLAC                 | ALAC               | `.caf`                  |
+//! | Matroska/WebM, Ogg (audio track: FLAC/PCM only — see [`crate::container_audio`]) | FLAC | `.flac`, `.mka`/`.mkv` |
+//! | Matroska/WebM, Ogg (as above) | PCM (s16le)    | `.wav`, `.mka`/`.mkv`   |
+//! | Matroska/WebM, Ogg (as above) | ALAC           | `.caf`                  |
+//! | Y4M (4:2:0)                | MJPEG              | `.mkv` (`V_MJPEG`)      |
+//! | Y4M (4:2:0)                | APV                | `.mkv` (VFW/`apv1`)     |
+//! | Y4M (4:2:0)                | MPEG-2 (intra)     | `.m2v`/`.mpg` (raw ES)  |
+//! | Y4M (4:2:0)                | FFV1 (lossless)    | `.ffv1` (crate-private raw framing — see [`crate::raw_sinks::Ffv1RawFileMuxer`], not readable by other tools) |
+//! | Y4M (4:2:0)                | rawvideo           | `.y4m`                  |
+//! | `.ffv1` (this crate's own raw framing, sniffed by magic — see [`is_raw_ffv1_file`]) | rawvideo (tested end-to-end); MJPEG/APV/MPEG-2/FFV1 reachable via the same dispatch but not covered by a test | same as the Y4M row above |
 //!
-//! AV1/VP9/VP8/Opus/Vorbis/AAC/MP3 encode, FFV1/ProRes muxing, and
-//! re-encoding from Matroska/Ogg inputs are not wired yet; each failure
-//! names the codec and the reason.
+//! The last row is the FFV1 *decode* leg: a `.ffv1` file this engine wrote
+//! is a real, engine-reachable video *input* too — [`execute_frame_level`]
+//! sniffs the private magic ahead of container detection (there is no
+//! [`ContainerFormat`] variant for it) and feeds
+//! [`crate::frame_adapters::Ffv1FrameDecoder`] through the exact same
+//! [`execute_video_job`] path Y4M input uses, so `-> .y4m` is a real decode
+//! through the public entry point, not just something a test can reach by
+//! driving the adapter directly. Every other video target is reachable from
+//! this input through that same dispatch (it is the identical
+//! `Box<dyn FrameDecoder>` the Y4M path uses downstream of `open_video_source`),
+//! but only the `-> .y4m` leg has a test exercising it.
+//!
+//! AV1/VP9/VP8/Opus/Vorbis/AAC/MP3 encode are not wired yet (no verified
+//! encoder). ProRes stays honest-`Err` for three independent reasons (see
+//! the `VideoTarget::ProRes` arm of [`execute_video_job`]): no genuine
+//! 10-bit source in this pipeline, no 10-bit decoder output API, and a
+//! decoder robustness gap on high-contrast content. Video re-encoding out
+//! of Matroska/WebM/Ogg (e.g. MKV/`V_MJPEG`) is not wired — only their
+//! audio track is. Every failure names the codec and the reason.
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::io::Read as _;
 use std::path::Path;
 
 use crate::audio_adapters::{FlacFrameEncoder, PcmBufferFrameDecoder, PcmFrameEncoder};
 use crate::frame_adapters::{
-    CodecVideoFrameEncoder, FpsResamplingDecoder, RawVideoFrameEncoder, Y4mFrameDecoder,
+    CodecVideoFrameEncoder, Ffv1FrameDecoder, FpsResamplingDecoder, RawVideoFrameEncoder,
+    Y4mFrameDecoder,
 };
 use crate::multi_track::{MultiTrackExecutor, MultiTrackStats, PerTrack};
 use crate::pipeline_context::{FilterGraph, Frame, FrameDecoder};
@@ -102,12 +125,15 @@ fn parse_audio_target(name: Option<&str>) -> Result<AudioTarget> {
         "flac" => Ok(AudioTarget::Flac),
         "pcm" | "pcm_s16le" | "wav" => Ok(AudioTarget::Pcm),
         "alac" => Ok(AudioTarget::Alac),
-        // TODO(0.2.x): re-enable Opus once a reference-verified encoder
-        // exists — both current workspace Opus encoders fail external
-        // decoder verification (see audio_adapters.rs).
+        // TODO(0.2.x): re-enable Opus once a reference-verified encoder AND
+        // decoder exist — empirically verified this session: the encoder's
+        // output is unverified against any reference decoder, and the
+        // decoder fails to reconstruct real-world CELT packets (decodes
+        // them to silence). Neither side of the codec is trustworthy yet.
         "opus" | "libopus" => Err(TranscodeError::Unsupported(
-            "Opus encoding is not yet supported for transcode (no encoder \
-             in this build passes reference-decoder verification); \
+            "Opus is not supported for transcode: the encoder in this build \
+             has not passed reference-decoder verification, and the decoder \
+             fails to reconstruct real CELT packets (decodes to silence); \
              supported audio codecs: flac, pcm, alac"
                 .into(),
         )),
@@ -148,21 +174,21 @@ fn parse_video_target(name: Option<&str>) -> Result<VideoTarget> {
         "rawvideo" | "raw" | "yuv420p" => Ok(VideoTarget::Raw),
         "av1" | "libaom-av1" => Err(TranscodeError::Unsupported(
             "AV1 encoding does not produce real output yet (planned for 0.2.x); \
-             supported video codecs: mjpeg, apv, mpeg2, rawvideo"
+             supported video codecs: mjpeg, apv, mpeg2, ffv1, rawvideo"
                 .into(),
         )),
         "vp9" | "libvpx-vp9" => Err(TranscodeError::Unsupported(
             "VP9 encoding is not yet supported for transcode; \
-             supported video codecs: mjpeg, apv, mpeg2, rawvideo"
+             supported video codecs: mjpeg, apv, mpeg2, ffv1, rawvideo"
                 .into(),
         )),
         "vp8" | "libvpx" => Err(TranscodeError::Unsupported(
             "VP8 encoding is not yet supported for transcode; \
-             supported video codecs: mjpeg, apv, mpeg2, rawvideo"
+             supported video codecs: mjpeg, apv, mpeg2, ffv1, rawvideo"
                 .into(),
         )),
         other => Err(TranscodeError::Unsupported(format!(
-            "unknown video codec '{other}'; supported: mjpeg, apv, mpeg2, rawvideo"
+            "unknown video codec '{other}'; supported: mjpeg, apv, mpeg2, ffv1, rawvideo"
         ))),
     }
 }
@@ -179,6 +205,27 @@ pub(crate) async fn execute_frame_level(
 ) -> Result<FrameLevelStats> {
     let audio_target = parse_audio_target(config.audio_codec.as_deref())?;
     let video_target = parse_video_target(config.video_codec.as_deref())?;
+
+    // This crate's own private raw-FFV1 framing (see
+    // `raw_sinks::Ffv1RawFileMuxer`) is not a real container:
+    // `oximedia_container::probe_format` has no entry for it, so
+    // `crate::pipeline::detect_format` would otherwise fail on it with a
+    // generic "unknown format" error before this function's own dispatch
+    // ever runs. Sniffed here, ahead of `detect_format`, and routed
+    // through the same video-job path Y4M input uses — this is what makes
+    // FFV1 *decode* (`frame_adapters::Ffv1FrameDecoder`) reachable through
+    // this engine entry point, not just from a test driving the adapter
+    // directly.
+    if is_raw_ffv1_file(&config.input)? {
+        if audio_target != AudioTarget::Copy {
+            return Err(TranscodeError::InvalidInput(
+                "audio codec requested but this crate's raw FFV1 input \
+                 carries no audio stream"
+                    .into(),
+            ));
+        }
+        return execute_video_job(config, video_target).await;
+    }
 
     let in_format = crate::pipeline::detect_format(&config.input).await?;
 
@@ -205,15 +252,38 @@ pub(crate) async fn execute_frame_level(
             }
             execute_video_job(config, video_target).await
         }
-        // TODO(0.2.x): wire Matroska/Ogg in-container decoders (blocked on
-        // MatroskaDemuxer codec-id mappings for V_MJPEG et al. in
-        // oximedia-container) so MKV(MJPEG) and similar inputs can be
-        // re-encoded, not just stream-copied.
+        // Matroska/WebM and Ogg carry both audio and video tracks; this
+        // engine only re-encodes the audio track out of them (FLAC/PCM
+        // in, honest Err for Vorbis/Opus/anything else — see
+        // `container_audio::load_container_audio_pcm`). Video re-encode
+        // from these containers (e.g. MKV/V_MJPEG) is still not wired:
+        // that needs a `FrameDecoder` over each in-tree video codec, not
+        // just the codec-id mapping (which already exists for audio).
+        ContainerFormat::Matroska | ContainerFormat::WebM | ContainerFormat::Ogg => {
+            if video_target != VideoTarget::Copy {
+                return Err(TranscodeError::Unsupported(format!(
+                    "video re-encoding from {in_format:?} input is not yet supported \
+                     (only the audio track can be frame-level transcoded out of \
+                     Matroska/Ogg containers); use stream copy for video, or \
+                     extract the video separately"
+                )));
+            }
+            if config.video_scale.is_some() || config.output_fps.is_some() {
+                return Err(TranscodeError::InvalidInput(
+                    "video filters (-vf/--scale/-r) require a video stream, and \
+                     video is not re-encoded from Matroska/Ogg input"
+                        .into(),
+                ));
+            }
+            let pcm =
+                crate::container_audio::load_container_audio_pcm(&config.input, in_format).await?;
+            execute_audio_job_from_pcm(config, pcm, audio_target, normalization_gain_db).await
+        }
         other => Err(TranscodeError::Unsupported(format!(
             "re-encoding from {other:?} input is not yet supported \
              (in-container decoders are not wired); supported transcode \
-             inputs: WAV/FLAC (audio), Y4M (video). Stream copy (no codec \
-             change) still works for this input."
+             inputs: WAV/FLAC/MKV/Ogg (audio), Y4M (video). Stream copy (no \
+             codec change) still works for this input."
         ))),
     }
 }
@@ -279,10 +349,14 @@ impl FrameDecoder for TrimDecoder {
 // ─── Audio jobs ───────────────────────────────────────────────────────────────
 
 /// Decoded interleaved 16-bit PCM plus stream parameters.
-struct DecodedPcm {
-    data: Vec<u8>,
-    sample_rate: u32,
-    channels: u16,
+///
+/// `pub(crate)` so [`crate::container_audio`] (Matroska/Ogg in-container
+/// audio decode) can construct it directly.
+#[derive(Debug)]
+pub(crate) struct DecodedPcm {
+    pub(crate) data: Vec<u8>,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
 }
 
 /// Convert a raw WAV data payload to interleaved i16 LE using the `fmt `
@@ -356,7 +430,10 @@ fn wav_payload_to_i16(raw: &[u8], fmt: &FmtChunk) -> Result<Vec<u8>> {
 }
 
 /// Fully demux + decode a WAV file to interleaved i16 PCM.
-async fn load_wav_pcm(path: &Path) -> Result<DecodedPcm> {
+///
+/// `pub(crate)` so tests in [`crate::container_audio`] can read back
+/// frame-level WAV output without re-parsing the RIFF header by hand.
+pub(crate) async fn load_wav_pcm(path: &Path) -> Result<DecodedPcm> {
     let source = FileSource::open(path)
         .await
         .map_err(|e| TranscodeError::IoError(e.to_string()))?;
@@ -441,6 +518,20 @@ async fn execute_audio_job(
             )))
         }
     };
+    execute_audio_job_from_pcm(config, pcm, target, normalization_gain_db).await
+}
+
+/// Execute an audio-only frame-level job from already-decoded PCM: shared
+/// tail end of [`execute_audio_job`] (WAV/FLAC) and the Matroska/Ogg
+/// in-container audio path (see [`crate::container_audio`]), which decode
+/// their respective inputs to the same interleaved i16 PCM shape before
+/// reaching this dispatch.
+async fn execute_audio_job_from_pcm(
+    config: &PipelineConfig,
+    pcm: DecodedPcm,
+    target: AudioTarget,
+    normalization_gain_db: f64,
+) -> Result<FrameLevelStats> {
     let bytes_in = pcm.data.len() as u64;
     let (sample_rate, channels) = (pcm.sample_rate, pcm.channels);
 
@@ -452,7 +543,7 @@ async fn execute_audio_job(
             None => {
                 return Err(TranscodeError::InvalidInput(
                     "audio filters require re-encoding: specify an audio codec \
-                     (flac, pcm, alac, opus) or use a .flac/.wav/.caf/.ogg output"
+                     (flac, pcm, alac) or use a .flac/.wav/.caf output"
                         .into(),
                 ))
             }
@@ -665,14 +756,57 @@ async fn run_video_track<M: Muxer>(
     executor.execute(&[stream]).await
 }
 
-/// Execute a video frame-level job: Y4M input → real re-encode.
+/// Sniffs whether `path` starts with this crate's private raw-FFV1 magic
+/// (see [`crate::raw_sinks::Ffv1RawFileMuxer`]) rather than being a real
+/// container `oximedia_container::probe_format` would recognize. Reading
+/// fewer than the magic's length (a very short/empty file) is treated as
+/// "no", not an error — the caller falls through to the real container
+/// path, which reports that honestly.
+///
+/// # Errors
+///
+/// Returns [`TranscodeError::IoError`] if `path` cannot be opened for a
+/// reason other than being shorter than the magic.
+fn is_raw_ffv1_file(path: &Path) -> Result<bool> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| TranscodeError::IoError(format!("cannot open '{}': {e}", path.display())))?;
+    let mut magic = [0u8; crate::raw_sinks::FFV1_RAW_MAGIC.len()];
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(&magic == crate::raw_sinks::FFV1_RAW_MAGIC),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(TranscodeError::IoError(format!(
+            "cannot read '{}': {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Opens the video source at `path`: either a Y4M file, or this crate's own
+/// private raw-FFV1 framing (see [`is_raw_ffv1_file`]) — the two
+/// video-shaped inputs this engine can decode today. Returns the boxed
+/// decoder plus its native dimensions/frame-rate, so [`execute_video_job`]
+/// does not need to know which one it got.
+fn open_video_source(path: &Path) -> Result<(Box<dyn FrameDecoder>, u32, u32, (u32, u32))> {
+    if is_raw_ffv1_file(path)? {
+        let dec = Ffv1FrameDecoder::open(path)?;
+        let (w, h) = dec.dimensions();
+        let fps = dec.fps();
+        Ok((Box::new(dec), w, h, fps))
+    } else {
+        let dec = Y4mFrameDecoder::open(path)?;
+        let (w, h) = dec.dimensions();
+        let fps = dec.fps();
+        Ok((Box::new(dec), w, h, fps))
+    }
+}
+
+/// Execute a video frame-level job: Y4M or raw-FFV1 input → real re-encode
+/// (see [`open_video_source`]).
 async fn execute_video_job(
     config: &PipelineConfig,
     target: VideoTarget,
 ) -> Result<FrameLevelStats> {
-    let y4m = Y4mFrameDecoder::open(&config.input)?;
-    let (src_w, src_h) = y4m.dimensions();
-    let src_fps = y4m.fps();
+    let (source, src_w, src_h, src_fps) = open_video_source(&config.input)?;
 
     // Resolve `copy` for filter-only jobs (e.g. `-vf scale` on Y4M → Y4M).
     let target = if target == VideoTarget::Copy {
@@ -681,7 +815,7 @@ async fn execute_video_job(
         } else {
             return Err(TranscodeError::InvalidInput(
                 "video filters require re-encoding: specify a video codec \
-                 (mjpeg, apv, mpeg2, rawvideo)"
+                 (mjpeg, apv, mpeg2, ffv1, rawvideo)"
                     .into(),
             ));
         }
@@ -692,8 +826,8 @@ async fn execute_video_job(
     let (out_w, out_h) = resolve_scale(src_w, src_h, config.video_scale.as_ref())?;
     let out_fps = config.output_fps.unwrap_or(src_fps);
 
-    // Decoder chain: Y4M → (fps resample) → (trim).
-    let mut decoder: Box<dyn FrameDecoder> = Box::new(y4m);
+    // Decoder chain: source → (fps resample) → (trim).
+    let mut decoder: Box<dyn FrameDecoder> = source;
     if config.output_fps.is_some() && config.output_fps != Some(src_fps) {
         info!(
             "Frame-rate conversion: {}/{} → {}/{}",
@@ -778,22 +912,72 @@ async fn execute_video_job(
             run_video_track(muxer, decoder, filters, encoder, stream).await?
         }
         VideoTarget::Ffv1 => {
-            // TODO(0.2.x): FFV1 encode works (see make_video_encoder), but no
-            // container in oximedia-container writes the V_FFV1 codec id +
-            // required CodecPrivate extradata yet.
-            return Err(TranscodeError::Unsupported(
-                "FFV1 transcode is not yet supported: the Matroska muxer \
-                 cannot carry FFV1 (V_FFV1 + CodecPrivate) yet; \
-                 supported video codecs: mjpeg, apv, mpeg2, rawvideo"
-                    .into(),
-            ));
+            // No container in oximedia-container writes V_FFV1 +
+            // CodecPrivate yet, so FFV1 output goes to this crate's own
+            // private length-prefixed framing (see raw_sinks::Ffv1RawFileMuxer)
+            // instead of Matroska — round-trippable via
+            // frame_adapters::Ffv1FrameDecoder, but not readable by other
+            // tools. FFV1 encode/decode themselves are both real (the
+            // 0.1.9 range-coder carry bug fix).
+            if ext != "ffv1" {
+                return Err(TranscodeError::InvalidOutput(format!(
+                    "FFV1 video is written in this crate's own private raw \
+                     framing (no container here can carry V_FFV1 + \
+                     CodecPrivate yet); use a .ffv1 output (got .{ext})"
+                )));
+            }
+            let params = VideoEncoderParams::new(out_w, out_h, quality)?;
+            let extradata = crate::codec_dispatch::ffv1_extradata(&params)?;
+            let inner = make_video_encoder(CodecId::Ffv1, &params)?;
+            let encoder = Box::new(CodecVideoFrameEncoder::new(inner, out_w, out_h));
+            let mut stream = StreamInfo::new(0, CodecId::Ffv1, timebase);
+            stream.codec_params = oximedia_container::CodecParams::video(out_w, out_h);
+            stream.codec_params.extradata = Some(bytes::Bytes::from(extradata.clone()));
+            let muxer = crate::raw_sinks::Ffv1RawFileMuxer::new(
+                config.output.clone(),
+                out_w,
+                out_h,
+                out_fps,
+                extradata,
+            );
+            run_video_track(muxer, decoder, filters, encoder, stream).await?
         }
         VideoTarget::ProRes => {
-            // TODO(0.2.x): ProRes needs a 10-bit 4:2:2 frame path (the
-            // pipeline is 8-bit 4:2:0) and a container that can label it.
+            // TODO(0.2.x): investigated this session (see
+            // codec_dispatch::tests::test_prores_*) — three independent
+            // reasons this stays honest-Err rather than wired up, none of
+            // them "just write a container extradata mapping":
+            //  1. oximedia_codec::prores has a real 10-bit 4:2:2 encoder,
+            //     but this frame-level pipeline (Frame/FilterGraph) is flat
+            //     8-bit 4:2:0, and the only demuxer wired here (Y4M) has no
+            //     10-bit chroma tag in oximedia_container::Y4mChroma — so
+            //     there is no genuine 10-bit source to encode from. Widening
+            //     an 8-bit source by left-shifting is refused: that
+            //     fabricates precision the source never had.
+            //  2. Even with a genuine 10-bit source, ProResDecoder has no
+            //     10-bit output API: both `ProResDecoder::decode` and the
+            //     `VideoDecoder` trait path right-shift the internal 10-bit
+            //     reconstruction by 2 before returning it. This codec
+            //     cannot deliver a 10-bit-in/10-bit-out round trip today.
+            //  3. Independent of bit depth: ProResDecoder fails outright on
+            //     realistic (non-flat, higher-contrast) content — a large
+            //     sample-value swing within one macroblock reproducibly
+            //     hits "entropy decode: malformed codeword (unary prefix
+            //     too long)" even though the encoder happily produces a
+            //     packet for the same input. See
+            //     test_prores_decoder_rejects_high_contrast_content.
+            // Encoder-vs-Apple/FFmpeg-stream conformance is also explicitly
+            // unverified per oximedia_codec::prores's own module docs.
             return Err(TranscodeError::Unsupported(
-                "ProRes transcode is not yet supported: it requires a 10-bit \
-                 4:2:2 pipeline; supported video codecs: mjpeg, apv, mpeg2, rawvideo"
+                "ProRes transcode is not supported: oximedia-codec has a real \
+                 10-bit 4:2:2 encoder, but (a) this pipeline's only video \
+                 source (Y4M) carries no genuine 10-bit chroma — widening an \
+                 8-bit source by shifting is refused as fabricated precision; \
+                 (b) the decoder has no 10-bit output API (it right-shifts its \
+                 internal 10-bit reconstruction to 8-bit); and (c) the decoder \
+                 fails on realistic higher-contrast content independent of bit \
+                 depth (a reproducible entropy-decode error on ordinary edges); \
+                 supported video codecs: mjpeg, apv, mpeg2, ffv1, rawvideo"
                     .into(),
             ));
         }
@@ -977,5 +1161,288 @@ mod tests {
         assert_eq!(kept[0].data[0], 3);
         assert_eq!(kept[0].pts_ms, 50, "PTS must be re-based to the seek point");
         assert!(dec.eof());
+    }
+
+    // ── Matroska in-container audio decode (task: close the frame-level
+    // Matroska/Ogg codec gap) ──────────────────────────────────────────────
+
+    /// Builds a real `A_FLAC` Matroska file at `path` via
+    /// `oximedia_container::mux::MatroskaMuxer` (not this crate's own
+    /// dispatch) so the round-trip test below exercises a genuinely
+    /// independent mux → demux path, not just self-consistency with our
+    /// own encoder wiring.
+    async fn write_flac_in_mkv_fixture(
+        path: &std::path::Path,
+        sample_rate: u32,
+        channels: u16,
+        samples: &[i16],
+    ) {
+        use crate::flac_bitstream::{stream_info_block, FlacStreamEncoder};
+        use bytes::Bytes;
+        use oximedia_container::{Muxer, Packet, PacketFlags};
+        use oximedia_core::Timestamp;
+
+        let block_frames = u16::try_from(samples.len() / usize::from(channels))
+            .expect("test block fits u16 sample-frames");
+        let mut flac_enc = FlacStreamEncoder::new(sample_rate, channels).expect("flac encoder");
+        let frame_bytes = flac_enc.encode_block(samples).expect("encode flac block");
+        let extradata = stream_info_block(
+            sample_rate,
+            channels,
+            u64::from(block_frames),
+            block_frames,
+            block_frames,
+        );
+
+        let mut stream = StreamInfo::new(0, CodecId::Flac, Rational::new(1, 1_000));
+        stream.codec_params = oximedia_container::CodecParams::audio(sample_rate, channels as u8);
+        stream.codec_params.extradata = Some(Bytes::from(extradata));
+
+        let sink = FileSource::create(path).await.expect("create mkv fixture");
+        let mut muxer = MatroskaMuxer::new(sink, MuxerConfig::new().with_writing_app("test"));
+        muxer.add_stream(stream).expect("add flac stream");
+        muxer.write_header().await.expect("write header");
+        let packet = Packet::new(
+            0,
+            Bytes::from(frame_bytes),
+            Timestamp::new(0, Rational::new(1, 1_000)),
+            PacketFlags::KEYFRAME,
+        );
+        muxer
+            .write_packet(&packet)
+            .await
+            .expect("write flac packet");
+        muxer.write_trailer().await.expect("write trailer");
+    }
+
+    /// Deterministic (non-silent, non-repeating) i16 test signal.
+    fn test_tone_i16(frames: usize, channels: usize) -> Vec<i16> {
+        (0..frames * channels)
+            .map(|i| {
+                let t = (i / channels) as f64;
+                let ch = (i % channels) as f64;
+                (8000.0 * (0.02 * t + ch * 0.3).sin()) as i16
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_matroska_flac_decode_pcm_sample_exact() {
+        let path =
+            std::env::temp_dir().join(format!("oximedia_test_mkv_flac_{}.mkv", std::process::id()));
+        let (sample_rate, channels) = (44_100u32, 2u16);
+        let samples = test_tone_i16(2_000, usize::from(channels));
+
+        write_flac_in_mkv_fixture(&path, sample_rate, channels, &samples).await;
+
+        let pcm = crate::container_audio::load_container_audio_pcm(
+            &path,
+            oximedia_container::ContainerFormat::Matroska,
+        )
+        .await
+        .expect("decode flac-in-mkv");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(pcm.sample_rate, sample_rate);
+        assert_eq!(pcm.channels, channels);
+        let decoded: Vec<i16> = pcm
+            .data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(decoded, samples, "FLAC-in-MKV decode must be sample-exact");
+    }
+
+    #[tokio::test]
+    async fn test_frame_level_mkv_to_wav_sample_exact() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let mkv_path = dir.join(format!("oximedia_test_mkv2wav_{pid}.mkv"));
+        let wav_path = dir.join(format!("oximedia_test_mkv2wav_{pid}.wav"));
+        let (sample_rate, channels) = (48_000u32, 1u16);
+        let samples = test_tone_i16(3_000, usize::from(channels));
+
+        write_flac_in_mkv_fixture(&mkv_path, sample_rate, channels, &samples).await;
+
+        let config = PipelineConfig {
+            input: mkv_path.clone(),
+            output: wav_path.clone(),
+            video_codec: None,
+            audio_codec: None,
+            quality: None,
+            multipass: None,
+            normalization: None,
+            track_progress: false,
+            hw_accel: false,
+            stream_map: Vec::new(),
+            start_time_secs: None,
+            duration_secs: None,
+            video_scale: None,
+            audio_gain_db: None,
+            output_fps: None,
+        };
+
+        let stats = execute_frame_level(&config, 0.0)
+            .await
+            .expect("MKV -> WAV frame-level transcode");
+        assert!(stats.audio_frames > 0);
+
+        let pcm = load_wav_pcm(&wav_path).await.expect("read back wav");
+        let _ = std::fs::remove_file(&mkv_path);
+        let _ = std::fs::remove_file(&wav_path);
+
+        assert_eq!(pcm.sample_rate, sample_rate);
+        assert_eq!(pcm.channels, channels);
+        let decoded: Vec<i16> = pcm
+            .data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(
+            decoded, samples,
+            "MKV(FLAC) -> WAV frame-level transcode must be sample-exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_matroska_unsupported_codec_names_it() {
+        // No FLAC/PCM stream at all — must name what it actually found
+        // rather than a generic "no audio stream" message when the
+        // container clearly does carry a (currently unsupported) codec.
+        let path = std::env::temp_dir().join(format!(
+            "oximedia_test_mkv_vorbis_{}.mkv",
+            std::process::id()
+        ));
+        let sink = FileSource::create(&path).await.expect("create fixture");
+        let mut muxer = MatroskaMuxer::new(sink, MuxerConfig::new());
+        let mut stream = StreamInfo::new(0, CodecId::Vorbis, Rational::new(1, 1_000));
+        stream.codec_params = oximedia_container::CodecParams::audio(44_100, 2);
+        muxer.add_stream(stream).expect("add vorbis stream");
+        muxer.write_header().await.expect("header");
+        muxer.write_trailer().await.expect("trailer");
+
+        let err = crate::container_audio::load_container_audio_pcm(
+            &path,
+            oximedia_container::ContainerFormat::Matroska,
+        )
+        .await
+        .expect_err("vorbis must be rejected honestly");
+        let _ = std::fs::remove_file(&path);
+        let msg = err.to_string();
+        assert!(msg.contains("Vorbis"), "must name the codec found: {msg}");
+    }
+
+    // ── FFV1 frame-level round trip (task: wire the FFV1 decode path) ─────
+
+    #[cfg(feature = "ffv1")]
+    #[tokio::test]
+    async fn test_ffv1_round_trip_y4m_lossless_multi_frame() {
+        use oximedia_container::mux::Y4mMuxerBuilder;
+
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let y4m_in = dir.join(format!("oximedia_test_ffv1_in_{pid}.y4m"));
+        let ffv1_path = dir.join(format!("oximedia_test_ffv1_{pid}.ffv1"));
+        let y4m_out = dir.join(format!("oximedia_test_ffv1_out_{pid}.y4m"));
+
+        let (w, h) = (16u32, 12u32);
+        let fps = (25u32, 1u32);
+        // 4 distinct frames (not silence, not repeats of frame 0) so a
+        // reused-decoder-state bug across frames would actually show up.
+        let frame_len = crate::frame_adapters::yuv420_frame_len(w, h);
+        let frames: Vec<Vec<u8>> = (0..4u32)
+            .map(|i| {
+                (0..frame_len)
+                    .map(|idx| ((idx as u32 * 7 + i * 53 + 11) % 256) as u8)
+                    .collect()
+            })
+            .collect();
+
+        {
+            let file = std::fs::File::create(&y4m_in).expect("create y4m");
+            let mut muxer = Y4mMuxerBuilder::new(w, h)
+                .fps(fps.0, fps.1)
+                .build(std::io::BufWriter::new(file))
+                .expect("build y4m muxer");
+            for f in &frames {
+                muxer.write_frame(f).expect("write y4m frame");
+            }
+            muxer.finish().expect("finish y4m");
+        }
+
+        // Real encode leg: Y4M -> FFV1 through the actual frame-level engine.
+        let config = PipelineConfig {
+            input: y4m_in.clone(),
+            output: ffv1_path.clone(),
+            video_codec: Some("ffv1".into()),
+            audio_codec: None,
+            quality: None,
+            multipass: None,
+            normalization: None,
+            track_progress: false,
+            hw_accel: false,
+            stream_map: Vec::new(),
+            start_time_secs: None,
+            duration_secs: None,
+            video_scale: None,
+            audio_gain_db: None,
+            output_fps: None,
+        };
+        let stats = execute_frame_level(&config, 0.0)
+            .await
+            .expect("Y4M -> FFV1 frame-level transcode");
+        assert_eq!(stats.video_frames, frames.len() as u64);
+
+        // Decode leg: FFV1 -> Y4M through `execute_frame_level` itself, not
+        // by driving `Ffv1FrameDecoder` directly — this is the part that
+        // proves FFV1 decode is reachable through the engine's public entry
+        // point. There is no `ContainerFormat` for this crate's private
+        // raw-FFV1 framing, so the engine must recognize it by magic ahead
+        // of container detection (see `is_raw_ffv1_file`).
+        let decode_config = PipelineConfig {
+            input: ffv1_path.clone(),
+            output: y4m_out.clone(),
+            video_codec: Some("rawvideo".into()),
+            audio_codec: None,
+            quality: None,
+            multipass: None,
+            normalization: None,
+            track_progress: false,
+            hw_accel: false,
+            stream_map: Vec::new(),
+            start_time_secs: None,
+            duration_secs: None,
+            video_scale: None,
+            audio_gain_db: None,
+            output_fps: None,
+        };
+        let decode_stats = execute_frame_level(&decode_config, 0.0)
+            .await
+            .expect("FFV1 -> Y4M frame-level transcode");
+        assert_eq!(decode_stats.video_frames, frames.len() as u64);
+
+        // Read the engine's real Y4M output back to compare frame-for-frame.
+        let mut reader = Y4mFrameDecoder::open(&y4m_out).expect("open y4m out");
+        assert_eq!(reader.dimensions(), (w, h));
+        let mut decoded_frames = Vec::new();
+        while let Some(frame) = reader.decode_next() {
+            decoded_frames.push(frame.data);
+        }
+
+        let _ = std::fs::remove_file(&y4m_in);
+        let _ = std::fs::remove_file(&ffv1_path);
+        let _ = std::fs::remove_file(&y4m_out);
+
+        assert_eq!(
+            decoded_frames.len(),
+            frames.len(),
+            "must decode every encoded frame"
+        );
+        for (i, (orig, dec)) in frames.iter().zip(decoded_frames.iter()).enumerate() {
+            assert_eq!(
+                orig, dec,
+                "frame {i} must round-trip lossless (FFV1 is lossless)"
+            );
+        }
     }
 }

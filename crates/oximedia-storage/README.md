@@ -6,7 +6,7 @@ Cloud storage abstraction layer for OxiMedia providing unified access to S3, Min
 
 Part of the [oximedia](https://github.com/cool-japan/oximedia) workspace — a comprehensive pure-Rust media processing framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 ## Features
 
@@ -88,10 +88,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-storage = { version = "0.1.9", features = ["azure", "gcs"] }
+oximedia-storage = { version = "0.2.0", features = ["azure", "gcs"] }
 
 # Enable S3 / MinIO (requires Rust 1.91+)
-# oximedia-storage = { version = "0.1.9", features = ["minio"] }
+# oximedia-storage = { version = "0.2.0", features = ["minio"] }
 ```
 
 ```rust

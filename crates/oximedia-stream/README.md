@@ -24,7 +24,7 @@ Part of the [OxiMedia](https://github.com/cool-japan/oximedia) sovereign media f
 
 ```toml
 [dependencies]
-oximedia-stream = "0.1.9"
+oximedia-stream = "0.2.0"
 ```
 
 ```rust
@@ -127,4 +127,4 @@ Licensed under the terms specified in the workspace root.
 
 Copyright (c) COOLJAPAN OU (Team Kitasan)
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested

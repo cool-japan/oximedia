@@ -47,8 +47,12 @@ impl std::fmt::Display for MediaType {
 /// Codec identifier for supported codecs.
 ///
 /// **Green List Only**: Only patent-free codecs are supported.
-/// Using patent-encumbered codecs (H.264, H.265, AAC, etc.) will
+/// Using patent-encumbered codecs (H.264, H.265, etc.) will
 /// result in [`OxiError::PatentViolation`](crate::error::OxiError::PatentViolation).
+///
+/// A variant existing here means the codec can be *named*; it does not imply
+/// that OxiMedia can decode or encode it. [`Aac`](Self::Aac) in particular is
+/// identification-only — the container demuxers still reject `mp4a` tracks.
 ///
 /// # Supported Video Codecs
 ///
@@ -66,6 +70,7 @@ impl std::fmt::Display for MediaType {
 /// - [`Flac`](Self::Flac) - FLAC (Xiph.org)
 /// - [`Alac`](Self::Alac) - ALAC (Apple Lossless, Apache-2.0, patent-free)
 /// - [`Mp3`](Self::Mp3) - MP3 (MPEG-1/2 Layer III, patents expired 2017)
+/// - [`Aac`](Self::Aac) - AAC (MPEG-2/4 Advanced Audio Coding, patents expired 2023)
 /// - [`Pcm`](Self::Pcm) - Uncompressed PCM
 ///
 /// # Supported Subtitle Formats
@@ -163,6 +168,24 @@ pub enum CodecId {
     Alac,
     /// MP3 audio codec (MPEG-1/2 Layer III, patents expired 2017).
     Mp3,
+    /// AAC audio codec (MPEG-2/4 Advanced Audio Coding, ISO/IEC 14496-3).
+    ///
+    /// The Fraunhofer/Via Licensing AAC-LC patent pool expired in April 2023,
+    /// so the format itself is patent-free and belongs on the green list.
+    ///
+    /// **Identification only.** OxiMedia ships no AAC decoder or encoder:
+    /// `oximedia_audio::AacDecoder` parses ADTS transport headers and then
+    /// fails closed, and the ISOBMFF / Matroska demuxers still refuse `mp4a`
+    /// tracks. This variant exists so that stream inspectors and platform
+    /// extensions can report the honest codec identity instead of borrowing
+    /// another codec's.
+    ///
+    /// Because it is identification-only, [`CodecId::from_str`] deliberately
+    /// refuses `"aac"` / `"mp4a"` / `"aac-lc"` / `"he-aac"`: AAC can never be
+    /// selected from a name, only observed in Rust code. This makes `Aac` the
+    /// only variant whose [`name()`](Self::name) does not round-trip through
+    /// [`FromStr`](std::str::FromStr).
+    Aac,
     /// Uncompressed PCM audio.
     Pcm,
 
@@ -214,9 +237,13 @@ impl CodecId {
             | Self::Png
             | Self::Tiff
             | Self::OpenExr => MediaType::Video,
-            Self::Opus | Self::Vorbis | Self::Flac | Self::Alac | Self::Mp3 | Self::Pcm => {
-                MediaType::Audio
-            }
+            Self::Opus
+            | Self::Vorbis
+            | Self::Flac
+            | Self::Alac
+            | Self::Mp3
+            | Self::Aac
+            | Self::Pcm => MediaType::Audio,
             Self::WebVtt | Self::Ass | Self::Ssa | Self::Srt => MediaType::Subtitle,
         }
     }
@@ -306,6 +333,7 @@ impl CodecId {
             Self::Flac => "flac",
             Self::Alac => "alac",
             Self::Mp3 => "mp3",
+            Self::Aac => "aac",
             Self::Pcm => "pcm",
             Self::WebVtt => "webvtt",
             Self::Ass => "ass",
@@ -379,6 +407,17 @@ impl std::str::FromStr for CodecId {
     ///
     /// Parsing is **case-insensitive** and accepts several common aliases.
     ///
+    /// # AAC
+    ///
+    /// [`CodecId::Aac`] is the one variant this parser will never produce.
+    /// `"aac"`, `"mp4a"`, `"aac-lc"` and `"he-aac"` all return `Err`, so
+    /// name-driven code paths (CLI arguments, container hints, playlist
+    /// manifests) cannot select AAC by accident. The variant is reachable only
+    /// by naming it in Rust, which is what a stream inspector or a platform
+    /// extension does when it reports what it actually found. Consequently
+    /// [`CodecId::Aac`] is the only variant for which
+    /// `codec.name().parse::<CodecId>()` does not round-trip.
+    ///
     /// # Examples
     ///
     /// ```
@@ -388,6 +427,10 @@ impl std::str::FromStr for CodecId {
     /// assert_eq!("WEBP".parse::<CodecId>().unwrap(), CodecId::WebP);
     /// assert_eq!("jxl".parse::<CodecId>().unwrap(), CodecId::JpegXl);
     /// assert_eq!("gif".parse::<CodecId>().unwrap(), CodecId::Gif);
+    ///
+    /// // AAC is identification-only: it never parses from a name.
+    /// assert!("aac".parse::<CodecId>().is_err());
+    /// assert_eq!(CodecId::Aac.name(), "aac");
     /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
@@ -421,6 +464,9 @@ impl std::str::FromStr for CodecId {
             "flac" => Ok(Self::Flac),
             "alac" | "m4a-alac" => Ok(Self::Alac),
             "mp3" | "mpeg1audio" | "mpeg1_audio" => Ok(Self::Mp3),
+            // NOTE: "aac"/"mp4a"/"aac-lc"/"he-aac" are deliberately **not**
+            // accepted here — see the `# AAC` section of this method's docs and
+            // `tests/patent_detection.rs`.
             "pcm" | "raw_audio" | "rawaudio" => Ok(Self::Pcm),
             // Subtitle formats
             "webvtt" | "vtt" => Ok(Self::WebVtt),
@@ -450,6 +496,7 @@ mod tests {
         assert_eq!(CodecId::Flac.media_type(), MediaType::Audio);
         assert_eq!(CodecId::Alac.media_type(), MediaType::Audio);
         assert_eq!(CodecId::Mp3.media_type(), MediaType::Audio);
+        assert_eq!(CodecId::Aac.media_type(), MediaType::Audio);
         assert_eq!(CodecId::Pcm.media_type(), MediaType::Audio);
 
         assert_eq!(CodecId::WebVtt.media_type(), MediaType::Subtitle);
@@ -589,6 +636,7 @@ mod tests {
             CodecId::Flac,
             CodecId::Alac,
             CodecId::Mp3,
+            CodecId::Aac,
             CodecId::Pcm,
             CodecId::WebVtt,
             CodecId::Ass,
@@ -699,14 +747,56 @@ mod tests {
     fn test_from_str_unknown_returns_err() {
         assert!("h264".parse::<CodecId>().is_err());
         assert!("h265".parse::<CodecId>().is_err());
-        assert!("aac".parse::<CodecId>().is_err());
         assert!("hevc".parse::<CodecId>().is_err());
         assert!("unknown".parse::<CodecId>().is_err());
     }
 
+    // ── AAC (identification only) ────────────────────────────────────────────
+
+    #[test]
+    fn test_aac_codec_properties() {
+        assert_eq!(CodecId::Aac.media_type(), MediaType::Audio);
+        assert!(CodecId::Aac.is_audio());
+        assert!(!CodecId::Aac.is_video());
+        assert!(!CodecId::Aac.is_subtitle());
+        assert_eq!(CodecId::Aac.name(), "aac");
+        assert_eq!(CodecId::Aac.canonical_name(), "aac");
+        assert_eq!(format!("{}", CodecId::Aac), "aac");
+        // AAC is a lossy transform codec.
+        assert!(!CodecId::Aac.is_lossless());
+    }
+
+    /// AAC is identification-only: it must never be reachable from a name.
+    ///
+    /// This asymmetry is deliberate and is the reason `CodecId::Aac` is
+    /// excluded from [`test_from_str_roundtrip`]. `tests/patent_detection.rs`
+    /// enforces the same rule from the outside.
+    #[test]
+    fn test_aac_is_never_parsed_from_a_name() {
+        for name in ["aac", "AAC", "mp4a", "MP4A", "aac-lc", "he-aac", "aac_lc"] {
+            assert!(
+                name.parse::<CodecId>().is_err(),
+                "{name:?} must not parse to a CodecId: AAC is identification-only"
+            );
+        }
+        // …yet the variant still reports the honest name.
+        assert_eq!(CodecId::Aac.name(), "aac");
+    }
+
+    #[test]
+    fn test_aac_container_compatibility() {
+        use crate::codec_matrix::CodecMatrix;
+        assert!(CodecMatrix::is_compatible(CodecId::Aac, "mp4"));
+        assert!(CodecMatrix::is_compatible(CodecId::Aac, "M4A"));
+        assert!(!CodecMatrix::is_compatible(CodecId::Aac, "wav"));
+        assert!(CodecMatrix::compatible_containers(CodecId::Aac).contains(&"mp4"));
+    }
+
     #[test]
     fn test_from_str_roundtrip() {
-        // Every codec round-trips through canonical_name
+        // Every codec round-trips through canonical_name, except CodecId::Aac,
+        // which is identification-only and intentionally never parses from a
+        // name (see `test_aac_is_never_parsed_from_a_name`).
         let all = [
             CodecId::Av1,
             CodecId::Vp9,

@@ -5,11 +5,26 @@
 //!
 //! - **Low-latency video/audio transport** over UDP with FEC (Forward Error Correction)
 //! - **mDNS/DNS-SD service discovery** for automatic source detection
-//! - **Multiple video codecs**: VP9, AV1 (compressed), v210, UYVY (uncompressed)
-//! - **Multiple audio formats**: Opus (compressed), PCM (uncompressed)
 //! - **Professional features**: Tally lights, PTZ control, timecode, metadata
 //! - **Network resilience**: FEC, jitter buffering, packet loss recovery
 //! - **Multi-stream support**: Program, preview, alpha channels
+//!
+//! # Codec support (send vs. receive are not symmetric)
+//!
+//! - **Send** ([`VideoIpSource`]): uncompressed video (v210, UYVY, 8-bit and
+//!   10-bit 4:2:0 planar) and uncompressed audio (PCM 16/24-bit, 32-bit
+//!   float). There is **no compressed send path**: no working VP8, VP9, AV1
+//!   or Opus encoder exists behind this crate, so those codecs are refused at
+//!   construction rather than broadcasting raw frames labelled as a
+//!   compressed bitstream.
+//! - **Receive** ([`VideoIpReceiver`]): everything above, **plus real VP8, VP9
+//!   and AV1 decode** through `oximedia-codec` — dimensions come from the
+//!   bitstream, and the decoders are bit-exact against libvpx/libaom on the
+//!   fixtures in `tests/fixtures/`. Opus decode is refused.
+//!
+//! [`codec`] documents, per codec and per direction, exactly what is missing
+//! and how that was verified; every unavailable direction fails with
+//! [`VideoIpError::CodecUnimplemented`] carrying the same detail at runtime.
 //!
 //! # Protocol Design
 //!
@@ -37,12 +52,15 @@
 //! ## Broadcasting a Video Stream
 //!
 //! ```ignore
+//! use oximedia_videoip::types::{AudioCodec, VideoCodec};
 //! use oximedia_videoip::{VideoIpSource, VideoConfig, AudioConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let video_config = VideoConfig::new(1920, 1080, 60.0)?;
-//!     let audio_config = AudioConfig::new(48000, 2)?;
+//!     // `VideoConfig::new` defaults to VP9 and `AudioConfig::new` to Opus,
+//!     // neither of which this crate can encode -- pick transmittable ones.
+//!     let video_config = VideoConfig::new(1920, 1080, 60.0)?.with_codec(VideoCodec::Uyvy);
+//!     let audio_config = AudioConfig::new(48000, 2)?.with_codec(AudioCodec::Pcm16)?;
 //!
 //!     let mut source = VideoIpSource::new("Camera 1", video_config, audio_config)?;
 //!     source.start_broadcasting().await?;

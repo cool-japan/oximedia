@@ -92,7 +92,10 @@ pub enum SwitcherCommand {
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
 
-        /// Video codec: av1, vp9
+        /// Video codec: av1, vp9, vp8 (encoder not real in this build --
+        /// config validates, `record start` then reports an honest error),
+        /// ffv1 (encoder is real; still blocked on the missing live capture
+        /// source -- see `handle_record`'s doc comment)
         #[arg(long, default_value = "av1")]
         codec: String,
     },
@@ -201,7 +204,7 @@ async fn handle_create(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Switcher Created".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "M/E rows:", me);
@@ -250,7 +253,7 @@ async fn handle_add_source(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Source Added".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Name:", name);
@@ -294,7 +297,7 @@ async fn handle_switch(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Source Switched".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Target input:", input);
@@ -323,7 +326,7 @@ async fn handle_preview(input: usize, me_row: usize, json_output: bool) -> Resul
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Preview Set".green().bold());
         println!("{:20} {}", "Input:", input);
         println!("{:20} {}", "M/E row:", me_row);
@@ -336,6 +339,28 @@ async fn handle_preview(input: usize, me_row: usize, json_output: bool) -> Resul
 // Handler: Record
 // ---------------------------------------------------------------------------
 
+/// Whether `codec`'s underlying video encoder produces real, valid output in
+/// this build, per the codec-reality note: MJPEG/FFV1 encoders are real
+/// (`oximedia-codec`'s `MjpegEncoder`/`Ffv1Encoder`, wired end-to-end in
+/// `oximedia-transcode`'s `codec_dispatch`); AV1/VP9/VP8 encode does not yet
+/// produce a valid bitstream. Returns `(is_real, caveat)`, where `caveat`
+/// explains the honest state for codecs whose `RecordingCodec` mapping is
+/// itself imprecise (VP8 has no dedicated variant).
+fn encoder_reality(codec: &str) -> (bool, Option<&'static str>) {
+    match codec {
+        "ffv1" => (true, None),
+        "vp8" => (
+            false,
+            Some(
+                "additionally, oximedia_switcher::recording::RecordingCodec has no dedicated \
+                 VP8 variant -- the config above was validated using the Vp9Crf preset purely \
+                 as a name/path shape check, not as a stand-in encoder",
+            ),
+        ),
+        _ => (false, None),
+    }
+}
+
 /// Start or stop recording the switcher's program output.
 ///
 /// `oximedia-switcher` provides a real recording *state machine*
@@ -344,7 +369,12 @@ async fn handle_preview(input: usize, me_row: usize, json_output: bool) -> Resul
 /// write bytes to disk, and `oximedia-cli`'s `switcher` command has no live
 /// capture pipeline or long-running switcher daemon (each CLI invocation
 /// configures a switcher and exits immediately). So "start" genuinely cannot
-/// produce a real recording here.
+/// produce a real recording here, for *any* codec -- the gap this function
+/// closes is distinguishing, per codec, whether the encoder itself is real
+/// (FFV1: yes, blocked only on the missing capture source) or also fake
+/// (AV1/VP9/VP8: blocked on both). Wiring an actual live capture source is
+/// separate, materially larger work (see `crates/oximedia-capture`, not yet
+/// a dependency of this CLI) tracked outside this function.
 ///
 /// This still does real, useful work before refusing: it validates the
 /// codec, validates the track configuration through the real
@@ -353,9 +383,6 @@ async fn handle_preview(input: usize, me_row: usize, json_output: bool) -> Resul
 /// `RecordingManager::add_track`/`start` state transition -- then reports an
 /// honest error instead of a fabricated `"status": "recording"` with no file
 /// ever created.
-// TODO(0.2.x): wire a real encoder once oximedia-cli gains a live capture
-// source and/or a persistent switcher process for `record start` to attach
-// to; only then can this legitimately report "recording".
 async fn handle_record(
     action: &str,
     output: Option<&std::path::Path>,
@@ -372,15 +399,21 @@ async fn handle_record(
                 "vp9" => oximedia_switcher::recording::RecordingCodec::Vp9Crf,
                 // `RecordingCodec` has no dedicated VP8 variant; the closest
                 // royalty-free long-GOP preset is reused purely for config
-                // validation below (name/path checks only -- see doc above).
+                // validation below (name/path checks only -- see
+                // `encoder_reality`'s caveat for VP8, surfaced in the error
+                // below).
                 "vp8" => oximedia_switcher::recording::RecordingCodec::Vp9Crf,
+                // FFV1 has a real encoder (unlike AV1/VP9/VP8) and a real,
+                // correctly-named `RecordingCodec` variant -- no reuse hack.
+                "ffv1" => oximedia_switcher::recording::RecordingCodec::Ffv1Lossless,
                 other => {
                     return Err(anyhow::anyhow!(
-                        "Unsupported codec '{}'. Use: av1, vp9, vp8",
+                        "Unsupported codec '{}'. Use: av1, vp9, vp8, ffv1",
                         other
                     ));
                 }
             };
+            let (encoder_is_real, encoder_caveat) = encoder_reality(codec);
 
             let track = oximedia_switcher::recording::RecordingTrack::new("program_out")
                 .with_codec(recording_codec)
@@ -415,6 +448,7 @@ async fn handle_record(
                     "status": "error",
                     "config_validated": true,
                     "state_machine_recording": state_machine_recording,
+                    "encoder_is_real": encoder_is_real,
                     "error": "no live capture pipeline; refusing to fabricate a recording",
                 });
                 eprintln!(
@@ -423,15 +457,33 @@ async fn handle_record(
                 );
             }
 
+            let encoder_status = if encoder_is_real {
+                format!(
+                    "The {codec} encoder itself is real (oximedia-codec); only the missing \
+                     capture source blocks this, not a fake codec."
+                )
+            } else {
+                match encoder_caveat {
+                    Some(caveat) => {
+                        format!("{codec} also has no real encoder in this build ({caveat}).")
+                    }
+                    None => format!(
+                        "{codec} also has no real encoder in this build (it does not yet \
+                         produce a valid bitstream)."
+                    ),
+                }
+            };
+
             Err(anyhow::anyhow!(
                 "Switcher recording is not yet implemented: configuration for '{}' (codec: {}) \
                  validated successfully and the in-process recording state machine transitioned \
                  to recording (is_recording={}), but oximedia-cli's `switcher` command has no \
                  live capture pipeline or persistent switcher process to write real frames to \
-                 disk. Refusing to report \"recording\" with no file ever written.",
+                 disk. {} Refusing to report \"recording\" with no file ever written.",
                 out.display(),
                 codec,
-                state_machine_recording
+                state_machine_recording,
+                encoder_status
             ))
         }
         "stop" => {
@@ -482,7 +534,7 @@ async fn handle_macro(
                 let json_str =
                     serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
                 println!("{}", json_str);
-            } else {
+            } else if !crate::progress::is_quiet() {
                 println!("{}", "Macro Running".green().bold());
                 println!("{:20} {}", "Macro ID:", macro_id);
             }
@@ -513,7 +565,7 @@ async fn handle_macro(
                 let json_str =
                     serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
                 println!("{}", json_str);
-            } else {
+            } else if !crate::progress::is_quiet() {
                 println!("{}", "Macro Recording Started".green().bold());
                 println!("{:20} {}", "Name:", macro_name);
             }
@@ -527,7 +579,7 @@ async fn handle_macro(
                 let json_str =
                     serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
                 println!("{}", json_str);
-            } else {
+            } else if !crate::progress::is_quiet() {
                 println!("{}", "Macro Recording Stopped".green().bold());
             }
         }
@@ -634,5 +686,85 @@ mod tests {
             .await
             .expect_err("stop must be honest when nothing was ever recording");
         assert!(err.to_string().contains("not yet implemented"));
+    }
+
+    // ── per-codec honesty: real (FFV1) vs fake (AV1/VP9/VP8) encoders ───────
+
+    #[test]
+    fn test_encoder_reality_ffv1_is_real() {
+        let (is_real, caveat) = encoder_reality("ffv1");
+        assert!(is_real, "FFV1 has a real encoder in oximedia-codec");
+        assert!(caveat.is_none());
+    }
+
+    #[test]
+    fn test_encoder_reality_av1_vp9_vp8_are_fake() {
+        for codec in ["av1", "vp9", "vp8"] {
+            let (is_real, _) = encoder_reality(codec);
+            assert!(
+                !is_real,
+                "{codec} encode does not yet produce a valid bitstream"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encoder_reality_vp8_names_missing_recording_codec_variant() {
+        let (_, caveat) = encoder_reality("vp8");
+        let caveat = caveat.expect("VP8 must carry a caveat about the RecordingCodec mapping");
+        assert!(caveat.contains("no dedicated"), "caveat: {caveat}");
+    }
+
+    #[tokio::test]
+    async fn test_handle_record_start_ffv1_accepted_and_error_says_encoder_is_real() {
+        let dir = std::env::temp_dir();
+        let out = dir.join("oximedia_switcher_test_record_ffv1.mkv");
+        let _ = std::fs::remove_file(&out);
+
+        let err = handle_record("start", Some(out.as_path()), "ffv1", false)
+            .await
+            .expect_err("still no live capture pipeline, so this must still error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("real") && msg.to_lowercase().contains("ffv1"),
+            "error must credit FFV1 as a real encoder, got: {msg}"
+        );
+        assert!(
+            !msg.contains("also has no real encoder"),
+            "must not claim FFV1's own encoder is fake, got: {msg}"
+        );
+        assert!(!out.exists(), "no output file may be fabricated");
+    }
+
+    #[tokio::test]
+    async fn test_handle_record_start_av1_error_says_encoder_is_fake() {
+        let dir = std::env::temp_dir();
+        let out = dir.join("oximedia_switcher_test_record_av1_fake.mkv");
+        let _ = std::fs::remove_file(&out);
+
+        let err = handle_record("start", Some(out.as_path()), "av1", false)
+            .await
+            .expect_err("must still error (no capture pipeline)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("also has no real encoder"),
+            "AV1's own encoder must be named as fake too, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_record_start_vp8_error_names_missing_recording_codec_variant() {
+        let dir = std::env::temp_dir();
+        let out = dir.join("oximedia_switcher_test_record_vp8_caveat.mkv");
+        let _ = std::fs::remove_file(&out);
+
+        let err = handle_record("start", Some(out.as_path()), "vp8", false)
+            .await
+            .expect_err("must still error (no capture pipeline)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no dedicated"),
+            "VP8's RecordingCodec gap must be disclosed, got: {msg}"
+        );
     }
 }

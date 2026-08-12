@@ -158,8 +158,21 @@ impl OutputValidator {
             return Err(ValidationError::OutputExists(path.to_string()));
         }
 
-        // Check if parent directory exists and is writable
+        // Check if parent directory exists and is writable.
+        //
+        // `Path::parent` yields `Some("")` for a bare relative filename such
+        // as `out.flac`, and `Path::new("").exists()` is always false — so
+        // checking it directly rejected the most ordinary invocation of all,
+        // `transcode -i in.wav -o out.flac`, while `./out.flac` and absolute
+        // paths passed. An empty parent means "the current directory", so it
+        // is resolved to `.` before the existence and writability probes.
         if let Some(parent) = path_obj.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+
             if !parent.exists() {
                 return Err(ValidationError::InvalidOutputPath(
                     "Parent directory does not exist".to_string(),
@@ -453,6 +466,29 @@ mod tests {
         let out = std::env::temp_dir().join("oximedia-transcode-validation-test_output.mp4");
         let result = OutputValidator::validate_path(out.to_string_lossy().as_ref(), false);
         assert!(result.is_ok());
+    }
+
+    /// A bare relative filename — no directory component at all — is the
+    /// most ordinary output path a caller can write (`-o out.flac`), and
+    /// `Path::parent` reports it as `Some("")`. Probing that empty path for
+    /// existence rejected the invocation outright, while `./out.flac` and any
+    /// absolute path were accepted; all three must behave identically.
+    #[test]
+    fn bare_relative_output_filename_is_accepted() {
+        assert!(
+            OutputValidator::validate_path("oximedia-transcode-bare-name-probe.flac", false)
+                .is_ok(),
+            "a bare filename resolves against the current directory"
+        );
+        assert!(
+            OutputValidator::validate_path("./oximedia-transcode-bare-name-probe.flac", false)
+                .is_ok(),
+            "the explicit `./` spelling must agree with the bare one"
+        );
+        assert!(
+            OutputValidator::validate_path("/nonexistent-dir-xyz/out.flac", false).is_err(),
+            "a genuinely missing parent directory is still refused"
+        );
     }
 
     #[test]

@@ -2,13 +2,17 @@
 
 use oximedia_videoip::source::ControlMessage;
 use oximedia_videoip::tally::{TallyController, TallyMessage, TallyState};
+use oximedia_videoip::types::{AudioCodec, VideoCodec};
 use oximedia_videoip::{AudioConfig, VideoConfig, VideoIpSource};
 use std::io::{self, Write};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let video_config = VideoConfig::new(1920, 1080, 30.0)?;
-    let audio_config = AudioConfig::new(48000, 2)?;
+    // UYVY + PCM: the formats this crate can actually put on the wire (it has
+    // no working VP8/VP9/AV1 or Opus encoder, and VideoIpSource::new refuses
+    // those rather than shipping raw frames labelled as compressed).
+    let video_config = VideoConfig::new(1920, 1080, 30.0)?.with_codec(VideoCodec::Uyvy);
+    let audio_config = AudioConfig::new(48000, 2)?.with_codec(AudioCodec::Pcm16)?;
 
     let source = VideoIpSource::new("Switcher Control", video_config, audio_config).await?;
     let control_tx = source.control_sender();

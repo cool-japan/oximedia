@@ -52,7 +52,13 @@ pub enum DolbyVisionCommand {
         #[arg(long)]
         to_profile: u8,
 
-        /// Preserve level metadata during conversion
+        /// Preserve Level 2 (trim pass) metadata during a Profile 8 ->
+        /// Profile 8.4 conversion instead of stripping it. Off by default:
+        /// Level 2 trims are tuned for the source's PQ target display, and
+        /// there is no real trim-pass regeneration for the new HLG target,
+        /// so carrying them forward unchanged would misrepresent stale data
+        /// as valid. Has no effect on an identity conversion (same profile
+        /// in and out), which never touches metadata either way.
         #[arg(long)]
         preserve_levels: bool,
     },
@@ -336,7 +342,7 @@ async fn run_convert(
     output: &PathBuf,
     from_profile: Option<u8>,
     to_profile: u8,
-    _preserve_levels: bool,
+    preserve_levels: bool,
     json_output: bool,
 ) -> Result<()> {
     if !input.exists() {
@@ -363,21 +369,43 @@ async fn run_convert(
 
     let path = oximedia_dolbyvision::profile_convert::ConversionPath::new(source_profile, target);
 
-    // TODO(0.2.x): `_preserve_levels` is not yet consulted. The only real
-    // transform available today (`convert_profile8_to_8_4`) always carries
-    // level metadata it doesn't itself rescale forward unchanged; a "strip
-    // levels" mode is not implemented.
-    let converted = if path.is_identity() {
-        source_rpu.clone()
+    // Real profile-pair coverage, as implemented by `oximedia-dolbyvision`
+    // today: identity (same profile in and out) and Profile 8 -> Profile
+    // 8.4 (`convert_profile8_to_8_4`, a real PQ->HLG Level 1/9 rescale).
+    // Every other pair (5<->7<->8<->8.1<->8.4) has no metadata transform in
+    // the crate — `profile_convert::DvProfileConverter::plan()` only lists
+    // *which* actions a real converter would need (strip-MEL, remap-base,
+    // regen-trims, ...), it does not execute any of them on RPU bytes. This
+    // is that ceiling, not a forgotten wiring task: refuse rather than emit
+    // a fabricated RPU for a pair nothing here can honestly produce.
+    let (converted, level2_stripped) = if path.is_identity() {
+        (source_rpu.clone(), false)
     } else if source_profile == oximedia_dolbyvision::Profile::Profile8
         && target == oximedia_dolbyvision::Profile::Profile8_4
     {
-        oximedia_dolbyvision::profile_convert::convert_profile8_to_8_4(&source_rpu)
+        let mut converted =
+            oximedia_dolbyvision::profile_convert::convert_profile8_to_8_4(&source_rpu);
+
+        // `--preserve-levels` now actually gates something: Level 2 (trim
+        // passes) is exactly the block `DvProfileConverter::plan()` marks
+        // `RegenerateTrimPasses` for on every non-identity conversion, and
+        // there is no real trim-pass regeneration to run — the source
+        // profile's trims were tuned for a PQ target display, not the HLG
+        // one this conversion just produced. Carrying them forward
+        // unchanged (the only thing `convert_profile8_to_8_4` itself does
+        // with Level 2) is a plausible default when the caller explicitly
+        // asks to preserve it; stripping is the honest default otherwise,
+        // since forwarding stale trim data silently would misrepresent it
+        // as valid for the new target. Other blocks this conversion does
+        // not touch (Level 4/5/6/7/9/11) describe things that stay true
+        // regardless of transfer function (mastering display, active area,
+        // content type, source geometry) and are always kept.
+        let level2_stripped = !preserve_levels && converted.level2.is_some();
+        if level2_stripped {
+            converted.level2 = None;
+        }
+        (converted, level2_stripped)
     } else {
-        // TODO(0.2.x): implement real metadata transforms for the
-        // remaining profile pairs (5<->7<->8<->8.1<->8.4). See
-        // `profile_convert::DvProfileConverter` for the currently-planned
-        // (but not executed) action list per path.
         return Err(anyhow::anyhow!(
             "dolby-vision convert: real profile conversion from P{} to P{to_profile} is not yet \
              implemented (only an identity conversion and Profile 8 -> Profile 8.4 have a real \
@@ -409,6 +437,8 @@ async fn run_convert(
             "to_profile": to_profile,
             "identity": path.is_identity(),
             "real_conversion": true,
+            "preserve_levels": preserve_levels,
+            "level2_stripped": level2_stripped,
         });
         let s = serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
         println!("{s}");
@@ -428,6 +458,19 @@ async fn run_convert(
                 "Profile 8 -> Profile 8.4 (real PQ->HLG rescale)".to_string()
             }
         );
+        if !path.is_identity() {
+            println!(
+                "{:20} {}",
+                "Level 2 (trims):",
+                if level2_stripped {
+                    "stripped (--preserve-levels not set; stale for the new target)".to_string()
+                } else if preserve_levels {
+                    "preserved (--preserve-levels set)".to_string()
+                } else {
+                    "absent in source (nothing to strip)".to_string()
+                }
+            );
+        }
         println!();
         println!(
             "{}",
@@ -1039,6 +1082,108 @@ mod tests {
             "with a 4000-nit mastering peak the HLG rescale must reduce max_pq \
              (source {source_max_pq}, got {})",
             converted_l1.max_pq
+        );
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&output).ok();
+    }
+
+    /// Build a Profile 8 fixture carrying real Level 1 + Level 2 data, write
+    /// it to `path`, and return the source RPU (so callers can compare
+    /// against `converted.level1` etc.).
+    fn write_p8_fixture_with_level2(
+        path: &std::path::Path,
+    ) -> oximedia_dolbyvision::DolbyVisionRpu {
+        let mut source =
+            oximedia_dolbyvision::DolbyVisionRpu::new(oximedia_dolbyvision::Profile::Profile8);
+        source.level1 = Some(oximedia_dolbyvision::Level1Metadata {
+            min_pq: 0,
+            avg_pq: 2000,
+            max_pq: 4000,
+        });
+        source.level2 = Some(oximedia_dolbyvision::Level2Metadata {
+            target_display_index: 1,
+            trim_slope: 100,
+            ..Default::default()
+        });
+        let bytes = source
+            .write_to_bitstream()
+            .expect("write_to_bitstream should succeed for a valid RPU");
+        std::fs::write(path, bytes).expect("write input fixture");
+        source
+    }
+
+    #[tokio::test]
+    async fn test_run_convert_default_strips_level2_trim_passes() {
+        let input = dv_temp_path("convert_8_to_84_strip_in.rpu");
+        let output = dv_temp_path("convert_8_to_84_strip_out.rpu");
+        let source = write_p8_fixture_with_level2(&input);
+        assert!(source.level2.is_some(), "fixture must carry Level 2 data");
+        std::fs::remove_file(&output).ok();
+
+        // Default (no --preserve-levels) must strip stale Level 2 trims.
+        run_convert(&input, &output, Some(8), 84, false, true)
+            .await
+            .expect("Profile 8 -> Profile 8.4 must succeed");
+
+        let (converted, _framing) =
+            read_and_parse_rpu(&output).expect("output must be a real, parseable RPU");
+        assert!(
+            converted.level2.is_none(),
+            "Level 2 trim passes must be stripped by default (they were tuned for the PQ \
+             target, not the HLG one this conversion just produced)"
+        );
+        // The real Level 1 rescale must still have happened — stripping
+        // Level 2 must not degrade into an identity/blank copy.
+        assert!(converted.level1.is_some());
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&output).ok();
+    }
+
+    #[tokio::test]
+    async fn test_run_convert_preserve_levels_keeps_level2() {
+        let input = dv_temp_path("convert_8_to_84_preserve_in.rpu");
+        let output = dv_temp_path("convert_8_to_84_preserve_out.rpu");
+        write_p8_fixture_with_level2(&input);
+        std::fs::remove_file(&output).ok();
+
+        run_convert(&input, &output, Some(8), 84, true, true)
+            .await
+            .expect("Profile 8 -> Profile 8.4 must succeed");
+
+        let (converted, _framing) =
+            read_and_parse_rpu(&output).expect("output must be a real, parseable RPU");
+        let l2 = converted
+            .level2
+            .expect("--preserve-levels must keep Level 2 trim passes");
+        assert_eq!(
+            l2.trim_slope, 100,
+            "preserved Level 2 must be the source's own data"
+        );
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&output).ok();
+    }
+
+    #[tokio::test]
+    async fn test_run_convert_identity_never_strips_regardless_of_preserve_levels() {
+        // Identity conversions (P8 -> P8) are a plain clone, not a
+        // Profile-8-to-8.4 rescale; `--preserve-levels` must not touch them.
+        let input = dv_temp_path("convert_identity_level2_in.rpu");
+        let output = dv_temp_path("convert_identity_level2_out.rpu");
+        write_p8_fixture_with_level2(&input);
+        std::fs::remove_file(&output).ok();
+
+        run_convert(&input, &output, None, 8, false, true)
+            .await
+            .expect("identity conversion must succeed");
+
+        let (converted, _framing) =
+            read_and_parse_rpu(&output).expect("output must be a real, parseable RPU");
+        assert!(
+            converted.level2.is_some(),
+            "identity conversion must never strip metadata, even with --preserve-levels unset"
         );
 
         std::fs::remove_file(&input).ok();

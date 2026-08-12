@@ -1,6 +1,6 @@
 # oximedia-renderfarm
 
-**Status: [Stable]** | Version: 0.2.0 | Tests: extensively tested | Updated: 2026-07-14
+**Status: [Stable]** | Version: 0.2.1 | Tests: extensively tested | Updated: 2026-08-12
 
 Enterprise-grade render farm coordinator for OxiMedia. Provides distributed media rendering with job management, worker pools, advanced scheduling, cloud bursting, fault tolerance, and real-time monitoring.
 
@@ -39,7 +39,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-renderfarm = "0.1.9"
+oximedia-renderfarm = "0.2.0"
 ```
 
 ```rust

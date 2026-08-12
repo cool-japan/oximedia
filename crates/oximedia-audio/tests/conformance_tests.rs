@@ -564,63 +564,68 @@ fn r128_compliance_check_via_loudness_meter() {
 // ---------------------------------------------------------------------------
 // EBU R128 absolute calibration (golden values)
 //
-// These pin the headline BS.1770-4 calibration after the loudness power
-// double-weighting bug fix in `loudness/gate.rs`. The helper runs the FULL
-// K-weighted `R128Meter` path, so the ITU-R BS.1770-4 K-weighting pre-filter
-// is applied before gating. Contrary to the common "0 dB at 1 kHz" shorthand,
-// the K-weighting magnitude at 1 kHz / 48 kHz is **+3.4554 dB** (the curve only
-// crosses 0 dB near ~2 kHz). For a 1 kHz sine of amplitude A the unweighted
-// per-channel mean square is A²/2, the K-weighted channel energy is
-// z_i = (A²/2)·|H_K(1 kHz)|² = (A²/2)·2.21586, and the gated loudness is
+// These pin the headline BS.1770-4 calibration. The helper runs the FULL
+// K-weighted `R128Meter` path, so the ITU-R BS.1770-4 K-weighting filter chain
+// is applied before gating. The chain magnitude at 1 kHz / 48 kHz is
+// **+0.6977 dB** (Table 1 coefficients; it is −1.13 dB at 100 Hz and +3.97 dB
+// at 4 kHz — see `loudness::filter::tests::test_k_weight_chain_matches_itu_table1`).
+// For a 1 kHz sine of amplitude A the unweighted per-channel mean square is
+// A²/2, the K-weighted channel energy is
+// z_i = (A²/2)·|H_K(1 kHz)|² = (A²/2)·1.17395, and the gated loudness is
 // L = −0.691 + 10·log10(Σ Gi·z_i):
-//   * mono  (G = 1):       L = −0.691 + 10·log10(A²/2)        + 3.4554
-//   * stereo (G = 1 + 1):  L = −0.691 + 10·log10(2·A²/2)      + 3.4554
+//   * mono  (G = 1):       L = −0.691 + 10·log10(A²/2)        + 0.6977
+//   * stereo (G = 1 + 1):  L = −0.691 + 10·log10(2·A²/2)      + 0.6977
 //                            = mono + 10·log10(2)             (Δ = +3.0103 LU)
 //
-// Unweighted reference (mono), then the measured K-weighted golden value:
-//   A = 1.0 → −0.691 + 10·log10(0.5)    = −3.701  → −3.701  + 3.4554 = −0.246 LUFS
-//   A = 0.5 → −0.691 + 10·log10(0.125)  = −9.722  → −9.722  + 3.4554 = −6.267 LUFS
-//   A = 0.1 → −0.691 + 10·log10(0.005)  = −23.701 → −23.701 + 3.4554 = −20.246 LUFS
+// Unweighted reference (mono), then the K-weighted golden value:
+//   A = 1.0 → −0.691 + 10·log10(0.5)    = −3.701  → −3.701  + 0.6977 = −3.003 LUFS
+//   A = 0.5 → −0.691 + 10·log10(0.125)  = −9.722  → −9.722  + 0.6977 = −9.024 LUFS
+//   A = 0.1 → −0.691 + 10·log10(0.005)  = −23.701 → −23.701 + 0.6977 = −23.003 LUFS
 // The +3.0103 LU mono→stereo channel-sum delta is independent of K-weighting.
+//
+// NOTE: these golden values were previously written against a K-weighting
+// implementation whose Stage 1 was a high-pass scaled by the *decibel* value
+// 3.9998 used as a linear gain and whose Stage 2 was a +1 dB high-shelf. That
+// chain measured +3.4554 dB at 1 kHz (and was ≈ −35 dB off at 100 Hz), so the
+// old goldens (−0.246 / −6.267 / −20.246 / −17.235) encoded the bug.
 // ---------------------------------------------------------------------------
 
-/// EBU R128 calibration: 1 kHz mono sine at amplitude 1.0 reads −0.25 LUFS
-/// (unweighted −3.70 + K-weighting +3.4554 dB at 1 kHz).
+/// EBU R128 calibration: 1 kHz mono sine at amplitude 1.0 reads −3.00 LUFS
+/// (unweighted −3.70 + K-weighting +0.6977 dB at 1 kHz).
 #[test]
 fn r128_calibration_mono_amp_1_0() {
     let lufs = measure_sine_integrated_lufs(1.0, 48000, 1, 4.0);
     assert!(
-        (lufs - (-0.246)).abs() < 0.5,
-        "mono amp 1.0 must read ≈ −0.25 LUFS (BS.1770 K-weighted calibration), got {lufs:.3}"
+        (lufs - (-3.003)).abs() < 0.5,
+        "mono amp 1.0 must read ≈ −3.00 LUFS (BS.1770 K-weighted calibration), got {lufs:.3}"
     );
 }
 
-/// EBU R128 calibration: 1 kHz mono sine at amplitude 0.5 reads −6.27 LUFS
-/// (unweighted −9.72 + K-weighting +3.4554 dB at 1 kHz).
+/// EBU R128 calibration: 1 kHz mono sine at amplitude 0.5 reads −9.02 LUFS
+/// (unweighted −9.72 + K-weighting +0.6977 dB at 1 kHz).
 #[test]
 fn r128_calibration_mono_amp_0_5() {
     let lufs = measure_sine_integrated_lufs(0.5, 48000, 1, 4.0);
     assert!(
-        (lufs - (-6.267)).abs() < 0.5,
-        "mono amp 0.5 must read ≈ −6.27 LUFS (K-weighted), got {lufs:.3}"
+        (lufs - (-9.024)).abs() < 0.5,
+        "mono amp 0.5 must read ≈ −9.02 LUFS (K-weighted), got {lufs:.3}"
     );
 }
 
 /// EBU R128 calibration: 1 kHz mono sine at amplitude 0.1 (−20 dBFS peak) reads
-/// −20.25 LUFS (unweighted −23.70 + K-weighting +3.4554 dB at 1 kHz). This is
-/// the headline calibration the gate.rs `frames`-divisor fix restores.
+/// −23.00 LUFS (unweighted −23.70 + K-weighting +0.6977 dB at 1 kHz).
 #[test]
 fn r128_calibration_mono_amp_0_1_headline() {
     let lufs = measure_sine_integrated_lufs(0.1, 48000, 1, 4.0);
     assert!(
-        (lufs - (-20.246)).abs() < 0.5,
-        "mono amp 0.1 (−20 dBFS) must read ≈ −20.25 LUFS (K-weighted), got {lufs:.3}"
+        (lufs - (-23.003)).abs() < 0.5,
+        "mono amp 0.1 (−20 dBFS) must read ≈ −23.00 LUFS (K-weighted), got {lufs:.3}"
     );
 }
 
 /// EBU R128 calibration: stereo (equal channels) is exactly +3.0103 LU above
 /// mono (two unity-weight channels SUM their powers), and the absolute stereo
-/// amp-0.1 reading is ≈ −20.69 LUFS.
+/// amp-0.1 reading is ≈ −19.99 LUFS.
 #[test]
 fn r128_calibration_stereo_channel_sum_plus_3db() {
     let mono = measure_sine_integrated_lufs(0.1, 48000, 1, 4.0);
@@ -637,10 +642,10 @@ fn r128_calibration_stereo_channel_sum_plus_3db() {
         "stereo must be +3.0103 LU above mono (channel-power sum), got Δ={:.3}",
         stereo - mono
     );
-    // Absolute: K-weighted mono −20.246 + 3.0103 = −17.235 LUFS.
+    // Absolute: K-weighted mono −23.003 + 3.0103 = −19.993 LUFS.
     assert!(
-        (stereo - (-17.235)).abs() < 0.5,
-        "stereo amp 0.1 must read ≈ −17.24 LUFS (K-weighted), got {stereo:.3}"
+        (stereo - (-19.993)).abs() < 0.5,
+        "stereo amp 0.1 must read ≈ −19.99 LUFS (K-weighted), got {stereo:.3}"
     );
 }
 

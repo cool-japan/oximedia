@@ -38,6 +38,22 @@
 //!
 //! - Streaming loudness requirements
 //! - Platform-specific targets (Spotify, YouTube, Apple Music, Netflix, Amazon Prime)
+//!
+//! # Module status — NOT COMPILED
+//!
+//! This file is **not declared** in `meters/mod.rs`, so it is not part of the
+//! build. It also does not currently compile: `KWeightingFilter::process`
+//! borrows `self` immutably (`&self.pre_b`) and `self.pre_state[channel]`
+//! mutably in the same call (two `E0502` errors). Wiring it up therefore needs
+//! that borrow split fixed first, plus a clippy pass.
+//!
+//! The K-weighting coefficients below were corrected in 0.2.1 to match
+//! ITU-R BS.1770-4 (Stage 1 is a +4 dB high-shelf, not a high-pass scaled by
+//! the shelf gain read as a linear factor) so that reviving the module does not
+//! resurrect the bug — but, because the file is not built, that correction is
+//! *unverified by tests*. The live, tested implementations are
+//! `crate::loudness::filter::KWeightFilter` and
+//! `oximedia_metering::ebu_r128_impl::KWeightingFilter`.
 
 #![forbid(unsafe_code)]
 
@@ -47,10 +63,15 @@ use std::collections::VecDeque;
 /// ITU-R BS.1770-4 K-weighting filter implementation.
 ///
 /// The K-weighting consists of two stages:
-/// 1. Pre-filter: High-pass filter at ~75 Hz (78.5 Hz)
-/// 2. RLB filter: Revised low-frequency B-weighting
+/// 1. Pre-filter: high-shelf modelling the acoustic effect of the head
+///    (f₀ ≈ 1 682 Hz, G ≈ +4 dB, Q ≈ 0.7071)
+/// 2. RLB filter: revised low-frequency B-weighting **high-pass**
+///    (f₀ ≈ 38.135 Hz, Q ≈ 0.5003)
+///
+/// The resulting chain is −1.13 dB at 100 Hz, +0.69 dB at 997 Hz and
+/// +3.97 dB at 4 kHz.
 pub struct KWeightingFilter {
-    /// Pre-filter coefficients (high-pass).
+    /// Pre-filter coefficients (high-shelf).
     pre_b: [f64; 3],
     pre_a: [f64; 3],
     /// RLB filter coefficients.
@@ -97,19 +118,26 @@ impl KWeightingFilter {
     /// * `sample_rate` - Sample rate in Hz
     /// * `channels` - Number of audio channels
     pub fn new(sample_rate: f64, channels: usize) -> Self {
-        // Pre-filter coefficients (high-pass at 78.5 Hz)
+        // Stage 1 — high-shelf pre-filter (acoustic effect of the head).
+        // f0 = 1681.974 Hz, G = 3.99984 *decibels*, Q = 0.707175.
         let f0 = 1681.974450955533;
-        let g = 3.999843853973347;
+        let g_db = 3.999843853973347;
         let q = 0.7071752369554196;
 
         let k = (std::f64::consts::PI * f0 / sample_rate).tan();
         let k2 = k * k;
-        let norm = 1.0 / (1.0 + k / q + k2);
+        let vh = 10.0_f64.powf(g_db / 20.0); // linear gain of the shelf
+        let vb = vh.powf(0.5); // mid-band gain (geometric mean)
+        let denom = 1.0 + k / q + k2;
 
-        let pre_b = [g * norm, -2.0 * g * norm, g * norm];
-        let pre_a = [1.0, 2.0 * (k2 - 1.0) * norm, (1.0 - k / q + k2) * norm];
+        let pre_b = [
+            (vh + vb * k / q + k2) / denom,
+            2.0 * (k2 - vh) / denom,
+            (vh - vb * k / q + k2) / denom,
+        ];
+        let pre_a = [1.0, 2.0 * (k2 - 1.0) / denom, (1.0 - k / q + k2) / denom];
 
-        // RLB filter coefficients (revised low-frequency B-weighting)
+        // Stage 2 — RLB high-pass (revised low-frequency B-weighting).
         let f0_rlb = 38.13547087602444;
         let q_rlb = 0.5003270373238773;
         let k_rlb = (std::f64::consts::PI * f0_rlb / sample_rate).tan();
@@ -1076,3 +1104,4 @@ fn extract_samples_f64(frame: &AudioFrame) -> Vec<f64> {
         }
     }
 }
+

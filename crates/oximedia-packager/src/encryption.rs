@@ -247,6 +247,110 @@ impl EncryptionHandler {
         ))
     }
 
+    /// Encrypts `data`, routing pattern-based schemes (`SampleAes`, i.e. the
+    /// CENC `cbcs` scheme) through NAL-unit-aware subsample mapping when
+    /// `codec` is NAL-structured (see [`codec_structure_for`]); every other
+    /// method/codec combination behaves exactly like [`Self::encrypt`], which
+    /// remains available directly for callers that don't have a codec name at
+    /// hand.
+    ///
+    /// # Errors
+    /// See [`Self::encrypt`]. For `SampleAes` with a NAL-structured `codec`,
+    /// additionally returns [`PackagerError::EncryptionError`] if `data` is
+    /// not validly length-prefixed (see [`nal_subsamples`]).
+    pub fn encrypt_for_codec(&self, data: &[u8], codec: &str) -> PackagerResult<Vec<u8>> {
+        if !self.is_enabled() || self.method != EncryptionMethod::SampleAes {
+            return self.encrypt(data);
+        }
+        match codec_structure_for(codec) {
+            CodecStructure::Elementary => self.encrypt(data),
+            CodecStructure::NalLengthPrefixed {
+                length_size,
+                header_style,
+            } => self.encrypt_sample_aes_nal(data, length_size, header_style),
+        }
+    }
+
+    /// Inverse of [`Self::encrypt_for_codec`].
+    ///
+    /// # Errors
+    /// See [`Self::encrypt_for_codec`].
+    pub fn decrypt_for_codec(&self, data: &[u8], codec: &str) -> PackagerResult<Vec<u8>> {
+        if !self.is_enabled() || self.method != EncryptionMethod::SampleAes {
+            return self.decrypt(data);
+        }
+        match codec_structure_for(codec) {
+            CodecStructure::Elementary => self.decrypt(data),
+            CodecStructure::NalLengthPrefixed {
+                length_size,
+                header_style,
+            } => self.decrypt_sample_aes_nal(data, length_size, header_style),
+        }
+    }
+
+    /// NAL-unit-aware `cbcs` encryption — see [`nal_subsamples`] and
+    /// [`sample_aes_cbcs_encrypt_subsamples`].
+    #[cfg(feature = "encryption")]
+    fn encrypt_sample_aes_nal(
+        &self,
+        data: &[u8],
+        length_size: u8,
+        header_style: NalHeaderStyle,
+    ) -> PackagerResult<Vec<u8>> {
+        let key_info = self
+            .key_info
+            .as_ref()
+            .ok_or_else(|| PackagerError::EncryptionError("Key info not set".to_string()))?;
+        let subsamples = nal_subsamples(data, length_size, header_style)?;
+        ensure_nal_sample_has_protected_data(data, &subsamples)?;
+        sample_aes_cbcs_encrypt_subsamples(&key_info.key, &key_info.iv, data, &subsamples)
+    }
+
+    /// NAL-aware SAMPLE-AES encryption stub when the `encryption` feature is
+    /// disabled.
+    #[cfg(not(feature = "encryption"))]
+    fn encrypt_sample_aes_nal(
+        &self,
+        _data: &[u8],
+        _length_size: u8,
+        _header_style: NalHeaderStyle,
+    ) -> PackagerResult<Vec<u8>> {
+        Err(PackagerError::EncryptionError(
+            "Encryption feature not enabled".to_string(),
+        ))
+    }
+
+    /// Inverse of [`Self::encrypt_sample_aes_nal`].
+    #[cfg(feature = "encryption")]
+    fn decrypt_sample_aes_nal(
+        &self,
+        data: &[u8],
+        length_size: u8,
+        header_style: NalHeaderStyle,
+    ) -> PackagerResult<Vec<u8>> {
+        let key_info = self
+            .key_info
+            .as_ref()
+            .ok_or_else(|| PackagerError::EncryptionError("Key info not set".to_string()))?;
+        let subsamples = nal_subsamples(data, length_size, header_style)?;
+        ensure_nal_sample_has_protected_data(data, &subsamples)?;
+        sample_aes_cbcs_decrypt_subsamples(&key_info.key, &key_info.iv, data, &subsamples)
+    }
+
+    /// NAL-aware SAMPLE-AES decryption stub when the `encryption` feature is
+    /// disabled.
+    #[cfg(not(feature = "encryption"))]
+    fn decrypt_sample_aes_nal(
+        &self,
+        _data: &[u8],
+        _length_size: u8,
+        _header_style: NalHeaderStyle,
+    ) -> PackagerResult<Vec<u8>> {
+        Err(PackagerError::EncryptionError(
+            "Encryption feature not enabled".to_string(),
+        ))
+    }
+
     /// Encrypt with Common Encryption `cenc` (ISO/IEC 23001-7): full-sample
     /// AES-128 in CTR mode. The 16-byte IV is used as the initial 128-bit
     /// big-endian counter block, incremented once per 16-byte block. CTR is the
@@ -504,6 +608,383 @@ fn sample_aes_cbcs_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> PackagerResult
     }
 
     out.extend_from_slice(&data[full_blocks * AES_BLOCK..]);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// NAL-unit-aware subsample mapping for `cbcs` pattern encryption.
+//
+// The functions above (`sample_aes_cbcs_encrypt`/`_decrypt`) apply the
+// crypt/skip pattern over a whole buffer, which is spec-correct for
+// elementary payloads (AV1/VP9/VP8/Opus/Vorbis/FLAC — see
+// `CodecStructure::Elementary`) but not for NAL-structured codecs (AVC/HEVC),
+// where CENC requires clear NAL headers/slice headers and pattern encryption
+// scoped to each NAL's protected data (ISO/IEC 23001-7 §10.4). This section
+// parses length-prefixed NAL units (ISO/IEC 14496-15) into CENC subsamples
+// and applies pattern encryption per subsample.
+// ---------------------------------------------------------------------------
+
+/// NAL unit header format, used to classify a NAL unit as VCL (slice data) or
+/// non-VCL (parameter sets, SEI, delimiters, …) for CENC `cbcs` subsample
+/// mapping. Different NAL-structured codec families place `nal_unit_type` at
+/// a different bit offset and give it a different VCL range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NalHeaderStyle {
+    /// ITU-T H.264 / AVC: a 1-byte NAL header (`forbidden_zero_bit(1) +
+    /// nal_ref_idc(2) + nal_unit_type(5)`). VCL (slice) types are 1-5
+    /// (non-IDR slice, slice data partitions A/B/C, IDR slice); every other
+    /// type (6=SEI, 7=SPS, 8=PPS, 9=AUD, …) is non-VCL.
+    Avc,
+    /// ITU-T H.265 / HEVC: a 2-byte NAL header (`forbidden_zero_bit(1) +
+    /// nal_unit_type(6) + nuh_layer_id(6) + nuh_temporal_id_plus1(3)`,
+    /// `nal_unit_type` entirely within the first byte). VCL (slice) types are
+    /// 0-31; types 32 and above (VPS/SPS/PPS/SEI/AUD/…) are non-VCL.
+    Hevc,
+}
+
+/// How a codec's sample payload is structured, for CENC `cbcs` pattern
+/// encryption routing.
+///
+/// [`codec_structure_for`] maps a codec name (as used in
+/// [`crate::config::BitrateEntry::codec`]) to this; [`EncryptionHandler`]'s
+/// `*_for_codec` methods use it to choose between the whole-buffer pattern
+/// path (spec-correct for elementary payloads) and NAL-unit-aware subsample
+/// mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecStructure {
+    /// One opaque elementary block per sample, with no internal unit framing
+    /// this crate parses: AV1, VP9, VP8, Opus, Vorbis, FLAC, PCM, and any
+    /// codec name not recognized by [`codec_structure_for`].
+    ///
+    /// `cbcs` pattern encryption is applied over the whole sample buffer —
+    /// the ISO/IEC 23001-7 spec-correct behavior for elementary payloads.
+    ///
+    /// AV1 is intentionally kept on this path rather than faked: the AV1
+    /// Codec ISOBMFF Binding Specification defines its own OBU-based
+    /// subsample rules (each OBU is its own subsample, with large frames
+    /// split further at tile-group boundaries), a materially different — and
+    /// currently unimplemented — mapping from the NAL model below. Encrypting
+    /// AV1 with the whole-buffer path is honest (it matches this crate's
+    /// actual capability); claiming OBU-aware subsampling without
+    /// implementing it would not be.
+    Elementary,
+    /// A sequence of length-prefixed NAL units per ISO/IEC 14496-15 (the
+    /// AVC/HEVC ISOBMFF "sample format"): each unit is `[length: length_size
+    /// bytes, big-endian][NAL unit bytes]`.
+    ///
+    /// None of the codecs this tree currently emits (AV1/VP9/VP8 video,
+    /// Opus/Vorbis/FLAC audio — see
+    /// [`crate::variant_stream::StreamCodec`]) use this framing;
+    /// [`codec_structure_for`] only returns this variant for H.264/H.265
+    /// codec names. It exists so `cbcs` subsample mapping is ready for those
+    /// codecs, and is directly exercised by [`nal_subsamples`] and the NAL
+    /// subsample tests in this module.
+    NalLengthPrefixed {
+        /// Length-field size in bytes: 1, 2, or 4 (`lengthSizeMinusOne + 1`
+        /// from the `avcC`/`hvcC` box when known; 4 is by far the most
+        /// common value in the wild and is what [`codec_structure_for`]
+        /// assumes).
+        length_size: u8,
+        /// NAL header layout used to tell VCL (slice) NAL units apart from
+        /// non-VCL ones.
+        header_style: NalHeaderStyle,
+    },
+}
+
+/// Maps a short codec name (as used in [`crate::config::BitrateEntry::codec`]
+/// / [`crate::ladder::SourceInfo::codec`]) to its [`CodecStructure`] for
+/// `cbcs` subsample routing. Matching is case-insensitive.
+///
+/// | Codec name(s) | Structure |
+/// |---|---|
+/// | `av1`, `vp9`, `vp8` (this tree's video codecs) | [`CodecStructure::Elementary`] |
+/// | `opus`, `vorbis`, `flac` (this tree's audio codecs) | [`CodecStructure::Elementary`] |
+/// | `h264`, `avc`, `avc1`, `avc3` | [`CodecStructure::NalLengthPrefixed`] with [`NalHeaderStyle::Avc`] |
+/// | `h265`, `hevc`, `hvc1`, `hev1` | [`CodecStructure::NalLengthPrefixed`] with [`NalHeaderStyle::Hevc`] |
+/// | anything else | [`CodecStructure::Elementary`] (safe default — whole-buffer pattern encryption can't corrupt stream structure the way a wrong NAL parse could) |
+#[must_use]
+pub fn codec_structure_for(codec: &str) -> CodecStructure {
+    match codec.to_ascii_lowercase().as_str() {
+        "h264" | "avc" | "avc1" | "avc3" => CodecStructure::NalLengthPrefixed {
+            length_size: 4,
+            header_style: NalHeaderStyle::Avc,
+        },
+        "h265" | "hevc" | "hvc1" | "hev1" => CodecStructure::NalLengthPrefixed {
+            length_size: 4,
+            header_style: NalHeaderStyle::Hevc,
+        },
+        _ => CodecStructure::Elementary,
+    }
+}
+
+/// One CENC subsample split (ISO/IEC 23001-7 `SubSampleEntry`): within a
+/// sample, `clear_bytes` leading bytes are left unencrypted, followed by
+/// `protected_bytes` bytes subject to the active encryption scheme (for
+/// `cbcs`, the crypt/skip pattern — see [`nal_subsamples`]).
+///
+/// These are logical, in-memory subsamples consumed directly by
+/// [`EncryptionHandler::encrypt_for_codec`] / `decrypt_for_codec`; this crate
+/// does not currently serialize a `senc`/`saiz`/`saio` box. Note for any
+/// future writer: the real `SubSampleEntry.bytes_of_clear_data` field is
+/// `unsigned int(16)`, narrower than `clear_bytes` here — a clear run over
+/// 65535 bytes (e.g. an unusually large non-VCL NAL) would need splitting
+/// into multiple zero-protected entries to serialize into that box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsampleEntry {
+    /// Number of leading clear (unencrypted) bytes.
+    pub clear_bytes: u32,
+    /// Number of following bytes subject to the active encryption pattern.
+    pub protected_bytes: u32,
+}
+
+/// VCL (slice data) vs non-VCL classification of a single NAL unit, used to
+/// decide whether [`nal_subsamples`] gives it a clear leader plus pattern
+/// encryption, or leaves the whole unit clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NalKind {
+    /// Slice data: carries a slice header followed by coded picture data.
+    Vcl,
+    /// Parameter sets, SEI, access unit delimiters, and everything else a
+    /// decoder must be able to read even without a license.
+    NonVcl,
+}
+
+/// Classifies a single NAL unit's payload (the bytes *after* its length
+/// prefix) as VCL or non-VCL, per `header_style`.
+///
+/// Matches Apple's HLS SAMPLE-AES specification for AVC (NAL types 1 and 5
+/// are the slice types it requires to be encrypted; this generalizes to the
+/// full VCL range 1-5 per ITU-T H.264, and to 0-31 for HEVC per ITU-T H.265)
+/// and real-world CENC packagers, which likewise leave parameter sets and SEI
+/// fully clear so a decoder can always read stream structure without a key.
+fn nal_kind(nal_payload: &[u8], header_style: NalHeaderStyle) -> NalKind {
+    let Some(&first) = nal_payload.first() else {
+        return NalKind::NonVcl;
+    };
+    let is_vcl = match header_style {
+        NalHeaderStyle::Avc => (1..=5).contains(&(first & 0x1F)),
+        NalHeaderStyle::Hevc => ((first >> 1) & 0x3F) <= 31,
+    };
+    if is_vcl {
+        NalKind::Vcl
+    } else {
+        NalKind::NonVcl
+    }
+}
+
+/// Clear leader length, in bytes of NAL *payload* (counted from the NAL
+/// header byte, not including the length prefix), that CENC `cbcs` leaves
+/// unencrypted at the start of a VCL NAL unit: the NAL header plus enough of
+/// the slice header to be a safe, decoder-independent boundary. Matches
+/// Apple's HLS SAMPLE-AES specification ("the byte containing nal_unit_type,
+/// plus the 31 bytes that follow, are unencrypted") and is the value used by
+/// mainstream CENC `cbcs` packagers for AVC/HEVC.
+const NAL_CLEAR_LEAD_BYTES: usize = 32;
+
+/// Parses `data` as a sequence of length-prefixed NAL units (ISO/IEC
+/// 14496-15) and computes the CENC subsample split that `cbcs` pattern
+/// encryption must honor for each one (ISO/IEC 23001-7 §10.4 — pattern
+/// encryption applies to the protected portion of each subsample, video NAL
+/// payloads only):
+///
+/// - Non-VCL NAL units (parameter sets, SEI, delimiters — see `nal_kind`)
+///   are emitted as fully clear subsamples (`protected_bytes = 0`), since a
+///   decoder must be able to read them without a license.
+/// - VCL (slice) NAL units get a `NAL_CLEAR_LEAD_BYTES`-byte clear leader
+///   (or the whole payload, if shorter) covering the NAL header and slice
+///   header; the remainder is `protected` for the caller to pattern-encrypt.
+///
+/// In both cases the length-prefix field itself is always counted as clear —
+/// a decryptor/demuxer must be able to walk NAL boundaries in the encrypted
+/// bitstream, which is the entire reason `cbcs` leaves framing visible.
+///
+/// # Errors
+/// Returns [`PackagerError::EncryptionError`] if `data` is truncated relative
+/// to its own length prefixes (a malformed or non-NAL-structured buffer), if
+/// a declared NAL length would overflow, or if `length_size` is not `1..=4`.
+pub fn nal_subsamples(
+    data: &[u8],
+    length_size: u8,
+    header_style: NalHeaderStyle,
+) -> PackagerResult<Vec<SubsampleEntry>> {
+    let length_size = length_size as usize;
+    if !(1..=4).contains(&length_size) {
+        return Err(PackagerError::EncryptionError(format!(
+            "NAL length size must be 1-4 bytes, got {length_size}"
+        )));
+    }
+
+    let mut subsamples = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        if offset + length_size > data.len() {
+            return Err(PackagerError::EncryptionError(format!(
+                "truncated NAL length prefix at offset {offset} ({} bytes remain, need {length_size})",
+                data.len() - offset
+            )));
+        }
+        let nal_len = data[offset..offset + length_size]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | b as usize);
+        let payload_start = offset + length_size;
+        let Some(payload_end) = payload_start.checked_add(nal_len) else {
+            return Err(PackagerError::EncryptionError(format!(
+                "NAL unit at offset {offset} declares an overflowing length {nal_len}"
+            )));
+        };
+        if payload_end > data.len() {
+            return Err(PackagerError::EncryptionError(format!(
+                "NAL unit at offset {offset} declares length {nal_len} but only {} bytes remain",
+                data.len() - payload_start
+            )));
+        }
+
+        let payload = &data[payload_start..payload_end];
+        let entry = match nal_kind(payload, header_style) {
+            NalKind::NonVcl => SubsampleEntry {
+                clear_bytes: (length_size + nal_len) as u32,
+                protected_bytes: 0,
+            },
+            NalKind::Vcl => {
+                let clear_payload = nal_len.min(NAL_CLEAR_LEAD_BYTES);
+                SubsampleEntry {
+                    clear_bytes: (length_size + clear_payload) as u32,
+                    protected_bytes: (nal_len - clear_payload) as u32,
+                }
+            }
+        };
+        subsamples.push(entry);
+
+        offset = payload_end;
+    }
+
+    Ok(subsamples)
+}
+
+/// Sanity-checks that `subsamples` actually reflects NAL-structured video
+/// data before pattern encryption/decryption proceeds.
+///
+/// [`nal_subsamples`] is a purely structural parser: fed a buffer that isn't
+/// really length-prefixed AVC/HEVC, it can still return `Ok` with a split
+/// that "parses" cleanly but is wrong — most notably, Annex-B byte-stream
+/// framing (`00 00 00 01` start codes) misreads as a sequence of near-zero
+/// declared NAL lengths, every one short enough to be classified fully clear.
+/// Encrypting such a misparse would return the buffer completely unmodified
+/// while still reporting success, which is exactly the "`Ok` for protection
+/// that didn't happen" failure this crate's honesty policy forbids — so a
+/// non-empty sample whose subsamples are *all* fully clear
+/// (`protected_bytes == 0` everywhere) is treated as a hard error instead of
+/// silently returned as if it had been protected.
+///
+/// A real coded video access unit always contains at least one VCL (slice)
+/// NAL carrying actual picture data, so this cannot reject genuine input
+/// unless every slice in the sample is implausibly small (under
+/// [`NAL_CLEAR_LEAD_BYTES`] bytes) — samples with at least one normally-sized
+/// slice are unaffected.
+///
+/// # Errors
+/// Returns [`PackagerError::EncryptionError`] when `data` is non-empty and no
+/// subsample has any protected bytes.
+#[cfg(feature = "encryption")]
+fn ensure_nal_sample_has_protected_data(
+    data: &[u8],
+    subsamples: &[SubsampleEntry],
+) -> PackagerResult<()> {
+    if !data.is_empty() && subsamples.iter().all(|s| s.protected_bytes == 0) {
+        return Err(PackagerError::EncryptionError(
+            "NAL-structured cbcs encryption found no protected (VCL slice) data anywhere in \
+             this sample; the buffer is likely not really length-prefixed AVC/HEVC (ISO/IEC \
+             14496-15) -- e.g. Annex-B start-code framing would misparse this way -- refusing \
+             rather than silently returning it unencrypted"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Encrypts `data` (a sample already split into `subsamples` — see
+/// [`nal_subsamples`]) with the CENC `cbcs` pattern, subsample by subsample:
+/// each subsample's clear bytes pass through unchanged, and its protected
+/// bytes are independently pattern-encrypted via [`sample_aes_cbcs_encrypt`].
+///
+/// Per ISO/IEC 23001-7 and matching real-world implementations — verified
+/// against FFmpeg's `cbcs_scheme_decrypt` (`libavformat/mov.c`, which
+/// `memcpy`s the *sample* IV back into its working IV at the start of every
+/// subsample) and Shaka Packager's `kUseConstantIv` pattern cryptor — both the
+/// crypt/skip pattern cycle *and* the AES-CBC chaining value restart at the
+/// beginning of every subsample's protected range, reseeded from the sample
+/// IV each time; neither carries over from the previous subsample. That is
+/// exactly what the single-buffer [`sample_aes_cbcs_encrypt`] already does, so
+/// each subsample can reuse it directly with the unmodified sample IV.
+#[cfg(feature = "encryption")]
+fn sample_aes_cbcs_encrypt_subsamples(
+    key: &[u8],
+    iv: &[u8],
+    data: &[u8],
+    subsamples: &[SubsampleEntry],
+) -> PackagerResult<Vec<u8>> {
+    let total: usize = subsamples
+        .iter()
+        .map(|s| s.clear_bytes as usize + s.protected_bytes as usize)
+        .sum();
+    if total != data.len() {
+        return Err(PackagerError::EncryptionError(format!(
+            "subsample byte total {total} does not match sample length {}",
+            data.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(data.len());
+    let mut offset = 0usize;
+    for sub in subsamples {
+        let clear_len = sub.clear_bytes as usize;
+        out.extend_from_slice(&data[offset..offset + clear_len]);
+        offset += clear_len;
+
+        let protected_len = sub.protected_bytes as usize;
+        let encrypted = sample_aes_cbcs_encrypt(key, iv, &data[offset..offset + protected_len])?;
+        out.extend_from_slice(&encrypted);
+        offset += protected_len;
+    }
+
+    Ok(out)
+}
+
+/// Decrypts data produced by [`sample_aes_cbcs_encrypt_subsamples`] (exact
+/// inverse — `subsamples` must be the same split, which is safe to recompute
+/// from the ciphertext via [`nal_subsamples`] since clear bytes, including
+/// every NAL length prefix and header, are never modified by encryption).
+#[cfg(feature = "encryption")]
+fn sample_aes_cbcs_decrypt_subsamples(
+    key: &[u8],
+    iv: &[u8],
+    data: &[u8],
+    subsamples: &[SubsampleEntry],
+) -> PackagerResult<Vec<u8>> {
+    let total: usize = subsamples
+        .iter()
+        .map(|s| s.clear_bytes as usize + s.protected_bytes as usize)
+        .sum();
+    if total != data.len() {
+        return Err(PackagerError::EncryptionError(format!(
+            "subsample byte total {total} does not match sample length {}",
+            data.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(data.len());
+    let mut offset = 0usize;
+    for sub in subsamples {
+        let clear_len = sub.clear_bytes as usize;
+        out.extend_from_slice(&data[offset..offset + clear_len]);
+        offset += clear_len;
+
+        let protected_len = sub.protected_bytes as usize;
+        let decrypted = sample_aes_cbcs_decrypt(key, iv, &data[offset..offset + protected_len])?;
+        out.extend_from_slice(&decrypted);
+        offset += protected_len;
+    }
+
     Ok(out)
 }
 
@@ -946,5 +1427,310 @@ mod tests {
             has_clear_block,
             "cbcs must leave skip blocks in the clear (not full-buffer CBC)"
         );
+    }
+
+    // --- NAL-unit-aware subsample mapping ----------------------------------
+
+    /// Builds a synthetic NAL unit payload: `header` byte followed by
+    /// `extra_len` bytes of deterministic filler content.
+    fn build_test_nal(header: u8, extra_len: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(1 + extra_len);
+        v.push(header);
+        v.extend((0..extra_len).map(|i| (i as u8).wrapping_mul(7).wrapping_add(3)));
+        v
+    }
+
+    /// Concatenates NAL unit payloads into a length-prefixed sample buffer
+    /// (4-byte big-endian length per unit, per ISO/IEC 14496-15).
+    fn build_nal_sample(nals: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for nal in nals {
+            out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            out.extend_from_slice(nal);
+        }
+        out
+    }
+
+    #[test]
+    fn test_nal_subsamples_boundaries_and_byte_counts() {
+        // SPS (type 7, non-VCL, 10-byte payload) + PPS (type 8, non-VCL,
+        // 6-byte payload) + an IDR slice (type 5, VCL, 82-byte payload).
+        let sps = build_test_nal(0x67, 9);
+        let pps = build_test_nal(0x68, 5);
+        let idr = build_test_nal(0x65, 81);
+        let sample = build_nal_sample(&[&sps, &pps, &idr]);
+        assert_eq!(
+            sample.len(),
+            14 + 10 + 86,
+            "sanity-check the hand-built sample length"
+        );
+
+        let subsamples = nal_subsamples(&sample, 4, NalHeaderStyle::Avc)
+            .expect("a well-formed length-prefixed NAL sample must parse");
+
+        assert_eq!(
+            subsamples,
+            vec![
+                SubsampleEntry {
+                    clear_bytes: 14,
+                    protected_bytes: 0
+                },
+                SubsampleEntry {
+                    clear_bytes: 10,
+                    protected_bytes: 0
+                },
+                SubsampleEntry {
+                    clear_bytes: 36,
+                    protected_bytes: 50
+                },
+            ],
+            "SPS/PPS (non-VCL) must be fully clear subsamples; the IDR slice (VCL) \
+             must get a 4-byte length + 32-byte clear lead (36 clear bytes) with \
+             the remaining 82 - 32 = 50 bytes protected"
+        );
+    }
+
+    #[test]
+    fn test_nal_subsamples_hevc_header_style_classifies_vcl_vs_non_vcl() {
+        // VPS (type 32, non-VCL): 2-byte header 0x40 0x01 + 8 bytes of body.
+        let mut vps = vec![0x40u8, 0x01u8];
+        vps.extend((0..8).map(|i| i as u8));
+        // IDR_W_RADL slice (type 19, VCL): 2-byte header 0x26 0x01 + 60 bytes
+        // of body (comfortably over the 32-byte clear lead).
+        let mut idr = vec![0x26u8, 0x01u8];
+        idr.extend((0..60).map(|i| (i as u8).wrapping_mul(5)));
+
+        let sample = build_nal_sample(&[&vps, &idr]);
+        let subsamples = nal_subsamples(&sample, 4, NalHeaderStyle::Hevc)
+            .expect("a well-formed HEVC NAL sample must parse");
+
+        assert_eq!(
+            subsamples,
+            vec![
+                SubsampleEntry {
+                    clear_bytes: (4 + vps.len()) as u32,
+                    protected_bytes: 0
+                },
+                SubsampleEntry {
+                    clear_bytes: 4 + 32,
+                    protected_bytes: (idr.len() - 32) as u32
+                },
+            ],
+            "HEVC VPS (type 32) must be fully clear; the IDR slice (type 19, VCL) \
+             must get the 32-byte clear lead"
+        );
+    }
+
+    #[test]
+    fn test_nal_subsamples_rejects_truncated_length_prefix() {
+        let sample = vec![0x00, 0x00, 0x00]; // 3 bytes: not enough for a 4-byte length field
+        let result = nal_subsamples(&sample, 4, NalHeaderStyle::Avc);
+        assert!(
+            result.is_err(),
+            "a truncated length prefix must be a real error, not silently ignored"
+        );
+    }
+
+    #[test]
+    fn test_nal_subsamples_rejects_declared_length_exceeding_buffer() {
+        // Declares a NAL of length 100 but the buffer has only 5 bytes of payload.
+        let mut sample = vec![0x00, 0x00, 0x00, 100u8];
+        sample.extend(vec![0u8; 5]);
+        let result = nal_subsamples(&sample, 4, NalHeaderStyle::Avc);
+        assert!(
+            result.is_err(),
+            "a NAL length declared past the end of the buffer must be a real error"
+        );
+    }
+
+    #[test]
+    fn test_nal_subsamples_rejects_invalid_length_size() {
+        let sample = vec![0u8; 8];
+        assert!(nal_subsamples(&sample, 0, NalHeaderStyle::Avc).is_err());
+        assert!(nal_subsamples(&sample, 5, NalHeaderStyle::Avc).is_err());
+    }
+
+    #[test]
+    fn test_nal_subsamples_empty_buffer_yields_no_subsamples() {
+        let result = nal_subsamples(&[], 4, NalHeaderStyle::Avc)
+            .expect("an empty buffer is trivially valid (zero NAL units)");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_codec_structure_for_routes_known_codecs() {
+        for codec in [
+            "av1",
+            "vp9",
+            "vp8",
+            "opus",
+            "vorbis",
+            "flac",
+            "totally_unknown",
+        ] {
+            assert_eq!(
+                codec_structure_for(codec),
+                CodecStructure::Elementary,
+                "'{codec}' must route to the whole-buffer path"
+            );
+        }
+        for codec in ["h264", "avc", "avc1", "avc3", "H264"] {
+            assert_eq!(
+                codec_structure_for(codec),
+                CodecStructure::NalLengthPrefixed {
+                    length_size: 4,
+                    header_style: NalHeaderStyle::Avc
+                },
+                "'{codec}' must route to the AVC NAL path"
+            );
+        }
+        for codec in ["h265", "hevc", "hvc1", "hev1"] {
+            assert_eq!(
+                codec_structure_for(codec),
+                CodecStructure::NalLengthPrefixed {
+                    length_size: 4,
+                    header_style: NalHeaderStyle::Hevc
+                },
+                "'{codec}' must route to the HEVC NAL path"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_nal_aware_cbcs_rejects_data_that_is_not_really_nal_structured() {
+        // Regression for a real silent-cleartext bug: an all-zero buffer (what
+        // `DashPackager`/`HlsPackager`'s placeholder segment generation
+        // actually feeds today) parses "successfully" as a long run of
+        // zero-length non-VCL NAL units -- every subsample fully clear -- so
+        // encrypting it must refuse rather than return Ok(unmodified cleartext)
+        // while claiming SAMPLE-AES protection was applied.
+        let all_zero = vec![0u8; 1000];
+
+        let key = vec![0x99u8; 16];
+        let iv = vec![0xAAu8; 16];
+        let key_info = KeyInfo::new(key, iv);
+        let mut handler = EncryptionHandler::new(EncryptionMethod::SampleAes);
+        handler
+            .set_key_info(key_info)
+            .expect("set_key_info should succeed in test");
+
+        let result = handler.encrypt_for_codec(&all_zero, "h264");
+        assert!(
+            result.is_err(),
+            "a buffer with no protected data anywhere must be a hard error, not a \
+             silently-unencrypted Ok(..)"
+        );
+
+        // A genuinely mixed sample (SPS/PPS clear + a real IDR slice) must NOT
+        // be rejected by the same guard.
+        let sps = build_test_nal(0x67, 9);
+        let pps = build_test_nal(0x68, 5);
+        let idr = build_test_nal(0x65, 81);
+        let real_sample = build_nal_sample(&[&sps, &pps, &idr]);
+        assert!(
+            handler.encrypt_for_codec(&real_sample, "h264").is_ok(),
+            "a sample with real protected (VCL) data must not be rejected by the guard"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_nal_aware_cbcs_pattern_block_alignment_and_roundtrip() {
+        let sps = build_test_nal(0x67, 9); // 10 bytes, non-VCL -> fully clear
+        let pps = build_test_nal(0x68, 5); // 6 bytes, non-VCL -> fully clear
+        let idr = build_test_nal(0x65, 81); // 82 bytes, VCL -> 32-byte lead + 50 protected
+        let sample = build_nal_sample(&[&sps, &pps, &idr]);
+        assert_eq!(sample.len(), 110);
+
+        let key = vec![0x77u8; 16];
+        let iv = vec![0x88u8; 16];
+        let key_info = KeyInfo::new(key, iv);
+        let mut handler = EncryptionHandler::new(EncryptionMethod::SampleAes);
+        handler
+            .set_key_info(key_info)
+            .expect("set_key_info should succeed in test");
+
+        let ciphertext = handler
+            .encrypt_for_codec(&sample, "h264")
+            .expect("NAL-aware cbcs encrypt should succeed");
+        assert_eq!(
+            ciphertext.len(),
+            sample.len(),
+            "cbcs pattern encryption must preserve length"
+        );
+
+        // SPS + PPS (fully clear, non-VCL): bytes [0, 24) unchanged.
+        assert_eq!(
+            &ciphertext[0..24],
+            &sample[0..24],
+            "non-VCL NAL units must stay fully clear"
+        );
+
+        // IDR's length prefix + 32-byte clear lead: bytes [24, 60) unchanged.
+        assert_eq!(
+            &ciphertext[24..60],
+            &sample[24..60],
+            "IDR NAL header + slice header clear lead must stay clear"
+        );
+
+        // First 16-byte block of the protected region [60, 76): must be encrypted
+        // (the pattern always resets to the crypt state at a subsample's start).
+        assert_ne!(
+            &ciphertext[60..76],
+            &sample[60..76],
+            "first protected block must be encrypted"
+        );
+
+        // Skip blocks 1-2 of the protected region [76, 108): stay clear (1:9 pattern).
+        assert_eq!(
+            &ciphertext[76..108],
+            &sample[76..108],
+            "skip blocks within the pattern must stay clear"
+        );
+
+        // Trailing partial block [108, 110) (< 16 bytes): stays clear.
+        assert_eq!(
+            &ciphertext[108..110],
+            &sample[108..110],
+            "trailing partial block must stay clear"
+        );
+
+        let decrypted = handler
+            .decrypt_for_codec(&ciphertext, "h264")
+            .expect("NAL-aware cbcs decrypt should succeed");
+        assert_eq!(
+            decrypted, sample,
+            "NAL-aware cbcs round-trip must recover the original sample exactly"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypt_for_codec_elementary_codec_matches_whole_buffer_path() {
+        // For this tree's actual codecs (av1/vp9/vp8/opus/vorbis/flac),
+        // encrypt_for_codec must be byte-for-byte identical to the pre-existing
+        // encrypt() path: adding NAL-awareness must not change behavior for any
+        // codec this crate actually emits.
+        let key = vec![0x55u8; 16];
+        let iv = vec![0x66u8; 16];
+        let plaintext: Vec<u8> = (0..300).map(|i| (i as u8).wrapping_mul(11)).collect();
+
+        let key_info = KeyInfo::new(key, iv);
+        let mut handler = EncryptionHandler::new(EncryptionMethod::SampleAes);
+        handler
+            .set_key_info(key_info)
+            .expect("set_key_info should succeed in test");
+
+        let via_generic = handler.encrypt(&plaintext).expect("encrypt");
+        for codec in ["av1", "vp9", "vp8", "opus", "vorbis", "flac"] {
+            let via_codec = handler
+                .encrypt_for_codec(&plaintext, codec)
+                .expect("encrypt_for_codec");
+            assert_eq!(
+                via_codec, via_generic,
+                "'{codec}' must match the whole-buffer path exactly"
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 # oximedia-qc
 
-**Status: [Stable]** | Version: 0.2.0 | Tests: extensively tested | Updated: 2026-07-14
+**Status: [Stable]** | Version: 0.2.1 | Tests: extensively tested | Updated: 2026-08-12
 
 Quality control and validation for OxiMedia. Provides comprehensive quality control and validation for media files ensuring they meet technical specifications and delivery requirements.
 
@@ -31,7 +31,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-qc = "0.1.9"
+oximedia-qc = "0.2.0"
 ```
 
 ```rust

@@ -19,12 +19,14 @@ workspace = true
 oximedia-core.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
-rayon.workspace = true
 
 # Image format dependencies
 byteorder.workspace = true
 half = "2.7"
-tiff = "0.11"
+# NOTE: no external `tiff` crate here -- `src/tiff/` is an in-house TIFF/BigTIFF
+# implementation built on `byteorder`, `weezl` and `oxiarc-deflate`. The unused
+# `tiff = "0.11"` dependency that used to sit on this line only dragged
+# flate2 + miniz_oxide into the graph (COOLJAPAN Policy: use oxiarc-*).
 serde = { workspace = true }
 
 # Compression support
@@ -37,3 +39,15 @@ oxifft.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# Thread-backed dependencies, kept off `wasm32-unknown-unknown`:
+#
+# - oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32,
+#   so the workspace baseline is `std` only; restore it for native targets.
+# - rayon itself compiles on wasm32 but cannot spawn its worker pool there, so
+#   every `par_iter` would fail at run time. `src/parallel.rs` routes the
+#   crate's parallel loops through helpers that fall back to sequential
+#   iteration when this dependency is absent.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }
+rayon = { workspace = true }

@@ -195,6 +195,8 @@ impl<S: MediaSource> MpegTsDemuxer<S> {
                             duration: None,
                             codec_params: CodecParams::default(),
                             metadata: Metadata::default(),
+                            rotation: None,
+                            display_matrix: None,
                         };
 
                         self.streams.push(stream_info);

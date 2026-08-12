@@ -37,6 +37,14 @@ impl std::fmt::Display for ChangeRequestId {
     }
 }
 
+impl std::str::FromStr for ChangeRequestId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
+    }
+}
+
 /// Create a new change request.
 ///
 /// # Errors
@@ -48,7 +56,7 @@ pub async fn create_change_request(
     description: String,
     priority: ChangePriority,
 ) -> ReviewResult<ChangeRequest> {
-    Ok(ChangeRequest {
+    let request = ChangeRequest {
         id: ChangeRequestId::new(),
         session_id,
         title,
@@ -59,7 +67,11 @@ pub async fn create_change_request(
         updated_at: Utc::now(),
         completed_at: None,
         assigned_to: None,
-    })
+    };
+
+    let store = crate::store::default_store().await?;
+    store.insert_change_request(&request).await?;
+    Ok(request)
 }
 
 /// List change requests for a session.
@@ -68,23 +80,22 @@ pub async fn create_change_request(
 ///
 /// Returns error if listing fails.
 pub async fn list_change_requests(session_id: SessionId) -> ReviewResult<Vec<ChangeRequest>> {
-    // In a real implementation, query database
-    let _ = session_id;
-    Ok(Vec::new())
+    let store = crate::store::default_store().await?;
+    store.list_change_requests_by_session(session_id).await
 }
 
 /// Update change request status.
 ///
 /// # Errors
 ///
-/// Returns error if update fails.
+/// Returns [`crate::error::ReviewError::ChangeRequestNotFound`] if `request_id`
+/// does not identify an existing change request.
 pub async fn update_change_status(
     request_id: ChangeRequestId,
     status: ChangeStatus,
 ) -> ReviewResult<()> {
-    // In a real implementation, update database
-    let _ = (request_id, status);
-    Ok(())
+    let store = crate::store::default_store().await?;
+    store.update_change_request_status(request_id, status).await
 }
 
 #[cfg(test)]
@@ -116,8 +127,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_change_status() {
+        let session_id = SessionId::new();
+        let request = create_change_request(
+            session_id,
+            "Fix audio".to_string(),
+            "Audio levels too low".to_string(),
+            ChangePriority::High,
+        )
+        .await
+        .expect("create should succeed");
+
+        let result = update_change_status(request.id, ChangeStatus::InProgress).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_change_status_not_found_is_honest_error() {
+        // A request ID that was never created must not silently succeed.
         let request_id = ChangeRequestId::new();
         let result = update_change_status(request_id, ChangeStatus::InProgress).await;
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 }

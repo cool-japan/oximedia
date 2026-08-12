@@ -298,7 +298,7 @@ async fn create_mixer(
         let result_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", result_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Mixer Session Created".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Session name:", session_name);
@@ -388,7 +388,7 @@ async fn add_channel(
         let result_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", result_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Channel Added".green().bold());
         println!("{}", "-".repeat(40));
         println!("{:20} {}", "Name:", channel_name);
@@ -436,7 +436,7 @@ async fn route_channel(
         let result_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", result_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Route Added".green().bold());
         println!("{}", "-".repeat(40));
         println!("{:20} {}", "From channel:", from_channel);
@@ -504,7 +504,7 @@ async fn render_mixer(
         let result_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", result_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Mixer Render".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Session:", mixer_path.display());

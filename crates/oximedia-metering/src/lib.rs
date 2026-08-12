@@ -306,9 +306,12 @@
 //!
 //! # Pipeline Architecture
 //!
-//! The core loudness pipeline lives in [`ebu_r128_impl::EbuR128Meter`] (wrapped by the
-//! higher-level [`LoudnessMeter`] in this crate root). Every sample flows through four
-//! stages — **filter → LKFS → gating → LRA**:
+//! The core loudness pipeline lives in [`ebu_r128_impl::EbuR128Meter`], which this crate
+//! root re-exports as [`EbuR128Meter`]. ([`LoudnessMeter`] is a *separate*, block-based
+//! pipeline over [`lkfs`] / [`gating`] / [`filters`]; it shares the K-weighting design but
+//! not the gating implementation, and it is the meter behind the approximate
+//! [`ebu::EbuR128Meter`].) Every sample flows through four stages —
+//! **filter → LKFS → gating → LRA**:
 //!
 //! ```text
 //!  interleaved samples                K-weighting filter (per channel)
@@ -339,8 +342,10 @@
 //! ```
 //!
 //! In parallel — not gated, and independent of the K-weighting/LKFS chain above — raw
-//! samples also feed a 4×-oversampled windowed-sinc [`ebu_r128_impl::TruePeakDetector`]
-//! for inter-sample peak detection. [`ebu_r128_impl::LoudnessReport::from_meter`]
+//! samples also feed one 4×-oversampled windowed-sinc
+//! [`ebu_r128_impl::TruePeakDetector`] **per channel** for inter-sample peak detection;
+//! `true_peak_dbtp()` reports the maximum across channels and
+//! `channel_true_peaks_dbtp()` the individual readings. [`ebu_r128_impl::LoudnessReport::from_meter`]
 //! combines Integrated Loudness, Loudness Range, and True Peak into a single compliance
 //! report checked against EBU R128, ATSC A/85, and ARIB TR-B32.
 //!
@@ -509,7 +514,16 @@ pub use correlation::{
     GoniometerPoint as CorrelationGoniometerPoint, MultibandMeter, PhaseRelationship,
 };
 pub use dynamics::{DynamicRangeMeter, PlrMeter};
-pub use ebu::{EbuR128Compliance, EbuR128Meter};
+pub use ebu::EbuR128Compliance;
+/// The crate-root `EbuR128Meter` is the standards-accurate implementation from
+/// [`ebu_r128_impl`] (exact ITU-R BS.1770-4 Table 1 K-weighting, ITU-R BS.1771
+/// two-stage gating, EBU Tech 3342 LRA, 4× oversampled per-channel true peak).
+///
+/// The older program-type-aware wrapper around [`LoudnessMeter`] remains
+/// available as [`ebu::EbuR128Meter`]; it is an *approximate* meter built on the
+/// block-based [`gating`]/[`lkfs`] pipeline and is not validated against the
+/// EBU Tech 3342 reference signals.
+pub use ebu_r128_impl::EbuR128Meter;
 pub use filters::{KWeightFilter, KWeightFilterBank};
 pub use gating::{GatingProcessor, GatingResult};
 pub use lkfs::{LkfsCalculator, LufsValue};
@@ -621,6 +635,12 @@ pub enum Standard {
     /// Max True Peak: -1.0 dBTP
     AmazonMusicHd,
 
+    /// `TikTok` short-form video delivery.
+    ///
+    /// Target: -14 LUFS ±1 LU
+    /// Max True Peak: -1.0 dBTP
+    TikTok,
+
     /// Custom target loudness.
     ///
     /// Specify your own target in LUFS and max true peak in dBTP.
@@ -640,7 +660,11 @@ impl Standard {
         match self {
             Self::EbuR128 => -23.0,
             Self::AtscA85 | Self::AmazonPrime => -24.0,
-            Self::Spotify | Self::YouTube | Self::TidalHiFi | Self::AmazonMusicHd => -14.0,
+            Self::Spotify
+            | Self::YouTube
+            | Self::TidalHiFi
+            | Self::AmazonMusicHd
+            | Self::TikTok => -14.0,
             Self::AppleMusic => -16.0,
             Self::Netflix => -27.0,
             Self::Custom { target_lufs, .. } => *target_lufs,
@@ -655,7 +679,8 @@ impl Standard {
             | Self::YouTube
             | Self::AppleMusic
             | Self::TidalHiFi
-            | Self::AmazonMusicHd => -1.0,
+            | Self::AmazonMusicHd
+            | Self::TikTok => -1.0,
             Self::AtscA85 | Self::Netflix | Self::AmazonPrime => -2.0,
             Self::Custom { max_peak_dbtp, .. } => *max_peak_dbtp,
         }
@@ -669,7 +694,8 @@ impl Standard {
             | Self::YouTube
             | Self::AppleMusic
             | Self::TidalHiFi
-            | Self::AmazonMusicHd => 1.0,
+            | Self::AmazonMusicHd
+            | Self::TikTok => 1.0,
             Self::AtscA85 | Self::Netflix | Self::AmazonPrime => 2.0,
             Self::Custom { tolerance_lu, .. } => *tolerance_lu,
         }
@@ -687,6 +713,7 @@ impl Standard {
             Self::AmazonPrime => "Amazon Prime Video",
             Self::TidalHiFi => "Tidal HiFi",
             Self::AmazonMusicHd => "Amazon Music HD",
+            Self::TikTok => "TikTok",
             Self::Custom { .. } => "Custom",
         }
     }
@@ -1224,19 +1251,26 @@ mod tests {
 
     /// EBU R128 reference signal test: 997 Hz sine at -23 LUFS.
     ///
-    /// The K-weighting pre-filter (Stage 1: high-shelf at 1681 Hz, G≈4 dB) adds
-    /// approximately +3.41 dB power gain at 997 Hz, so the raw signal amplitude
-    /// must be compensated by the inverse of that gain.
+    /// The complete ITU-R BS.1770-4 K-weighting chain (Stage 1 high-shelf at
+    /// 1 681.97 Hz with G ≈ +4 dB, Stage 2 high-pass at 38.135 Hz) has a gain of
+    /// **+0.691 dB** at 997 Hz — see `filters::tests::
+    /// test_k_weight_chain_matches_itu_table1`, which pins the chain against
+    /// Table 1 of the standard. The generated amplitude is compensated by the
+    /// inverse of that gain so the meter should read exactly -23 LUFS.
     ///
     /// Calibration procedure:
     ///   1. Target LUFS = -23; after filter the mean-square must equal
     ///      `10^((-23 + 0.691) / 10)`.
-    ///   2. The K-weight filter at 997 Hz has power gain ≈ 2.193 (+3.41 dB).
+    ///   2. The K-weight chain at 997 Hz has power gain ≈ 1.172 (+0.691 dB).
     ///   3. Required pre-filter RMS² = target_power / filter_gain.
     ///   4. For a sine wave: peak amplitude A = sqrt(2 × RMS²).
     ///
     /// We generate 10 seconds of stereo audio (enough for gating to converge)
     /// and assert the integrated loudness is within ±0.5 LUFS of -23.0.
+    ///
+    /// Before the K-weighting fix this constant read `3.41` dB, which silently
+    /// compensated for a Stage 1 that was a high-pass scaled by the decibel
+    /// value 3.9998 used as a linear gain.
     #[test]
     fn test_ebu_r128_reference_signal() {
         let sample_rate = 48000.0_f64;
@@ -1244,10 +1278,8 @@ mod tests {
         let duration_secs = 10.0_f64;
         let freq_hz = 997.0_f64;
 
-        // K-weighting pre-filter adds ~3.41 dB power gain at 997 Hz for the
-        // standard ITU-R BS.1770-4 coefficients implemented in filters.rs.
-        // amplitude calibrated so the integrated loudness converges to -23 LUFS.
-        let k_weight_power_gain_db = 3.41_f64;
+        // K-weighting chain gain at 997 Hz, from ITU-R BS.1770-4 Table 1.
+        let k_weight_power_gain_db = 0.691_f64;
         let target_power = 10.0_f64.powf((-23.0_f64 + 0.691) / 10.0);
         let filter_power_gain = 10.0_f64.powf(k_weight_power_gain_db / 10.0);
         // For a stereo signal with identical L/R: the gating normalises by
@@ -1299,5 +1331,27 @@ mod tests {
         assert_eq!(s.target_lufs(), -14.0);
         assert_eq!(s.max_true_peak_dbtp(), -1.0);
         assert_eq!(s.name(), "Amazon Music HD");
+    }
+
+    /// Verify the TikTok delivery target: -14 LUFS, -1 dBTP, ±1 LU.
+    #[test]
+    fn test_tiktok_standard() {
+        let s = Standard::TikTok;
+        assert_eq!(s.target_lufs(), -14.0);
+        assert_eq!(s.max_true_peak_dbtp(), -1.0);
+        assert_eq!(s.tolerance_lu(), 1.0);
+        assert_eq!(s.name(), "TikTok");
+    }
+
+    /// The crate-root `EbuR128Meter` must be the standards-accurate
+    /// `ebu_r128_impl` implementation, not the approximate `ebu` wrapper.
+    #[test]
+    fn test_crate_root_ebu_meter_is_accurate_impl() {
+        // `ebu_r128_impl::EbuR128Meter::new` is infallible and takes (u32, u32);
+        // the approximate `ebu::EbuR128Meter::new` returns a Result and needs a
+        // `ProgramType`, so this only compiles for the accurate implementation.
+        let meter: crate::EbuR128Meter = crate::EbuR128Meter::new(48_000, 2);
+        assert_eq!(meter.sample_rate(), 48_000);
+        assert_eq!(meter.channels(), 2);
     }
 }

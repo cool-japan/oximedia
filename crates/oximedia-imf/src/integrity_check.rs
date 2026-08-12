@@ -207,10 +207,25 @@ mod tests {
 
     // ── verify — real temp directory ──────────────────────────────────────
 
+    /// Create a private temporary package directory for a single test.
+    ///
+    /// The name combines the process id, a per-process counter and a
+    /// nanosecond timestamp.  A timestamp alone is not enough: two tests that
+    /// read the clock within the same nanosecond receive the same directory,
+    /// and the first one to finish then `remove_dir_all`s the other's fixture
+    /// mid-run.  The pid and counter make the name unique both across the
+    /// per-test processes `cargo nextest` spawns and across threads inside one
+    /// process; the timestamp additionally keeps a recycled pid from reusing a
+    /// directory left behind by a panicking earlier run.
     fn temp_pkg() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let mut dir = std::env::temp_dir();
         dir.push(format!(
-            "oximedia_imf_test_{}",
+            "oximedia_imf_test_{}_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())

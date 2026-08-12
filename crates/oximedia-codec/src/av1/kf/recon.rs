@@ -57,6 +57,120 @@ pub struct DecodedIntraFrame {
     pub height: usize,
 }
 
+// --------------------------------------------------- filter-stage row bands
+//
+// Reconstruction itself is strictly sequential: intra prediction reads the
+// already-reconstructed samples above and to the left of the current block,
+// so neither rows nor blocks may be reordered. The two post-reconstruction
+// stages that follow it are not: CDEF (spec 7.15) and loop restoration
+// (spec 7.17) both read an immutable input frame (`CurrFrame` /
+// `UpscaledCdefFrame` plus `UpscaledCurrFrame`) and write a *separate*
+// output frame, and every output sample is produced by exactly one source
+// block. Splitting the output into horizontal bands therefore reproduces
+// the serial result byte for byte, whatever the band count and whatever
+// order the bands are evaluated in. The deblocking loop filter (spec 7.14)
+// has no such property — it filters in place and its horizontal-edge pass
+// is only column-independent — so it stays serial.
+
+/// A horizontal band of a three-plane output frame: one mutable row window
+/// per plane plus the absolute plane row each window starts at.
+///
+/// [`OutBand::put`] lets the filter stages keep addressing samples in
+/// absolute plane coordinates, exactly as the serial code does.
+pub struct OutBand<'a> {
+    rows: [&'a mut [u8]; 3],
+    row0: [usize; 3],
+    stride: [usize; 3],
+}
+
+impl OutBand<'_> {
+    /// Stores one output sample at absolute plane coordinates `(x, y)`.
+    #[inline]
+    pub fn put(&mut self, plane: usize, y: usize, x: usize, v: u8) {
+        self.rows[plane][(y - self.row0[plane]) * self.stride[plane] + x] = v;
+    }
+}
+
+/// Splits three output planes into the contiguous luma-row ranges `bounds`.
+///
+/// `bounds` must be contiguous, start at 0, end at the luma plane height and
+/// have every boundary divisible by `1 << sub_y`, so the chroma row counts
+/// divide exactly. Returns one [`OutBand`] per range, in `bounds` order.
+pub fn split_out_bands<'a>(
+    out: &'a mut [Vec<u8>; 3],
+    strides: [usize; 3],
+    sub_y: usize,
+    bounds: &[(usize, usize)],
+) -> Vec<OutBand<'a>> {
+    let [o0, o1, o2] = out;
+    let mut rest: [&mut [u8]; 3] = [o0.as_mut_slice(), o1.as_mut_slice(), o2.as_mut_slice()];
+    let mut next_row = [0usize; 3];
+    let mut bands = Vec::with_capacity(bounds.len());
+    for &(y0, y1) in bounds {
+        debug_assert_eq!(y0, next_row[0], "bands must be contiguous from row 0");
+        let mut rows: [&mut [u8]; 3] = [&mut [], &mut [], &mut []];
+        let row0 = next_row;
+        for plane in 0..3 {
+            let shift = if plane == 0 { 0 } else { sub_y };
+            let n_rows = (y1 >> shift) - (y0 >> shift);
+            let take = n_rows * strides[plane];
+            let all = core::mem::take(&mut rest[plane]);
+            debug_assert!(take <= all.len(), "band exceeds the output plane");
+            let (head, tail) = all.split_at_mut(core::cmp::min(take, all.len()));
+            rest[plane] = tail;
+            rows[plane] = head;
+            next_row[plane] += n_rows;
+        }
+        bands.push(OutBand {
+            rows,
+            row0,
+            stride: strides,
+        });
+    }
+    bands
+}
+
+/// Splits `total` rows into `count` contiguous bands whose boundaries are
+/// multiples of `align`. `total` must be a multiple of `align`; `count` is
+/// clamped to `1..=total / align`.
+///
+/// Every returned band is non-empty, so `total == 0` yields no bands at all.
+pub fn plan_bands(total: usize, align: usize, count: usize) -> Vec<(usize, usize)> {
+    let align = align.max(1);
+    debug_assert_eq!(total % align, 0, "band alignment must divide the height");
+    let units = total / align;
+    if units == 0 {
+        return Vec::new();
+    }
+    let count = count.clamp(1, units);
+    let mut bounds = Vec::with_capacity(count);
+    let mut start = 0usize;
+    for k in 0..count {
+        let end = core::cmp::min(units * (k + 1) / count * align, total);
+        bounds.push((start, end));
+        start = end;
+    }
+    if let Some(last) = bounds.last_mut() {
+        last.1 = total;
+    }
+    bounds
+}
+
+/// Band count for a frame-sized filter stage: 1 (fully serial, no rayon
+/// involvement at all) for small frames and single-threaded pools, else the
+/// work divided by `min_pixels_per_band`, capped at the global pool size.
+///
+/// The count only decides how the work is scheduled — the filtered output is
+/// identical for every value, which the `filter_stage_bands_bit_exact` test
+/// checks against the reference decodes.
+pub fn auto_band_count(luma_pixels: usize, min_pixels_per_band: usize) -> usize {
+    let threads = rayon::current_num_threads();
+    if threads <= 1 {
+        return 1;
+    }
+    (luma_pixels / min_pixels_per_band.max(1)).clamp(1, threads)
+}
+
 #[inline]
 fn block_width(bsize: usize) -> usize {
     usize::from(NUM_4X4_BLOCKS_WIDE[bsize]) * 4
@@ -1399,18 +1513,22 @@ impl Dec<'_> {
         let dc_q = i64::from(self.dc_quant(plane, b.segment_id));
         let ac_q = i64::from(self.ac_quant(plane, b.segment_id));
         // using_qmatrix is rejected at frame level (honest error), so q2 = q.
-        let mut dequant = [0i64; 32 * 32];
+        let mut dequant = [0i32; 32 * 32];
         for i in 0..th {
             for j in 0..tw {
                 let q = if i == 0 && j == 0 { dc_q } else { ac_q };
                 let dq = i64::from(quant[i * tw + j]) * q;
                 let sign: i64 = if dq < 0 { -1 } else { 1 };
                 let dq2 = sign * ((dq.abs() & 0xFF_FFFF) / dq_denom);
-                let bd_clamp = 1i64 << (7 + 8);
+                // `dq2` is masked to 24 bits before the sign is reapplied, so
+                // it always lies in -0xFF_FFFF..=0xFF_FFFF and the narrowing
+                // is exact; the fallback saturates rather than wrapping.
+                let dq2 = i32::try_from(dq2).unwrap_or(if dq2 < 0 { i32::MIN } else { i32::MAX });
+                let bd_clamp = 1i32 << (7 + 8);
                 dequant[i * 32 + j] = dq2.clamp(-bd_clamp, bd_clamp - 1);
             }
         }
-        let mut residual = vec![0i64; w * h];
+        let mut residual = vec![0i32; w * h];
         inverse_transform_2d(&dequant, &mut residual, tx_sz, plane_tx_type, b.lossless, 8);
 
         let p = &mut self.planes[plane];
@@ -1421,7 +1539,7 @@ impl Dec<'_> {
                 let px = y + yy;
                 let pxx = x + xx;
                 if px < p.height && pxx < p.width {
-                    let cur = i64::from(p.data[px * p.stride + pxx]);
+                    let cur = i32::from(p.data[px * p.stride + pxx]);
                     p.data[px * p.stride + pxx] = (cur + residual[i * w + j]).clamp(0, 255) as u8;
                 }
             }
@@ -1469,6 +1587,19 @@ pub(crate) fn decode_intra_frame(
     seq: &SeqHdr,
     hdr: &FrameHdr,
     tile_payloads: &[&[u8]],
+) -> CodecResult<DecodedIntraFrame> {
+    decode_intra_frame_banded(seq, hdr, tile_payloads, None)
+}
+
+/// [`decode_intra_frame`] with an explicit row-band count for the CDEF and
+/// loop-restoration stages. `None` (the production path) picks the count
+/// from the frame size and the rayon pool; a forced count only changes how
+/// the work is scheduled, never the decoded samples.
+pub(crate) fn decode_intra_frame_banded(
+    seq: &SeqHdr,
+    hdr: &FrameHdr,
+    tile_payloads: &[&[u8]],
+    forced_bands: Option<usize>,
 ) -> CodecResult<DecodedIntraFrame> {
     // Stage gates (all honest errors; each names its missing surface).
     if seq.bit_depth != 8 || seq.mono_chrome || !seq.subsampling_x || !seq.subsampling_y {
@@ -1635,7 +1766,7 @@ pub(crate) fn decode_intra_frame(
             skips: &dec.grids.skips,
             cdef_idx: &dec.grids.cdef_idx,
         };
-        super::cdef::cdef_frame(&mut dec.planes, &input);
+        super::cdef::cdef_frame(&mut dec.planes, &input, forced_bands);
     }
 
     // Loop restoration (spec 7.17). No superres in this decoder, so
@@ -1651,7 +1782,7 @@ pub(crate) fn decode_intra_frame(
                 pre_cdef: pre,
                 grids: &dec.lr_units,
             };
-            super::lr::loop_restore_frame(&mut dec.planes, &apply);
+            super::lr::loop_restore_frame(&mut dec.planes, &apply, forced_bands);
         }
     }
 
@@ -1661,3 +1792,7 @@ pub(crate) fn decode_intra_frame(
         height: hdr.frame_height as usize,
     })
 }
+
+#[cfg(test)]
+#[path = "recon_tests.rs"]
+mod tests;

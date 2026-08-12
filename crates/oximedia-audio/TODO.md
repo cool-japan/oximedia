@@ -35,9 +35,51 @@
 - [x] Add SIMD-optimized sample format conversion in `format_convert` (verified 2026-05-16; src/format_convert.rs:168 SIMD-optimised batch conversion, auto-vectorised chunks of 8)
 - [x] Implement lock-free ring buffer for real-time audio threading in `stream_buffer` (verified 2026-05-16; src/stream_buffer.rs:136 struct StreamBuffer)
 - [x] Optimize `biquad` filter with direct form II transposed for better numerical behavior (implemented 2026-05-15; src/dsp/biquad.rs BiquadDf2t struct, 2 delay elements, IR matches DF1 to 1e-12)
-- [x] Add batch processing mode to `meters` (process multiple channels simultaneously) (verified 2026-05-16; src/meters/batch.rs:57 BatchMeterConfig, BatchMeterProcessor)
+- [x] Add batch processing mode to `meters` (process multiple channels simultaneously) (src/meters/batch.rs:57 BatchMeterConfig, BatchMeterProcessor; the 2026-05-16 "verified" note was wrong — the file was never declared in `meters/mod.rs`, so neither it nor its 12 tests were compiled. Wired in and re-exported 2026-07-29; `process_channel` now returns `AudioResult<()>` instead of `Result<(), ()>`.)
 - [x] Implement FFT plan caching in `spectrum/fft` to avoid repeated planner allocation (verified 2026-05-16; src/spectrum/fft_cache.rs:52 struct FftPlanCache, hit/miss counters)
 - [x] Optimize Vorbis MDCT with split-radix algorithm in `vorbis/mdct` (implemented 2026-05-15; src/vorbis/mdct.rs MdctFast struct, FFT-based O(N log N) forward+inverse via oxifft)
+
+## Orphan meter modules (assessed 2026-07-29, deliberately not wired)
+
+Both files exist under `src/meters/` but are **not** declared in
+`meters/mod.rs`, so they are not compiled. Nothing is deleted; wiring either one
+requires the work below plus conformance tests, otherwise it would ship a
+loudness reading that is quietly wrong.
+
+- [ ] `src/meters/itu.rs` (1107 lines) — revive or retire. Blockers, in order:
+  (1) two `E0502` borrow errors in `KWeightingFilter::process` (`&self.pre_b`
+  immutable + `&mut self.pre_state[ch]` mutable in one call) — fixable by making
+  `process_biquad` an associated fn; (2) `Bs1770Meter::channel_weights` is
+  computed in `new()` and **never applied** — `SlidingWindow::calculate_loudness`
+  sums unweighted channel mean squares, so 5.1 meters LFE at weight 1.0 instead
+  of 0.0 and the surrounds at 1.0 instead of 1.41; (3) `ItuMeter::true_peak` is a
+  plain sample-peak detector with no oversampling, yet is reported as
+  `true_peak_dbtp` and feeds `check_streaming_compliance`; (4)
+  `LoudnessRangeCalculator` applies no EBU Tech 3342 −20 LU relative gate, so it
+  over-reports LRA on material with quiet tails; (5) dead fields
+  (`SlidingWindow::overlap`, `BlockMeasurement::timestamp`,
+  `ItuMeter::{sample_rate, channels}`) hidden only by the crate-wide
+  `#![allow(dead_code)]`; (6) zero tests. Also note it would be the **third**
+  BS.1770-4 meter in the workspace, after `crate::loudness` and
+  `oximedia_metering::ebu_r128_impl` — pick one to keep. The genuinely
+  non-duplicated parts are the pure data tables `Bs1864Practice` (target level /
+  tolerance per programme type) and `Bs2217Streaming` (per-platform targets);
+  extracting just those into a small `meters/targets.rs` is the cheap win.
+- [ ] `src/meters/dolby.rs` (944 lines) — sketch, not an implementation. Blockers:
+  (1) `AWeightingFilter::new` ignores its `sample_rate` argument and hard-codes
+  one unstated sample rate's coefficients ("simplified for this implementation …
+  in practice, would use proper IIR filter design"), so `LeqAMeter` is wrong at
+  every rate but one; (2) `MWeightingFilter` is two hand-tuned biquads with
+  round-number coefficients labelled "Simplified M-weighting … in practice,
+  M-weighting is more complex"; (3) `SpeechDetector::geometric_mean` takes the
+  `product()` of every sample in a 25 ms frame (1200 values < 1.0) before the
+  `powf(1/n)`, which underflows to 0.0 — the spectral-flatness term is therefore
+  constant and `detect_speech` reduces to energy + ZCR thresholds; (4)
+  `calculate_spectral_flatness` is a time-domain stand-in ("in a full
+  implementation, would use FFT"); (5) zero tests. `dialnorm` derived from this
+  detector would be unusable. Rewrite against real A-weighting (IEC 61672-1
+  bilinear design at the actual sample rate) and a real spectral front-end, or
+  drop the file.
 
 ## Testing
 - [x] Add FLAC round-trip test: encode -> decode -> bit-exact comparison (8 tests in tests/conformance_tests.rs)

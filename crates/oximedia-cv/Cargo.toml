@@ -30,7 +30,9 @@ directml = ["onnx", "oxionnx/directml"]
 
 [dependencies]
 oximedia-core = { workspace = true }
-oximedia-codec = { workspace = true, default-features = true }
+# Only `VideoFrame` / `Plane` are used here, both unconditional. Leaving the default features off
+# keeps the `image-io` PNG/JPEG decoders -- and with them `flate2`/`miniz_oxide` -- out of the tree.
+oximedia-codec = { workspace = true, default-features = false }
 thiserror = { workspace = true }
 oxionnx = { workspace = true, optional = true }
 ndarray = { workspace = true }
@@ -38,3 +40,8 @@ bytes = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 oxifft = { workspace = true }
+
+# oxifft's `threading` (rayon) backend is a hard `compile_error!` on wasm32, so
+# the workspace baseline is `std` only; restore it for native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxifft = { workspace = true, features = ["threading"] }

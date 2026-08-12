@@ -17,17 +17,30 @@ workspace = true
 
 [dependencies]
 oximedia-core = { workspace = true }
-oximedia-codec = { workspace = true, default-features = true }
+# Only the frame/plane data types (`VideoFrame`, `Plane`, `ColorInfo`, ...) are used here, all of
+# which are unconditional. Keeping the default features off avoids dragging the `image-io` PNG/JPEG
+# decoders -- and with them `flate2`/`miniz_oxide` -- into every downstream filter-graph consumer.
+oximedia-codec = { workspace = true, default-features = false }
 oximedia-audio = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 fontdue.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
+# Row-level data parallelism for the resampling passes of `ScaleFilter`. Rows are independent, so
+# the parallel and serial paths are bit-identical (see `tests/scale_golden.rs`).
+rayon = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "macros"] }
+# Pure-Rust hasher used to pin byte-exact scaler goldens (`default-features = false` + `pure`
+# comes from the workspace definition, so no C/assembly backend is ever built).
+blake3 = { workspace = true }
 
 [[bench]]
 name = "graph_exec_bench"
+harness = false
+
+[[bench]]
+name = "scale_bench"
 harness = false

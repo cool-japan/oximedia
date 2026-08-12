@@ -320,13 +320,13 @@ pub fn convolve_tiled_sequential(
     Ok(output)
 }
 
-/// Apply tiled convolution in parallel using rayon.
+/// Apply tiled convolution in parallel using rayon (sequentially on `wasm32`).
 pub fn convolve_tiled_parallel(
     src: &GrayImage,
     kernel: &TileKernel,
     config: &TileConfig,
 ) -> ImageResult<GrayImage> {
-    use rayon::prelude::*;
+    use crate::parallel::map_slice;
 
     if src.width == 0 || src.height == 0 {
         return Err(ImageError::InvalidDimensions(
@@ -337,10 +337,8 @@ pub fn convolve_tiled_parallel(
     let tiles = generate_tiles(src.width, src.height, config);
 
     // Process tiles in parallel, each producing (TileDesc, Vec<f32>)
-    let results: Vec<(TileDesc, Vec<f32>)> = tiles
-        .par_iter()
-        .map(|tile| (*tile, convolve_tile(src, kernel, tile)))
-        .collect();
+    let results: Vec<(TileDesc, Vec<f32>)> =
+        map_slice(&tiles, |tile| (*tile, convolve_tile(src, kernel, tile)));
 
     let mut output = GrayImage::new(src.width, src.height);
     for (tile, tile_data) in &results {

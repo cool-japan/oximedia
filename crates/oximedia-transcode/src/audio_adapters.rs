@@ -17,11 +17,13 @@
 //! |---------------------|------------------------------------------|---------------------------|
 //! | [`FlacFrameEncoder`]| `oximedia_audio::flac::FlacEncoder`      | raw FLAC frames           |
 //! | [`PcmFrameEncoder`] | (identity)                               | interleaved i16 LE PCM    |
-//! | [`AlacFrameEncoder`]| `oximedia_codec::alac::AlacEncoder`      | raw ALAC frames           |
-//! | [`OpusFrameEncoder`]| `oximedia_codec::opus::OpusEncoder`      | Opus packets (TOC+frames) |
+//! | [`AlacFrameEncoder`]| `crate::alac_bitstream::AlacStreamEncoder` | raw ALAC frames (escape + compressed, both FFmpeg-verified) |
 //!
 //! Every adapter chunks its input to the wrapped encoder's native block
 //! size internally, so callers may feed frames of any length.
+//!
+//! There is intentionally no Opus adapter here — see the note near the
+//! bottom of this file for why.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -44,7 +46,7 @@ const PCM_CHUNK_FRAMES: usize = 4096;
 
 /// A [`FrameDecoder`] over a fully-decoded interleaved i16 LE PCM buffer.
 ///
-/// Emits [`Frame::audio`] chunks of [`PCM_CHUNK_FRAMES`] sample-frames with
+/// Emits [`Frame::audio`] chunks of `PCM_CHUNK_FRAMES` sample-frames with
 /// PTS derived from the sample position, so downstream muxing gets real
 /// timestamps.
 pub struct PcmBufferFrameDecoder {
@@ -57,7 +59,7 @@ pub struct PcmBufferFrameDecoder {
 
 impl PcmBufferFrameDecoder {
     /// Creates a decoder over `pcm` (interleaved i16 LE) emitting
-    /// [`PCM_CHUNK_FRAMES`]-sample chunks.
+    /// `PCM_CHUNK_FRAMES`-sample chunks.
     ///
     /// # Errors
     ///
@@ -256,9 +258,12 @@ impl FrameEncoder for PcmFrameEncoder {
 // ─── AlacFrameEncoder ─────────────────────────────────────────────────────────
 
 /// A [`FrameEncoder`] producing spec-compliant raw ALAC frames via
-/// [`crate::alac_bitstream::AlacStreamEncoder`] (verified against FFmpeg;
-/// the workspace's compressed ALAC encoder emits elements reference
-/// decoders reject).
+/// [`crate::alac_bitstream::AlacStreamEncoder`], which picks the escape
+/// (uncompressed) or compressed (adaptive Rice + LPC) element form per
+/// block automatically — both forms are verified against FFmpeg (see that
+/// module's doc). The workspace's other ALAC encoder
+/// (`oximedia_codec::alac::AlacEncoder`) is not used here: its compressed
+/// elements are rejected by reference decoders.
 ///
 /// Output packets are raw ALAC frames, exactly one 4096-sample packet per
 /// non-empty payload (packet boundaries are container-significant for
@@ -351,14 +356,19 @@ impl FrameEncoder for AlacFrameEncoder {
     }
 }
 
-// NOTE: There is intentionally no Opus adapter. Both workspace Opus
-// encoders were evaluated for this pipeline and rejected: the audio-crate
-// encoder serializes a custom non-spec payload, and the codec-crate CELT
-// encoder emits byte-identical packets regardless of input (verified
-// empirically against FFmpeg). Transcoding to Opus returns a descriptive
-// unsupported-codec error instead of fabricating output.
-// TODO(0.2.x): wire a real Opus encoder once one passes reference-decoder
-// verification, then re-enable the `.ogg`/`.opus` target in `frame_level`.
+// NOTE: There is intentionally no Opus adapter. Both the encoder and the
+// decoder were evaluated for this pipeline this session and rejected:
+// - Encoder: the audio-crate encoder serializes a custom non-spec payload,
+//   and the codec-crate CELT encoder emits byte-identical packets
+//   regardless of input (verified empirically against FFmpeg) — its output
+//   is unverified against any reference decoder.
+// - Decoder: the codec-crate CELT decoder fails to reconstruct real-world
+//   CELT packets, decoding them to silence instead of audio.
+// Neither direction is trustworthy, so transcoding to/from Opus returns a
+// descriptive unsupported-codec error instead of fabricating output.
+// TODO(0.2.x): wire a real Opus encoder AND decoder once both pass
+// reference-decoder / real-packet verification, then re-enable the
+// `.ogg`/`.opus` target in `frame_level`.
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
@@ -473,22 +483,49 @@ mod tests {
         let mut enc = AlacFrameEncoder::new(sr, 2).expect("alac encoder");
         assert_eq!(enc.magic_cookie().len(), 24, "ALACSpecificConfig cookie");
 
+        // A sine tone compresses well, so `AlacStreamEncoder::encode_block`
+        // (self-verified against its own decoder, see alac_bitstream.rs)
+        // is expected to prefer the compressed element form here — assert
+        // real compression + real round-trip through the stream decoder,
+        // not a byte-exact escape-coding size (which no longer applies
+        // once the encoder is allowed to pick the smaller form).
         let full = enc
             .encode_frame(&Frame::audio(pcm[..PCM_CHUNK_FRAMES * 4].to_vec(), 0))
             .expect("encode full block");
-        // Escape coding is deterministic: 23 bits header + samples + END.
-        let expected_full = (23 + PCM_CHUNK_FRAMES * 2 * 16 + 3).div_ceil(8);
-        assert_eq!(full.len(), expected_full, "one packet per 4096 frames");
+        assert!(!full.is_empty(), "one packet per 4096 frames");
+        let escape_size = (23 + PCM_CHUNK_FRAMES * 2 * 16 + 3).div_ceil(8);
+        assert!(
+            full.len() < escape_size,
+            "a sine tone must compress smaller than escape coding: {} vs {escape_size}",
+            full.len()
+        );
 
-        enc.encode_frame(&Frame::audio(pcm[PCM_CHUNK_FRAMES * 4..].to_vec(), 0))
+        let tail = enc
+            .encode_frame(&Frame::audio(pcm[PCM_CHUNK_FRAMES * 4..].to_vec(), 0))
             .expect("buffer partial");
+        assert!(
+            tail.is_empty(),
+            "partial block is buffered, not flushed yet"
+        );
         let tail = enc.flush().expect("flush");
-        let expected_tail: usize = (23 + 32 + 500 * 2 * 16 + 3usize).div_ceil(8);
-        assert_eq!(tail.len(), expected_tail, "short final packet");
+        assert!(!tail.is_empty(), "short final packet");
         assert_eq!(
             enc.sample_counter()
                 .load(std::sync::atomic::Ordering::Relaxed),
             (PCM_CHUNK_FRAMES + 500) as u64
         );
+
+        // Round-trip both packets through the real stream decoder to
+        // confirm this wrapper's chunking didn't corrupt anything.
+        let pcm_i16: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let dec = crate::alac_bitstream::AlacStreamDecoder::new(2, PCM_CHUNK_FRAMES as u32)
+            .expect("decoder");
+        let decoded_full = dec.decode_block(&full).expect("decode full packet");
+        assert_eq!(decoded_full, pcm_i16[..PCM_CHUNK_FRAMES * 2]);
+        let decoded_tail = dec.decode_block(&tail).expect("decode tail packet");
+        assert_eq!(decoded_tail, pcm_i16[PCM_CHUNK_FRAMES * 2..]);
     }
 }

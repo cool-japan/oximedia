@@ -1,7 +1,15 @@
 # oximedia-cli — Command-Line Interface TODO
 
-**Version: 0.2.0 (active, dev branch `0.2.0`) / 0.1.9 (stable, `master`)**
-**Status as of: 2026-07-15**
+**Version: 0.2.1 (active, dev branch `0.2.1`) / 0.2.0 (stable, `master`)**
+**Status as of: 2026-08-12**
+
+**0.2.1 summary.** The single root cause behind the largest cluster of gaps —
+no CLI-reachable decode → process → encode frame path — is **closed**. A shared
+`src/frame_harness/` module now backs **nine** commands with real frame work.
+Thirteen further single-command gaps shipped. `TODO(0.2.x)` markers in
+`oximedia-cli/src/` are down to **four** (all listed under "Subcommand-level
+gaps" below). `--quiet` remains a **partial** rollout — see the honest count
+there. `--resume` is **unchanged and still USER-UNDECIDED**.
 
 The `oximedia-cli` crate is the primary user-facing entry point to the OxiMedia
 Sovereign Media Framework. It ships **two binaries** from a single crate — the
@@ -321,6 +329,77 @@ tabs, `↑`/`↓` navigate, `Enter` show details.
 
 ### Subcommand-level gaps (direct `grep` findings)
 
+**0.2.1 status (re-harvested 2026-08-12).** `rg -n "TODO\(0\.2" oximedia-cli/src/`
+returns exactly **four** markers, all verified present in the tree:
+`archivepro_cmd.rs:514`, `captions_cmd.rs:1061`, `distributed_cmd.rs:228`,
+`edl_cmd.rs:281` — detailed at the end of this subsection.
+
+- [x] **The frame-level-pipeline root cause is closed.** A new shared
+  `src/frame_harness/` module (`mod`/`adapt`/`ops`/`font`/`scale`/`text`),
+  lifted out of `restore_cmd.rs`'s private stabiliser code, provides
+  `process_clip` and `process_frames` (the latter genuinely streaming via
+  `Y4mDemuxer::read_frame`) over a Y4M-in/Y4M-out contract. Output is
+  buffered and written with a single `fs::write` after full success, so a
+  failure leaves no partial file. `ClipStats.bytes_changed` is an
+  anti-fabrication counter: a command that changed nothing removes its
+  output and refuses to report success. `restore_cmd.rs::stabilize_video_y4m`
+  was re-pointed at it, deleting 289 lines of duplicated private
+  `ChromaLayout`/`stabilize_planar_frames`/`warp_plane`. **Nine commands now
+  do real frame work through it:**
+  - `scaling scale` / `compare` / `batch` — real `Resampler` per plane
+    (u8→f32→resize→f32→u8) with `FilterKernel` from `--mode`, real
+    letterbox/crop, and real PSNR/SSIM via `oximedia_scaling::quality_metrics`.
+  - `denoise` — real `Denoiser::process` through a `VideoFrame` bridge;
+    `denoise_reduces_variance_on_real_noise` asserts both `bytes_changed > 0`
+    and a measured local-variance decrease.
+  - `stabilize` — config built from the command's own
+    `--mode`/`--quality`/`--smoothing`/`--zoom`; `--zoom` genuinely drives a
+    real `ZoomOptimizer` (proven by a pixel-level warp-difference test on
+    trackable motion, and a companion test that it is correctly a no-op only
+    on featureless footage).
+  - `multicam color-match` — real per-angle Y4M decode → BT.709 YCbCr→sRGB →
+    mean/std → `ColorMatcher::update_stats`/`calculate_corrections`, written
+    to `<stem>.colormatch.json`. This replaces `ColorStats::new`, whose
+    `[0.5,0.5,0.5]` / 6500 K defaults were the original fabrication.
+  - `timecode burn` — `TimecodeFilter` driven through `Node::process` and
+    back to planar; verified by hand through the real binary (a flat 256×64
+    clip burns legible glyphs, `01:00:00:00` → `01:00:00:01`, with exactly
+    191 luma pixels differing between frames — only the last digit).
+  - `subtitle burn` and `captions burn` — real cue parsing, layout via
+    `oximedia_subtitle::font::{Font, GlyphCache, SimpleLayoutEngine}`, per-cue
+    alpha compositing; `captions` additionally positions through
+    `CaptionRenderer::render_lines` + `SafeAreaInsets::standard`.
+
+  A new **`--font <PATH>`** flag is required by every text-burning command.
+  No font ships in the tree and no system-font probing is done: a missing or
+  unreadable font is an honest error that names the flag. Non-Y4M input keeps
+  a shared "convert first" message naming `oximedia transcode`. Content-level
+  coverage lives in `tests/frame_harness_e2e.rs`; real-glyph pixel tests are
+  gated behind `OXIMEDIA_TEST_FONT`. One genuine intermittent test race was
+  found and fixed while verifying with a real font: `captions_cmd.rs`'s test
+  module built every fixture path from a bare `std::env::temp_dir()` with
+  fixed filenames.
+- [x] **Thirteen single-command gaps shipped** (0.2.1). Part 1:
+  `archivepro migrate` (real PNG/TIFF image migration via `oximedia_image`,
+  reusing `image_cmd.rs`'s own codec path; `VideoFfv1Mkv` stays an honest
+  refusal — see the marker below), `cloud upload --multipart` (real
+  `upload_stream` with a size hint; all three backends treat an unknown size
+  as "always chunk", so this genuinely forces multipart/block/resumable, with
+  a pure `upload_size_hint()` guard against the 10,000-part ceiling above
+  ~50 GB), `collab edit` (a new subcommand plus `EditEventRecord` persistence
+  and real `--include-edits` JSON/CSV export), `distributed`, `drm`, `edl`.
+  Part 2: `dolbyvision convert` (`--preserve-levels` gating Level-2 stripping
+  on the real Profile 8→8.4 PQ→HLG rescale; every other profile pair is an
+  honest `Err` naming the missing transform, never a fabricated RPU),
+  `mam ingest` (real `ProxyGenerator` proxies for Y4M→MJPEG/MKV and
+  WAV→FLAC; any other format is a visible stderr warning with the asset still
+  cataloged and `proxy_path: None`), `renderfarm init` (real XDG-conventional
+  persistent state dir via `dirs::state_dir()` → `data_local_dir()` → temp,
+  with a real manifest written to disk), `switcher record` (an honest-`Err`
+  message that correctly distinguishes FFV1 — a real encoder, blocked only on
+  a missing capture source — from AV1/VP9/VP8, whose encoders are themselves
+  fake), `transcode` preset/`--audio-bitrate` knobs, `validate`
+  (EBU R103 + decode coverage), `workflow` SQLite state.
 - [x] `captions_cmd.rs:114` — `generate` currently writes a placeholder caption
   track; wire to the real ASR pipeline (OxiMedia has speech alignment in
   `oximedia-caption-gen`). Done: feature-gated `caption-gen` implementation
@@ -402,6 +481,26 @@ tabs, `↑`/`↓` navigate, `Enter` show details.
   per-metric size-guard honesty); covered by
   `tests/probe_quality_snapshot.rs`.
 
+#### Open — the four remaining `TODO(0.2.x)` markers (verified 2026-08-12)
+
+- [ ] `archivepro_cmd.rs:514` — `VideoFfv1Mkv` migration target. Honest
+  refusal today, and deliberately so: `oximedia-transcode`'s frame level
+  writes FFV1 only in its own private raw framing (`.ffv1`), never into
+  Matroska, and labelling that output `.mkv` would be exactly the
+  mislabelling this command refuses elsewhere. Blocked on a Matroska muxer
+  that can carry FFV1. (UT Video, JPEG 2000, PDF/A and plain text are
+  separate honest refusals in the same command.)
+- [ ] `captions_cmd.rs:1061` — extend caption extraction to MP4 (tx3g) and
+  ASS/SSA-in-Matroska.
+- [ ] `distributed_cmd.rs:228` — add a state/persistence-directory field to
+  the config. Related finding from the 0.2.1 pass, recorded so it is not
+  re-investigated: `--watch` cannot poll a real coordinator because
+  `oximedia_distributed`'s `CoordinatorServiceClient` is a stub whose RPC
+  methods return a default response without touching the connected channel,
+  and `Coordinator::serve` mounts no tonic service at all (it runs a plain-TCP
+  text protocol instead). That is an `oximedia-distributed` gap, not a CLI one.
+- [ ] `edl_cmd.rs:281` — grow real per-dialect writers in `oximedia-edl`.
+
 ### CLI Flag Wiring Investigation (2026-07-14) — CLOSED 2026-07-15
 
 **Status update (2026-07-15, 0.2.0 wave):** every flag investigated below
@@ -482,8 +581,22 @@ Related honesty fixes shipped in the same pass (2026-07-15):
   status/banner stdout of transcode (plan/summary/two-pass banner),
   extract (plan/summary), and image convert; probe/audio results and
   `--json`/`--ndjson` payloads are never suppressed. Help text documents
-  the exact coverage. Tests: `tests/quiet_flag.rs`. TODO(0.2.x): sweep the
-  remaining ~50 handlers (marker in src/progress.rs).
+  the exact coverage. Tests: `tests/quiet_flag.rs`.
+  **Rollout status, measured 2026-08-12: PARTIAL, and the tracking marker in
+  `src/progress.rs` is gone even though the sweep is not finished — do not
+  read the absence of a marker as completion.** `is_quiet()` is consulted in
+  **38** source files (**31** of the 75 `*_cmd.rs` handlers, plus the seven
+  shared helpers `batch.rs`, `concat.rs`, `extract.rs`, `metadata.rs`,
+  `progress.rs`, `thumbnail.rs`, `transcode.rs`). The other **44**
+  `*_cmd.rs` handlers **do not consult `is_quiet()` at all**, so nothing
+  they print can be suppressed — the largest by
+  raw `println!` count are `renderfarm_cmd.rs`, `workflow_cmd.rs`,
+  `mir_cmd.rs`, `videoip_cmd.rs`, `farm_cmd.rs`, `audiopost_cmd.rs`,
+  `auto_cmd.rs`, `routing_cmd.rs`, `rights_cmd.rs` and `align_cmd.rs`.
+  Note that a bare `println!` is **not** automatically a defect here: by
+  design, command *results* and `--json`/`--ndjson` payloads are never
+  suppressed, so closing this properly means classifying each site as
+  status-vs-result rather than mechanically wrapping every call.
 - Debug-format leaks fixed where a Display path exists: probe text/csv
   container format (src/handlers/inspect.rs), EDL format (src/edl_cmd.rs),
   benchmark codec/preset lists (join), graphics template params (k=v
@@ -898,6 +1011,18 @@ recorded below for historical context:
   (2026-07-14) — CLOSED 2026-07-15" above, which also cover the second
   audit of every other parsed-but-dropped flag (validate/mam/batch-engine/
   workflow/collab/edl/drm/cloud/recommend/distributed/renderfarm).
+- **0.2.1 (2026-08-12).** The frame-level-pipeline root cause is closed
+  (nine commands, see "Subcommand-level gaps"), thirteen single-command gaps
+  shipped, and `TODO(0.2.x)` markers under `src/` are down to four. Two
+  things stay open and are easy to misread as done:
+  1. **`--quiet` is a partial rollout** — 38 files consult `is_quiet()`,
+     44 `*_cmd.rs` handlers do not consult it at all — and its tracking marker in
+     `src/progress.rs` has been removed, so a marker grep will not surface
+     it. Honest counts are under "Subcommand-level gaps" above.
+  2. **`--resume` is unchanged: USER-UNDECIDED, removed from the CLI
+     surface.** Nothing this session touched it. See the "`--resume`
+     disposition record" below for the full design question. **Do not
+     implement without an explicit user decision.**
 - **Resolved:** a dedicated `tests/` directory now exists (36 files,
   verified 2026-07-14) — `assert_cmd`/`predicates`-driven integration tests
   covering help/version smoke, JSON strict output, NDJSON, exit codes,
@@ -927,6 +1052,8 @@ recorded below for historical context:
 | Crate split under `commands.rs`     | Keep files < 2000 SLOC as the subcommand count climbs.     |
 
 ---
+
+*Last updated: 2026-08-12 — v0.2.1: frame-harness wave (nine commands made real, `--font` added), thirteen single-command gaps shipped, `TODO(0.2.x)` markers down to four, `--quiet` rollout re-measured as partial (38 files gated), `--resume` disposition unchanged (USER-UNDECIDED). Previous entry below.*
 
 *Last updated: 2026-05-06 — v0.1.9, oximedia-cli summary (Run 4 of `/ultra oximedia-cli` LANDED 2026-05-06: handlers.rs split into per-domain submodule, doctor `--full` Phase 1 with codec matrix + plugin path validation + OXICUDA probe, oximedia-compat-cv2 `dnn` module wrapping oxionnx + ORB pipeline followups (BFMatcher / knn_match / mask), 10 new oximedia-cv2 subcommands; bookkeeping flips Refinement 8 done and closes Refinement 5 as WONT-FIX)*
 

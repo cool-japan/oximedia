@@ -74,12 +74,20 @@ impl BitWriter {
         self.write_bits(unsigned, bits);
     }
 
-    /// Write unary coded value (n ones followed by a zero).
+    /// Write unary coded value (n zeros followed by a one).
+    ///
+    /// Per RFC 9639 ("FLAC: Free Lossless Audio Codec") section 9.2.7: "Unary
+    /// coding in a FLAC bitstream is done with zero bits terminated with a one
+    /// bit, e.g., the number 5 is coded unary as 0b000001." This is the
+    /// opposite polarity from the more commonly seen "ones terminated by a
+    /// zero" convention — get this backwards and the bitstream stays
+    /// self-consistent with a matching (also backwards) reader, but is
+    /// unreadable by any spec-compliant decoder.
     pub fn write_unary(&mut self, value: u32) {
         for _ in 0..value {
-            self.write_bit(true);
+            self.write_bit(false);
         }
-        self.write_bit(false);
+        self.write_bit(true);
     }
 
     /// Write Rice-coded value.
@@ -320,11 +328,11 @@ mod tests {
     #[test]
     fn test_write_unary() {
         let mut writer = BitWriter::new();
-        writer.write_unary(3);
-        writer.write_unary(0);
+        writer.write_unary(3); // 3 zeros then a one: 0001
+        writer.write_unary(0); // 0 zeros then a one: 1
 
         let data = writer.finish();
-        assert_eq!(data[0] >> 4, 0b1110);
+        assert_eq!(data[0] >> 4, 0b0001);
     }
 
     #[test]

@@ -12,10 +12,17 @@
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_possible_wrap)]
 
+use rayon::prelude::*;
+
 use super::bits::floor_log2;
 use super::hdr::{CdefParams, FrameHdr};
-use super::recon::PlaneBuf;
+use super::recon::{auto_band_count, plan_bands, split_out_bands, OutBand, PlaneBuf};
 use super::tables_conv::{CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS, CDEF_UV_DIR, DIV_TABLE};
+
+/// Smallest luma area worth giving a CDEF band of its own. Below roughly
+/// this much work per band the rayon dispatch costs more than the filtering
+/// it hands off, so small frames stay on the serial path.
+const CDEF_MIN_BAND_PIXELS: usize = 1 << 16;
 
 /// Frame state the CDEF pass needs.
 pub struct CdefInput<'a> {
@@ -31,30 +38,65 @@ pub struct CdefInput<'a> {
 }
 
 /// Applies CDEF: `planes` is CurrFrame on input, CdefFrame on output.
-pub fn cdef_frame(planes: &mut [PlaneBuf; 3], input: &CdefInput<'_>) {
+///
+/// `forced_bands` overrides the automatic row-band split (tests only); the
+/// filtered output does not depend on it.
+pub fn cdef_frame(planes: &mut [PlaneBuf; 3], input: &CdefInput<'_>, forced_bands: Option<usize>) {
     // CdefFrame starts as a copy; filtered blocks overwrite it.
     let mut out: [Vec<u8>; 3] = [
         planes[0].data.clone(),
         planes[1].data.clone(),
         planes[2].data.clone(),
     ];
+    let want = forced_bands.unwrap_or_else(|| {
+        auto_band_count(planes[0].width * planes[0].height, CDEF_MIN_BAND_PIXELS)
+    });
+    // Each 8x8 CDEF block covers two MI rows, so bands split on even ones.
+    // MI row r covers luma rows 4r..4r+8, so band k owns exactly luma rows
+    // 4*r0..4*r1 — which requires MiRows to be even. It always is (spec
+    // 5.9.2 `MiRows = 2 * ((frame_height_minus_1 + 8) >> 3)`), and the block
+    // loop below already depends on it; pin it where it is consumed.
+    debug_assert_eq!(input.mi_rows % 2, 0, "MiRows must be even");
+    let mi_bounds = plan_bands(input.mi_rows, 2, want);
+    let luma_bounds: Vec<(usize, usize)> = mi_bounds.iter().map(|&(a, b)| (a * 4, b * 4)).collect();
+    let strides = [planes[0].stride, planes[1].stride, planes[2].stride];
+    let windows = split_out_bands(&mut out, strides, usize::from(input.sub_y), &luma_bounds);
+    let jobs: Vec<((usize, usize), OutBand<'_>)> = mi_bounds.into_iter().zip(windows).collect();
+    if jobs.len() > 1 {
+        jobs.into_par_iter()
+            .for_each(|((r0, r1), mut band)| cdef_rows(planes, &mut band, input, r0, r1));
+    } else {
+        for ((r0, r1), mut band) in jobs {
+            cdef_rows(planes, &mut band, input, r0, r1);
+        }
+    }
+    for (p, o) in planes.iter_mut().zip(out.into_iter()) {
+        p.data = o;
+    }
+}
+
+/// Runs the CDEF block loop over the MI rows `r0..r1` of one output band.
+fn cdef_rows(
+    planes: &[PlaneBuf; 3],
+    out: &mut OutBand<'_>,
+    input: &CdefInput<'_>,
+    r0: usize,
+    r1: usize,
+) {
     let step4 = 2usize; // Num_4x4_Blocks_Wide[BLOCK_8X8]
     let cdef_size4 = 16usize; // Num_4x4_Blocks_Wide[BLOCK_64X64]
     let cdef_mask4 = !(cdef_size4 - 1);
-    let mut r = 0;
-    while r < input.mi_rows {
+    let mut r = r0;
+    while r < r1 {
         let mut c = 0;
         while c < input.mi_cols {
             let base_r = r & cdef_mask4;
             let base_c = c & cdef_mask4;
             let idx = input.cdef_idx[base_r * input.mi_cols + base_c];
-            cdef_block(planes, &mut out, input, r, c, idx);
+            cdef_block(planes, out, input, r, c, idx);
             c += step4;
         }
         r += step4;
-    }
-    for (p, o) in planes.iter_mut().zip(out.into_iter()) {
-        p.data = o;
     }
 }
 
@@ -62,7 +104,7 @@ pub fn cdef_frame(planes: &mut [PlaneBuf; 3], input: &CdefInput<'_>) {
 /// output starts as a copy of the input).
 fn cdef_block(
     planes: &[PlaneBuf; 3],
-    out: &mut [Vec<u8>; 3],
+    out: &mut OutBand<'_>,
     input: &CdefInput<'_>,
     r: usize,
     c: usize,
@@ -182,7 +224,7 @@ fn constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
 #[allow(clippy::too_many_arguments)]
 fn cdef_filter(
     planes: &[PlaneBuf; 3],
-    out: &mut [Vec<u8>; 3],
+    out: &mut OutBand<'_>,
     input: &CdefInput<'_>,
     plane: usize,
     r: usize,
@@ -245,7 +287,93 @@ fn cdef_filter(
                 }
             }
             let v = (x + ((8 + sum - i32::from(sum < 0)) >> 4)).clamp(mn, mx);
-            out[plane][(y0 + i) * p.stride + x0 + j] = v as u8;
+            out.put(plane, y0 + i, x0 + j, v as u8);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::hdr::FrameHdr;
+    use super::{cdef_frame, CdefInput, PlaneBuf};
+
+    /// Deterministic filler (splitmix64) so the fixtures below are the same
+    /// on every run and every platform.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn make_planes(mi_rows: usize, mi_cols: usize, seed: u64) -> [PlaneBuf; 3] {
+        let mut state = seed;
+        let mut mk = |w: usize, h: usize| PlaneBuf {
+            data: (0..w * h).map(|_| next(&mut state) as u8).collect(),
+            stride: w,
+            width: w,
+            height: h,
+        };
+        let (lw, lh) = (mi_cols * 4, mi_rows * 4);
+        [mk(lw, lh), mk(lw / 2, lh / 2), mk(lw / 2, lh / 2)]
+    }
+
+    /// CDEF reads `CurrFrame` and writes a separate `CdefFrame`, so the
+    /// output must not depend on how the frame is split into row bands.
+    #[test]
+    fn cdef_row_bands_match_serial() {
+        // MiRows/MiCols are always even (spec 5.9.2); 76x42 decodes to
+        // 20x12 MI, which is the odd-size shape the fixtures cover.
+        for &(mi_rows, mi_cols) in &[(2usize, 2usize), (12, 20), (16, 16), (18, 34), (34, 18)] {
+            let mut state = 0x5EED_1234_u64 ^ (mi_rows as u64) << 32 ^ mi_cols as u64;
+            let n = mi_rows * mi_cols;
+            let skips: Vec<u8> = (0..n)
+                .map(|_| u8::from(next(&mut state) & 3 == 0))
+                .collect();
+            let cdef_idx: Vec<i16> = (0..n)
+                .map(|_| {
+                    let v = next(&mut state) % 9;
+                    if v == 8 {
+                        -1
+                    } else {
+                        v as i16
+                    }
+                })
+                .collect();
+            let mut hdr = FrameHdr::default();
+            hdr.frame_width = (mi_cols * 4) as u32;
+            hdr.frame_height = (mi_rows * 4) as u32;
+            hdr.cdef.damping = 4;
+            hdr.cdef.bits = 3;
+            for i in 0..8 {
+                hdr.cdef.y_pri_strength[i] = (next(&mut state) % 16) as u32;
+                hdr.cdef.y_sec_strength[i] = [0u32, 1, 2, 4][(next(&mut state) % 4) as usize];
+                hdr.cdef.uv_pri_strength[i] = (next(&mut state) % 16) as u32;
+                hdr.cdef.uv_sec_strength[i] = [0u32, 1, 2, 4][(next(&mut state) % 4) as usize];
+            }
+            let input = CdefInput {
+                hdr: &hdr,
+                sub_x: true,
+                sub_y: true,
+                num_planes: 3,
+                mi_rows,
+                mi_cols,
+                skips: &skips,
+                cdef_idx: &cdef_idx,
+            };
+            let mut serial = make_planes(mi_rows, mi_cols, 0xC0FF_EE00);
+            cdef_frame(&mut serial, &input, Some(1));
+            for bands in 2..=9usize {
+                let mut split = make_planes(mi_rows, mi_cols, 0xC0FF_EE00);
+                cdef_frame(&mut split, &input, Some(bands));
+                for plane in 0..3 {
+                    assert_eq!(
+                        split[plane].data, serial[plane].data,
+                        "CDEF plane {plane} differs at {mi_cols}x{mi_rows} MI with {bands} bands"
+                    );
+                }
+            }
         }
     }
 }

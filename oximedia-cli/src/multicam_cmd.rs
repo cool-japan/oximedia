@@ -80,17 +80,18 @@ pub enum MulticamCommand {
         spacing: u32,
     },
 
-    /// Match colors across camera angles
+    /// Measure colour statistics across camera angles and compute corrections
     ColorMatch {
-        /// Reference camera file
+        /// Reference camera file (uncompressed YUV4MPEG2 / .y4m)
         #[arg(long)]
         reference: PathBuf,
 
-        /// Input camera files to match
+        /// Input camera files to match (uncompressed YUV4MPEG2 / .y4m)
         #[arg(short, long, required = true, num_args = 1..)]
         inputs: Vec<PathBuf>,
 
-        /// Output directory for matched files
+        /// Output directory for per-angle colour-correction reports
+        /// (JSON metadata; no video is re-encoded)
         #[arg(short, long)]
         output_dir: PathBuf,
     },
@@ -408,28 +409,40 @@ async fn composite_cameras(
     Ok(())
 }
 
+/// Operation label used in the frame harness's error messages.
+const COLOR_MATCH_OP: &str = "multicam color-match";
+
 /// Match colors across camera angles.
 ///
-/// Real color matching needs per-angle pixel statistics (mean/stddev RGB --
-/// see [`oximedia_multicam::color::ColorStats`], consumed by
-/// [`oximedia_multicam::color::ColorMatcher::calculate_corrections`]) derived
-/// from *decoded* video frames. `oximedia-cli` has no video decode pipeline
-/// reachable from this handler (the same gap documented on `captions burn`
-/// in `captions_cmd.rs`), so there is no way to compute real statistics here.
+/// Every number here is measured from real decoded pixels:
 ///
-/// Calling `ColorMatcher` with default-constructed `ColorStats` would just
-/// reproduce the original bug (its defaults are `mean_rgb: [0.5, 0.5, 0.5]`,
-/// `temperature: 6500.0` -- i.e. exactly the fabricated "neutral" values this
-/// fix is removing), so we validate real inputs and then refuse honestly
-/// instead.
-// TODO(0.2.x): wire real per-angle `ColorStats` once a CLI-reachable video
-// decode pipeline exists to compute them from actual frames.
+/// 1. Each angle (reference first, then the inputs) is decoded with
+///    [`crate::frame_harness::read_y4m_clip`].
+/// 2. [`crate::frame_harness::ops::clip_rgb_stats`] converts every pixel of
+///    every frame to RGB and accumulates per-channel mean and standard
+///    deviation; the colour temperature and green–magenta tint are derived
+///    from those means.
+/// 3. The resulting [`oximedia_multicam::color::ColorStats`] are fed to
+///    [`oximedia_multicam::color::ColorMatcher::update_stats`] and
+///    [`oximedia_multicam::color::ColorMatcher::calculate_corrections`], whose
+///    per-angle correction matrices are written to `output_dir` as JSON.
+///
+/// `ColorStats::new` is deliberately *not* used: its defaults
+/// (`mean_rgb: [0.5, 0.5, 0.5]`, `temperature: 6500.0`) are the fabricated
+/// "neutral" values this command previously refused to emit. Every field is
+/// constructed from measured statistics.
+///
+/// This command writes correction *metadata*, not corrected video: applying a
+/// correction matrix to every pixel and re-encoding is a separate operation.
+/// The output says so explicitly.
 async fn color_match(
     reference: &PathBuf,
     inputs: &[PathBuf],
     output_dir: &PathBuf,
     json_output: bool,
 ) -> Result<()> {
+    use oximedia_multicam::color::{ColorMatcher, ColorStats};
+
     if !reference.exists() {
         return Err(anyhow::anyhow!(
             "Reference file not found: {}",
@@ -442,32 +455,183 @@ async fn color_match(
         }
     }
 
-    if json_output {
-        let diag = serde_json::json!({
-            "reference": reference.display().to_string(),
-            "cameras": inputs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "output_dir": output_dir.display().to_string(),
-            "status": "error",
-            "error": "color matching requires decoded video frames; no decode pipeline is \
-                      reachable from oximedia-cli in this build",
-        });
-        eprintln!(
-            "{}",
-            serde_json::to_string_pretty(&diag).unwrap_or_else(|_| diag.to_string())
-        );
+    // Angle 0 is the reference; angles 1..=n are the inputs to be matched.
+    let mut angle_paths: Vec<PathBuf> = Vec::with_capacity(inputs.len() + 1);
+    angle_paths.push(reference.clone());
+    angle_paths.extend(inputs.iter().cloned());
+
+    // Per angle: the multicam `ColorStats`, the raw sample counts, and the
+    // colour-temperature estimate — `None` when the chromaticity is too far
+    // off the Planckian locus for McCamy's approximation to mean anything.
+    let mut measured: Vec<(ColorStats, crate::frame_harness::ops::RgbStats, Option<f32>)> =
+        Vec::with_capacity(angle_paths.len());
+    for (angle, path) in angle_paths.iter().enumerate() {
+        let clip = crate::frame_harness::read_y4m_clip(COLOR_MATCH_OP, path)?;
+        let stats = crate::frame_harness::ops::clip_rgb_stats(&clip)
+            .with_context(|| format!("Failed to measure colour of '{}'", path.display()))?;
+        let temperature = crate::frame_harness::ops::correlated_color_temperature(stats.mean_rgb);
+        measured.push((
+            ColorStats {
+                angle,
+                mean_rgb: stats.mean_rgb,
+                std_rgb: stats.std_rgb,
+                // `ColorStats` has no "unknown" temperature, and its own
+                // constructor would seed the fabricated 6500 K default. 0 K is
+                // physically impossible, so it cannot be mistaken for a
+                // measurement; the reported value is the `Option` below.
+                temperature: temperature.unwrap_or(0.0),
+                tint: crate::frame_harness::ops::green_magenta_tint(stats.mean_rgb),
+            },
+            stats,
+            temperature,
+        ));
     }
 
-    Err(anyhow::anyhow!(
-        "Color matching across {} camera(s) against reference '{}' is not yet implemented: \
-         real corrections require per-angle color statistics (mean/stddev RGB) computed from \
-         decoded video frames via oximedia_multicam::color::ColorMatcher, and oximedia-cli has \
-         no video decode pipeline reachable from this handler to produce them. Refusing to \
-         report \"color_match_ready\" with fabricated neutral (identity) adjustments and no \
-         matched files written to '{}'.",
-        inputs.len(),
-        reference.display(),
-        output_dir.display()
-    ))
+    let mut matcher = ColorMatcher::new(angle_paths.len(), 0);
+    for (stats, _, _) in &measured {
+        matcher.update_stats(*stats);
+    }
+    matcher
+        .calculate_corrections()
+        .map_err(|e| anyhow::anyhow!("Colour correction calculation failed: {e}"))?;
+
+    tokio::fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create output directory: {}",
+                output_dir.display()
+            )
+        })?;
+
+    let reference_stats = measured
+        .first()
+        .map(|(stats, _, _)| *stats)
+        .ok_or_else(|| anyhow::anyhow!("no reference statistics were measured"))?;
+
+    let mut angle_reports = Vec::with_capacity(angle_paths.len());
+    let mut written_files = Vec::with_capacity(inputs.len());
+
+    for (angle, path) in angle_paths.iter().enumerate() {
+        let (stats, sampled, temperature) = measured[angle];
+        let matrix = matcher
+            .get_correction(angle)
+            .ok_or_else(|| anyhow::anyhow!("no correction matrix for angle {angle}"))?;
+
+        let report = serde_json::json!({
+            "angle": angle,
+            "role": if angle == 0 { "reference" } else { "input" },
+            "source": path.display().to_string(),
+            "frames_sampled": sampled.frame_count,
+            "pixels_sampled": sampled.pixel_count,
+            "mean_rgb": stats.mean_rgb,
+            "std_rgb": stats.std_rgb,
+            // null when the chromaticity is too far off the Planckian locus
+            // for McCamy's approximation to be meaningful.
+            "temperature_kelvin": temperature,
+            "tint_green_magenta": stats.tint,
+            "distance_to_reference": stats.distance_to(&reference_stats),
+            "correction_matrix": matrix.matrix,
+        });
+
+        if angle > 0 {
+            let stem = path
+                .file_stem()
+                .map_or_else(|| format!("angle{angle}"), |s| s.to_string_lossy().into());
+            let out_path = output_dir.join(format!("{stem}.colormatch.json"));
+            let body = serde_json::to_string_pretty(&serde_json::json!({
+                "reference": reference.display().to_string(),
+                "reference_mean_rgb": reference_stats.mean_rgb,
+                "angle": report,
+                "note": "Correction metadata measured from decoded frames. \
+                         No video was re-encoded by `multicam color-match`.",
+            }))
+            .context("Failed to serialise colour-match report")?;
+            tokio::fs::write(&out_path, body.as_bytes())
+                .await
+                .with_context(|| format!("Failed to write {}", out_path.display()))?;
+            written_files.push(out_path.display().to_string());
+        }
+
+        angle_reports.push(report);
+    }
+
+    let summary = serde_json::json!({
+        "reference": reference.display().to_string(),
+        "cameras": inputs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "output_dir": output_dir.display().to_string(),
+        "reference_angle": 0,
+        "color_space": "BT.709 limited-range YCbCr decoded to gamma-encoded sRGB",
+        "temperature_model": "McCamy's CCT approximation over linearised channel means; \
+                              null when the result falls outside 1000-25000 K, where the \
+                              cubic has clearly broken down",
+        "tint_model": "linear-light G - (R + B) / 2 (positive = green, negative = magenta)",
+        "angles": angle_reports,
+        "written_files": written_files,
+        "note": "Correction matrices measured from decoded frames. \
+                 This command writes correction metadata only; no video was re-encoded.",
+    });
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    println!("{}", "Multi-Camera Color Match".green().bold());
+    println!("{}", "=".repeat(60));
+    println!("{:20} {}", "Reference:", reference.display());
+    println!("{:20} {}", "Cameras:", inputs.len());
+    println!("{:20} {}", "Output dir:", output_dir.display());
+    println!();
+    println!("{}", "Measured Statistics".cyan().bold());
+    println!("{}", "-".repeat(60));
+    for (angle, path) in angle_paths.iter().enumerate() {
+        let (stats, sampled, temperature) = measured[angle];
+        let label = if angle == 0 { "ref" } else { "cam" };
+        println!(
+            "  [{label} {angle}] {}  ({} frames, {} px)",
+            path.display(),
+            sampled.frame_count,
+            sampled.pixel_count
+        );
+        println!(
+            "        mean RGB {:.4}/{:.4}/{:.4}   std {:.4}/{:.4}/{:.4}",
+            stats.mean_rgb[0],
+            stats.mean_rgb[1],
+            stats.mean_rgb[2],
+            stats.std_rgb[0],
+            stats.std_rgb[1],
+            stats.std_rgb[2]
+        );
+        println!(
+            "        CCT {}   tint {:+.4}   Δ to reference {:.4}",
+            temperature.map_or_else(
+                || "n/a (off the Planckian locus)".to_string(),
+                |k| format!("{k:.0} K")
+            ),
+            stats.tint,
+            stats.distance_to(&reference_stats)
+        );
+        if angle > 0 {
+            if let Some(matrix) = matcher.get_correction(angle) {
+                println!(
+                    "        gain R {:.4}  G {:.4}  B {:.4}",
+                    matrix.matrix[0][0], matrix.matrix[1][1], matrix.matrix[2][2]
+                );
+            }
+        }
+    }
+    println!();
+    for file in &written_files {
+        println!("  {} {}", "Wrote:".cyan(), file);
+    }
+    println!();
+    println!(
+        "  {} correction metadata only; no video was re-encoded.",
+        "Note:".yellow()
+    );
+
+    Ok(())
 }
 
 /// Build a CMX3600-style multi-camera EDL from a parsed timeline JSON value.
@@ -769,6 +933,17 @@ async fn list_layouts(json_output: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Scratch path for a fixture.
+    ///
+    /// The PID matters: this module is compiled into *both* the `oximedia`
+    /// binary and the `oximedia-cli` lib target (`lib.rs` exposes
+    /// `multicam_cmd` so the integration tests can drive it in-process), so
+    /// every test here runs twice in two concurrent processes. Fixed names
+    /// would let one copy's cleanup delete the other copy's fixture mid-test.
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("oximedia_mc_{}_{name}", std::process::id()))
+    }
+
     #[test]
     fn test_validate_sync_method() {
         assert!(validate_sync_method("audio").is_ok());
@@ -805,13 +980,12 @@ mod tests {
         assert!(desc.contains("Picture"));
     }
 
-    // ── color_match: honest-Err, no fabricated output ───────────────────────
+    // ── color_match: real statistics, honest-Err on unusable input ──────────
 
     #[tokio::test]
     async fn test_color_match_missing_reference_errors() {
-        let dir = std::env::temp_dir();
-        let reference = dir.join("oximedia_mc_test_missing_reference.mov");
-        let output_dir = dir.join("oximedia_mc_test_color_match_out_1");
+        let reference = temp_path("missing_reference.mov");
+        let output_dir = temp_path("color_match_out_1");
         let _ = std::fs::remove_file(&reference);
         let _ = std::fs::remove_dir_all(&output_dir);
 
@@ -825,12 +999,14 @@ mod tests {
         );
     }
 
+    /// Colour matching is real now, but it needs decodable frames. Files that
+    /// are not Y4M are refused with the shared, actionable error — and, as
+    /// before, nothing is fabricated on disk.
     #[tokio::test]
     async fn test_color_match_real_inputs_returns_honest_err_no_files() {
-        let dir = std::env::temp_dir();
-        let reference = dir.join("oximedia_mc_test_color_match_ref.mov");
-        let input = dir.join("oximedia_mc_test_color_match_in.mov");
-        let output_dir = dir.join("oximedia_mc_test_color_match_out_2");
+        let reference = temp_path("color_match_ref.mov");
+        let input = temp_path("color_match_in.mov");
+        let output_dir = temp_path("color_match_out_2");
         std::fs::write(
             &reference,
             b"not a real video, just bytes for existence checks",
@@ -844,12 +1020,10 @@ mod tests {
             .expect_err("color_match must not fabricate success");
         let msg = err.to_string();
         assert!(
-            msg.contains("not yet implemented"),
-            "error should be honest about the missing decode pipeline, got: {msg}"
+            msg.contains("YUV4MPEG2") && msg.contains("oximedia transcode"),
+            "error should name the input contract and how to satisfy it, got: {msg}"
         );
-        // The message may legitimately *name* the old status while refusing
-        // it (that's honest: "refusing to report ... color_match_ready");
-        // what must never reappear is the old success-shaped JSON fragment.
+        // What must never reappear is the old success-shaped JSON fragment.
         assert!(
             !msg.contains("\"status\": \"color_match_ready\"")
                 && !msg.contains("\"status\":\"color_match_ready\""),
@@ -862,6 +1036,69 @@ mod tests {
 
         std::fs::remove_file(&reference).ok();
         std::fs::remove_file(&input).ok();
+    }
+
+    /// Real angles produce measured statistics and a non-identity correction.
+    ///
+    /// The fabricated `ColorStats::new` defaults (mean 0.5 / std 0.1 /
+    /// 6500 K) must not appear anywhere in the output.
+    #[tokio::test]
+    async fn test_color_match_measures_real_statistics() {
+        /// Write a flat 4:2:0 Y4M clip.
+        fn write_flat(path: &std::path::Path, y: u8, u: u8, v: u8) {
+            let (w, h, frames) = (16usize, 16usize, 2usize);
+            let mut buf = format!("YUV4MPEG2 W{w} H{h} F25:1 Ip A1:1 C420jpeg\n").into_bytes();
+            for _ in 0..frames {
+                buf.extend_from_slice(b"FRAME\n");
+                buf.extend(std::iter::repeat_n(y, w * h));
+                buf.extend(std::iter::repeat_n(u, (w / 2) * (h / 2)));
+                buf.extend(std::iter::repeat_n(v, (w / 2) * (h / 2)));
+            }
+            std::fs::write(path, buf).expect("write y4m fixture");
+        }
+
+        let reference = temp_path("cm_ref.y4m");
+        let input = temp_path("cm_dim.y4m");
+        let output_dir = temp_path("cm_out");
+        let _ = std::fs::remove_dir_all(&output_dir);
+        write_flat(&reference, 200, 128, 128);
+        write_flat(&input, 90, 128, 128);
+
+        color_match(&reference, std::slice::from_ref(&input), &output_dir, false)
+            .await
+            .expect("color_match must succeed on real Y4M angles");
+
+        // The report is named after the input clip's file stem.
+        let stem = input
+            .file_stem()
+            .expect("stem")
+            .to_string_lossy()
+            .to_string();
+        let report = output_dir.join(format!("{stem}.colormatch.json"));
+        let body = std::fs::read_to_string(&report).expect("per-angle report must exist");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let mean = json["angle"]["mean_rgb"][0].as_f64().expect("mean_rgb[0]");
+        let std_dev = json["angle"]["std_rgb"][0].as_f64().expect("std_rgb[0]");
+        let gain = json["angle"]["correction_matrix"][0][0]
+            .as_f64()
+            .expect("correction gain");
+        assert!(
+            (mean - 0.5).abs() > 1e-3,
+            "mean must be measured, not the ColorStats::new default 0.5"
+        );
+        assert!(
+            std_dev < 1e-4,
+            "a flat clip must measure zero spread, got {std_dev}"
+        );
+        assert!(
+            gain > 1.05,
+            "matching a dark angle to a bright reference must gain it up, got {gain}"
+        );
+
+        let _ = std::fs::remove_file(&reference);
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_dir_all(&output_dir);
     }
 
     // ── export_timeline: real EDL/XML content, not boilerplate ──────────────
@@ -950,9 +1187,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_timeline_edl_writes_real_content_not_boilerplate() {
-        let dir = std::env::temp_dir();
-        let timeline_path = dir.join("oximedia_mc_test_export_timeline.json");
-        let output_path = dir.join("oximedia_mc_test_export_output.edl");
+        let timeline_path = temp_path("export_timeline.json");
+        let output_path = temp_path("export_output.edl");
         let _ = std::fs::remove_file(&output_path);
 
         let timeline_json = serde_json::to_string_pretty(&sample_switch_timeline())
@@ -979,9 +1215,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_timeline_rejects_non_json_timeline_for_edl() {
-        let dir = std::env::temp_dir();
-        let timeline_path = dir.join("oximedia_mc_test_export_bad_timeline.json");
-        let output_path = dir.join("oximedia_mc_test_export_bad_output.edl");
+        let timeline_path = temp_path("export_bad_timeline.json");
+        let output_path = temp_path("export_bad_output.edl");
         std::fs::write(&timeline_path, b"not json at all").expect("write bad timeline");
         let _ = std::fs::remove_file(&output_path);
 

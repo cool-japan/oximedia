@@ -95,6 +95,7 @@ pub mod normalize;
 pub mod peak;
 pub mod r128;
 pub mod report;
+pub mod sample_bytes;
 
 use crate::frame::AudioFrame;
 use crate::AudioResult;
@@ -422,57 +423,41 @@ impl LoudnessMeter {
         self.standard = standard;
     }
 
-    /// Extract samples from an audio frame as f64.
+    /// Extract samples from an audio frame as interleaved f64.
+    ///
+    /// Decoding honours the frame's own
+    /// [`SampleFormat`](oximedia_core::SampleFormat); planar frames are
+    /// interleaved channel-by-channel.
     fn extract_samples(&self, frame: &AudioFrame) -> Vec<f64> {
+        let format = frame.format;
+
         match &frame.samples {
-            crate::frame::AudioBuffer::Interleaved(data) => self.bytes_to_samples_f64(data),
+            crate::frame::AudioBuffer::Interleaved(data) => {
+                sample_bytes::decode(data, format).unwrap_or_default()
+            }
             crate::frame::AudioBuffer::Planar(planes) => {
-                // Interleave planar samples
                 if planes.is_empty() {
                     return Vec::new();
                 }
 
-                let channels = planes.len();
-                let sample_size = std::mem::size_of::<f32>();
-                let frames = planes[0].len() / sample_size;
+                let decoded: Vec<Vec<f64>> = planes
+                    .iter()
+                    .map(|plane| sample_bytes::decode(plane, format).unwrap_or_default())
+                    .collect();
+
+                let channels = decoded.len();
+                let frames = decoded.iter().map(Vec::len).min().unwrap_or(0);
                 let mut interleaved = Vec::with_capacity(frames * channels);
 
                 for frame_idx in 0..frames {
-                    for plane in planes {
-                        let samples = self.bytes_to_samples_f64(plane);
-                        if let Some(&sample) = samples.get(frame_idx) {
-                            interleaved.push(sample);
-                        }
+                    for plane in &decoded {
+                        interleaved.push(plane[frame_idx]);
                     }
                 }
 
                 interleaved
             }
         }
-    }
-
-    /// Convert bytes to f64 samples (simplified - assumes f32 for now).
-    fn bytes_to_samples_f64(&self, bytes: &bytes::Bytes) -> Vec<f64> {
-        // Simplified: would need to handle different sample formats
-        // For now, assume f32
-        let sample_count = bytes.len() / 4;
-        let mut samples = Vec::with_capacity(sample_count);
-
-        for i in 0..sample_count {
-            let offset = i * 4;
-            if offset + 4 <= bytes.len() {
-                let bytes_array = [
-                    bytes[offset],
-                    bytes[offset + 1],
-                    bytes[offset + 2],
-                    bytes[offset + 3],
-                ];
-                let sample = f32::from_le_bytes(bytes_array);
-                samples.push(f64::from(sample));
-            }
-        }
-
-        samples
     }
 }
 

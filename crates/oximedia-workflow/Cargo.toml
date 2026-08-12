@@ -67,5 +67,20 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 
+# Real task execution (`task_exec`): HTTP, transcode, QC and analysis.
+# Native-only — the `executor` module itself is already `cfg(not(wasm32))`.
+reqwest = { workspace = true }
+rustls-rustcrypto = { workspace = true }
+oximedia-core = { workspace = true }
+oximedia-io = { workspace = true }
+oximedia-codec = { workspace = true }
+oximedia-container = { workspace = true }
+oximedia-transcode = { workspace = true }
+oximedia-qc = { workspace = true }
+oximedia-quality = { workspace = true }
+oximedia-analysis = { workspace = true }
+oximedia-audio-analysis = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+axum = { workspace = true }

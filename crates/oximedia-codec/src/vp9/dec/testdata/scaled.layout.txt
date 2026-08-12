@@ -1,0 +1,112 @@
+layout: scaled  (source: scaled.ivf)
+IVF header: 96x64  fourcc=VP90  timebase=25/1  declared_frame_count=12
+actual IVF packet count parsed: 12
+
+N     pkt/sf        size    type   show  intra  er  dims       q    seg  interp          refresh  ref_idx  hsib
+----------------------------------------------------------------------------------------------------------------------------------
+   0  pkt0   sf0     2264B  key    show=1  intra_only=0  er=0  dims=96x64      q= 16  seg=off  interp=-               refresh=0xff  ref_idx=[-]  hsib=80  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=-  adapt=YES
+        loop_filter deltas: ref=[1, None, -1, -1] mode=[None, None]
+   1  pkt1   sf0      408B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 38  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=16  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   2  pkt2   sf0      432B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 53  seg=off  interp=EIGHTTAP_SMOOTH  refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=10  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   3  pkt3   sf0      418B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 50  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   4  pkt4   sf0      504B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 46  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   5  pkt5   sf0      419B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 45  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=7  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   6  pkt6   sf0     1104B  inter  show=1  intra_only=0  er=0  dims=64x48      q= 35  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref=0) L1:slot1(found_ref=0) L2:slot2(found_ref=0)]  hsib=25  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   7  pkt7   sf0      337B  inter  show=1  intra_only=0  er=0  dims=64x48      q= 51  seg=off  interp=SWITCHABLE      refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   8  pkt8   sf0      454B  inter  show=1  intra_only=0  er=0  dims=64x48      q= 43  seg=off  interp=SWITCHABLE      refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   9  pkt9   sf0      446B  inter  show=1  intra_only=0  er=0  dims=64x48      q= 41  seg=off  interp=SWITCHABLE      refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+  10  pkt10  sf0     1121B  inter  show=1  intra_only=0  er=0  dims=64x48      q= 16  seg=off  interp=SWITCHABLE      refresh=0x03  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+  11  pkt11  sf0      411B  inter  show=1  intra_only=0  er=0  dims=64x48      q= 39  seg=off  interp=SWITCHABLE      refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+----------------------------------------------------------------------------------------------------------------------------------
+
+frame accounting
+----------------------------------------
+IVF packets:       12
+coded frames:      12  (key=1, inter=11, of which show_existing_frame=0)
+hidden coded frames (show_frame=0, not show_existing_frame): 0
+output pictures:   12  = count(show_existing_frame==1) [0] + count(show_existing_frame==0 && show_frame==1) [12]
+
+coded-frame-index -> output-picture-index mapping (n/a rows contribute no output picture)
+coded_idx  pkt  show_existing  show_frame  output_idx  dims
+        0    0              0  1           0           96x64
+        1    1              0  1           1           96x64
+        2    2              0  1           2           96x64
+        3    3              0  1           3           96x64
+        4    4              0  1           4           96x64
+        5    5              0  1           5           96x64
+        6    6              0  1           6           64x48
+        7    7              0  1           7           64x48
+        8    8              0  1           8           64x48
+        9    9              0  1           9           64x48
+       10   10              0  1           10          64x48
+       11   11              0  1           11          64x48
+
+scaled.ref.yuv byte-offset table (HETEROGENEOUS frame sizes -- required reading before indexing this file)
+output_idx  byte_offset  dims       frame_bytes(4:2:0 planar = w*h*3/2)
+         0            0  96x64      9216
+         1         9216  96x64      9216
+         2        18432  96x64      9216
+         3        27648  96x64      9216
+         4        36864  96x64      9216
+         5        46080  96x64      9216
+         6        55296  64x48      4608
+         7        59904  64x48      4608
+         8        64512  64x48      4608
+         9        69120  64x48      4608
+        10        73728  64x48      4608
+        11        78336  64x48      4608
+total scaled.ref.yuv size (bytes): 82944
+
+stream-level summary
+----------------------------------------
+key frames: 1  (task requires exactly 1, at coded index 0)
+hidden frames (show_frame=0): 0
+distinct frame-level interpolation_filter values seen: ['EIGHTTAP', 'EIGHTTAP_SMOOTH', 'SWITCHABLE']
+frames with segmentation_enabled=1: []
+distinct coded (width,height) seen: [(64, 48), (96, 64)]
+distinct profile values seen: [0]
+
+stream notes / expected+observed reference-frame coverage:
+  MID-STREAM RESOLUTION CHANGE: frames 0-5 coded at 96x64 (frame 0 forced keyframe,
+  1-5 inter LAST-only), frames 6-11 coded at 64x48 (all inter). Produced via a custom
+  C program (scaled_encoder.c, in this directory) against libvpx v1.15.2's public API
+  -- vpx_codec_enc_config_set() with a new g_w/g_h between frames, the same mechanism
+  libvpx's own conformance test test/resize_test.cc uses -- because no vpxenc/ffmpeg
+  CLI flag exposes an exact, deterministic, forced-frame-index resolution change (see
+  RECIPE.md 'scaled: method that worked' for the flags that do NOT do this).
+  kf_mode=VPX_KF_DISABLED so the ONLY keyframe is the one forced at frame 0 (guards
+  against an auto-inserted keyframe silently coinciding with/replacing the resize
+  point). Expected+observed at coded frame 6 (the first 64x48 frame): frame_type=inter,
+  intra_only=0 (i.e. genuinely non-key, non-intra-only despite the size change) --
+  the single most important static fact this stream exists to prove. All 3
+  found_ref bits are 0 at frame 6 (none of the 3 reference slots -- all still holding
+  96x64 pictures -- match the new 64x48 size), forcing an EXPLICIT frame_size() read
+  instead of the found_ref shortcut; VP9's built-in reference-scaling motion
+  compensation (decoder-side, invoked whenever a used reference's stored dimensions
+  differ from the current frame's, independent of how frame_size_with_refs() resolved
+  the current size) is what makes ref_frame_idx pointing at 96x64 slots legal for a
+  64x48 inter frame at all. IMPORTANT: ffmpeg's forced-libvpx-vp9 rawvideo decode of
+  this stream silently re-normalizes every output frame to the FIRST frame's
+  dimensions (96x64) -- confirmed via ffmpeg's own log line 'dimension change! 96x64 ->
+  64x48' immediately followed by a wrong, constant-96x64-sized rawvideo byte count
+  (110592 = 12*9216, i.e. every frame padded/rescaled back to 96x64). scaled.ref.yuv is
+  therefore the vpxdec (not ffmpeg) decode for this stream ONLY -- vpxdec is libvpx
+  directly, satisfying the 'decoder identity = libvpx' requirement at least as strongly
+  as the ffmpeg wrapper, and its per-resolution-pattern output (%wx%h) independently
+  confirmed exactly 6 frames at 96x64 then 6 at 64x48, matching this parser's header-
+  parsed dims exactly. See the byte-offset table below (and RECIPE.md) for the exact
+  heterogeneous layout of scaled.ref.yuv.
+  frame_parallel_decoding_mode=0 on every frame (explicit VP9E_SET_FRAME_PARALLEL_DECODING
+  control in scaled_encoder.c) -- adapt=YES throughout, incidental to this stream's
+  purpose but consistent with p5single/compound.

@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_from_array() {
-        let fcc: FourCc = [b'a', b'v', b'c', b'1'].into();
+        let fcc: FourCc = (*b"avc1").into();
         assert_eq!(fcc.as_bytes(), b"avc1");
     }
 

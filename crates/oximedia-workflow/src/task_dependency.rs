@@ -172,12 +172,20 @@ impl DependencyResolver {
         let mut adj: HashMap<String, Vec<String>> =
             tasks.iter().map(|t| (t.clone(), Vec::new())).collect();
 
+        // `adj`/`in_degree` were seeded from `tasks = self.all_tasks()`,
+        // which is defined as the union of every edge's `from`/`to` over
+        // this same `self.edges` — so both lookups below always hit.  The
+        // `if let` (rather than `.expect()`) means a future change that
+        // breaks that invariant degrades to "edge ignored" instead of
+        // panicking.
         for e in &self.edges {
             if e.kind.is_hard() {
-                adj.get_mut(&e.from)
-                    .expect("should succeed in test")
-                    .push(e.to.clone());
-                *in_degree.get_mut(&e.to).expect("should succeed in test") += 1;
+                if let Some(list) = adj.get_mut(&e.from) {
+                    list.push(e.to.clone());
+                }
+                if let Some(d) = in_degree.get_mut(&e.to) {
+                    *d += 1;
+                }
             }
         }
 
@@ -197,11 +205,14 @@ impl DependencyResolver {
         while let Some(task) = queue.pop_front() {
             order.push(task.clone());
             let mut next_batch = Vec::new();
-            for succ in adj.get(&task).expect("should succeed in test") {
-                let d = in_degree.get_mut(succ).expect("should succeed in test");
-                *d -= 1;
-                if *d == 0 {
-                    next_batch.push(succ.clone());
+            if let Some(successors) = adj.get(&task) {
+                for succ in successors {
+                    if let Some(d) = in_degree.get_mut(succ) {
+                        *d -= 1;
+                        if *d == 0 {
+                            next_batch.push(succ.clone());
+                        }
+                    }
                 }
             }
             next_batch.sort();

@@ -9,6 +9,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
+use oximedia_qc::broadcast_safe::BroadcastSafeConfig;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -21,10 +22,12 @@ pub struct ValidateOptions {
     pub strict: bool,
     pub fix: bool,
     /// Run a real EBU R128 loudness compliance check (`--loudness-check`).
-    /// Requires decodable audio; WAV/PCM is supported today.
+    /// Requires decodable audio; WAV/PCM and FLAC are supported today.
     pub loudness_check: bool,
-    /// `--gamut-check` — no YUV-level analysis path exists yet; a stderr
-    /// warning is printed and the flag is otherwise ignored.
+    /// Run a real EBU R103 legal (studio) range check (`--gamut-check`).
+    /// Requires decodable video; Y4M is supported today (see
+    /// [`crate::frame_harness`]). Non-Y4M input produces a visible skip
+    /// issue in the per-file report rather than a silent no-op.
     pub gamut_check: bool,
     pub json_output: bool,
 }
@@ -132,15 +135,6 @@ pub struct ValidationSummary {
 pub async fn validate_files(options: ValidateOptions) -> Result<()> {
     info!("Starting file validation");
     debug!("Validation options: {:?}", options);
-
-    // No decoded-YUV analysis path exists in the CLI yet, so a gamut check
-    // cannot produce a real verdict; warn instead of silently dropping the
-    // flag (and instead of fabricating a pass).
-    // TODO(0.2.x): implement a real EBU R103 legal-range check once the
-    // frame-extraction helpers expose pre-RGB YUV planes.
-    if options.gamut_check {
-        eprintln!("warning: --gamut-check is not implemented yet and is ignored");
-    }
 
     // Validate inputs exist
     for input in &options.inputs {
@@ -295,6 +289,13 @@ async fn validate_single_file(
     if options.loudness_check {
         checks_performed.push("Loudness".to_string());
         check_loudness(path, &mut issues).await;
+    }
+
+    // Optional EBU R103 legal (studio) range check (--gamut-check): decodes
+    // real pixel planes and checks them; never a silent no-op.
+    if options.gamut_check {
+        checks_performed.push("Gamut".to_string());
+        check_gamut(path, &mut issues).await;
     }
 
     // Fix issues if requested
@@ -668,17 +669,21 @@ const LOUDNESS_TOLERANCE_LU: f64 = 1.0;
 
 /// Real EBU R128 loudness compliance check (`--loudness-check`).
 ///
-/// Decodes actual audio samples (WAV/PCM today via
-/// [`crate::decode_helper::decode_wav_f32`]) and feeds them through a real
+/// Decodes actual audio samples (WAV/PCM and FLAC today via
+/// [`crate::decode_helper::decode_audio_f32`]) and feeds them through a real
 /// [`oximedia_metering::LoudnessMeter`]. Files whose audio cannot be decoded
 /// produce a visible warning-severity issue — never a silent skip and never a
 /// fabricated pass on synthetic data.
-// TODO(0.2.x): extend decode coverage beyond WAV (FLAC/Opus in
-// Matroska/Ogg) once decode_helper grows a compressed-audio path.
+///
+/// Remaining gap: Opus/Vorbis audio (e.g. carried in Matroska/Ogg) has no
+/// decode path here. Opus is excluded deliberately — its encoder/decoder
+/// pair has not passed reference verification (see `frame_level.rs`'s
+/// `parse_audio_target`) — and Vorbis-in-Ogg container demuxing is not
+/// wired into this helper yet.
 async fn check_loudness(path: &Path, issues: &mut Vec<ValidationIssue>) {
     debug!("Checking loudness compliance for {}", path.display());
 
-    let audio = match crate::decode_helper::decode_wav_f32(path).await {
+    let audio = match crate::decode_helper::decode_audio_f32(path).await {
         Ok(audio) => audio,
         Err(e) => {
             issues.push(ValidationIssue {
@@ -686,7 +691,7 @@ async fn check_loudness(path: &Path, issues: &mut Vec<ValidationIssue>) {
                 check: "Loudness".to_string(),
                 message: format!(
                     "Loudness check skipped: cannot decode audio ({e}). \
-                     WAV/PCM input is supported today."
+                     WAV/PCM and FLAC input is supported today."
                 ),
                 location: None,
                 fixable: false,
@@ -778,6 +783,120 @@ async fn check_loudness(path: &Path, issues: &mut Vec<ValidationIssue>) {
         "Loudness measured: integrated {:.2} LUFS, true peak {:.2} dBTP (target {:.1} LUFS)",
         metrics.integrated_lufs, metrics.true_peak_dbtp, target
     );
+}
+
+/// Real EBU R103 legal (studio/broadcast) range check (`--gamut-check`).
+///
+/// Decodes the input through [`crate::frame_harness::read_y4m_clip`] — the
+/// only real pixel-plane decode this CLI has — and checks every luma and
+/// chroma sample against the digital studio range used by EBU R103 / ITU-R
+/// BT.601 / BT.709: luma (Y) in `[16, 235]`, chroma (Cb/Cr) in `[16, 240]`
+/// (8-bit code values; see [`oximedia_qc::broadcast_safe::BroadcastSafeConfig::hd`]).
+///
+/// Y4M carries no explicit full/limited-range flag, so "studio range" is an
+/// assumption inherited from the format's conventional use — not a
+/// certainty read from the file. Violations are therefore reported at
+/// `Warning` severity (matching `check_loudness`'s precedent of never
+/// escalating an assumption to a hard failure), and the message says so
+/// explicitly. Non-Y4M input produces a visible skip issue naming the
+/// required format — never a silent no-op and never a fabricated pass.
+///
+/// Violations are counted directly rather than collected into a
+/// `PixelViolation` per out-of-range sample: a fully out-of-range 1080p
+/// frame would otherwise allocate millions of short-lived structs.
+async fn check_gamut(path: &Path, issues: &mut Vec<ValidationIssue>) {
+    debug!("Checking gamut/legal-range for {}", path.display());
+
+    let clip = match crate::frame_harness::read_y4m_clip("gamut check", path) {
+        Ok(clip) => clip,
+        Err(e) => {
+            issues.push(ValidationIssue {
+                severity: IssueSeverity::Info,
+                check: "Gamut".to_string(),
+                message: format!("Gamut check skipped: {e}"),
+                location: None,
+                fixable: false,
+            });
+            return;
+        }
+    };
+
+    let config = BroadcastSafeConfig::hd();
+
+    let mut luma_violations: u64 = 0;
+    let mut chroma_violations: u64 = 0;
+    let mut luma_total: u64 = 0;
+    let mut chroma_total: u64 = 0;
+    let mut violating_frames: u64 = 0;
+
+    for frame in &clip.frames {
+        let mut frame_has_violation = false;
+
+        for &y in frame.luma() {
+            luma_total += 1;
+            if y < config.min_luma || y > config.max_luma {
+                luma_violations += 1;
+                frame_has_violation = true;
+            }
+        }
+
+        // Chroma planes (Cb=1, Cr=2); absent for monochrome Y4M, where
+        // `PlanarFrame::plane` returns `None` and is simply skipped.
+        for plane_idx in 1..=2usize {
+            if let Some(plane) = frame.plane(plane_idx) {
+                for &c in plane {
+                    chroma_total += 1;
+                    // Chroma's lower legal bound is the same 16 as luma's.
+                    if c < config.min_luma || c > config.max_chroma {
+                        chroma_violations += 1;
+                        frame_has_violation = true;
+                    }
+                }
+            }
+        }
+
+        if frame_has_violation {
+            violating_frames += 1;
+        }
+    }
+
+    let total_violations = luma_violations + chroma_violations;
+    let total_samples = luma_total + chroma_total;
+
+    debug!(
+        "Gamut check: {} frame(s), {luma_total} luma + {chroma_total} chroma samples, \
+         {total_violations} violation(s)",
+        clip.len()
+    );
+
+    if total_violations == 0 {
+        return;
+    }
+
+    let pct = if total_samples > 0 {
+        100.0 * total_violations as f64 / total_samples as f64
+    } else {
+        0.0
+    };
+
+    issues.push(ValidationIssue {
+        severity: IssueSeverity::Warning,
+        check: "Gamut".to_string(),
+        message: format!(
+            "{violating_frames} of {} frame(s) contain samples outside the assumed studio \
+             range: {luma_violations} luma sample(s) outside [{}, {}] and {chroma_violations} \
+             chroma sample(s) outside [{}, {}], {pct:.3}% of {total_samples} total samples. \
+             Y4M carries no full/limited-range flag, so this assumes conventional studio \
+             (limited) range rather than reading it from the file.",
+            clip.len(),
+            config.min_luma,
+            config.max_luma,
+            config.min_luma,
+            config.max_chroma,
+        ),
+        location: Some("video".to_string()),
+        fixable: false,
+    });
 }
 
 /// Attempt to fix issues.
@@ -1028,5 +1147,94 @@ mod tests {
         assert!(IssueSeverity::Info < IssueSeverity::Warning);
         assert!(IssueSeverity::Warning < IssueSeverity::Error);
         assert!(IssueSeverity::Error < IssueSeverity::Critical);
+    }
+
+    // ── check_gamut ──────────────────────────────────────────────────────────
+
+    /// Build a minimal single-frame 4:2:0 Y4M clip with every luma byte set
+    /// to `luma` and every chroma byte set to `chroma`.
+    fn make_y4m_solid(width: u32, height: u32, luma: u8, chroma: u8) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("YUV4MPEG2 W{width} H{height} C420jpeg\n").as_bytes());
+        buf.extend_from_slice(b"FRAME\n");
+        buf.extend(std::iter::repeat_n(luma, (width * height) as usize));
+        let chroma_w = width.div_ceil(2);
+        let chroma_h = height.div_ceil(2);
+        buf.extend(std::iter::repeat_n(
+            chroma,
+            (chroma_w * chroma_h) as usize * 2,
+        ));
+        buf
+    }
+
+    #[tokio::test]
+    async fn check_gamut_in_range_reports_nothing() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_validate_test_gamut_ok.y4m");
+        // Mid-range luma (126) and chroma (128) are well inside [16,235]/[16,240].
+        std::fs::write(&path, make_y4m_solid(4, 4, 126, 128)).expect("write Y4M fixture");
+
+        let mut issues = Vec::new();
+        check_gamut(&path, &mut issues).await;
+        assert!(
+            issues.is_empty(),
+            "in-range Y4M must report no issues, got: {issues:?}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn check_gamut_out_of_range_reports_warning() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_validate_test_gamut_bad.y4m");
+        // Full-white luma (255) is far above the legal maximum of 235.
+        std::fs::write(&path, make_y4m_solid(4, 4, 255, 128)).expect("write Y4M fixture");
+
+        let mut issues = Vec::new();
+        check_gamut(&path, &mut issues).await;
+        assert_eq!(
+            issues.len(),
+            1,
+            "expected exactly one Gamut issue: {issues:?}"
+        );
+        let issue = &issues[0];
+        assert_eq!(issue.check, "Gamut");
+        assert_eq!(issue.severity, IssueSeverity::Warning);
+        assert!(
+            issue.message.contains("luma"),
+            "message must mention luma: {}",
+            issue.message
+        );
+        assert!(
+            issue.message.contains("studio"),
+            "message must disclose the studio-range assumption: {}",
+            issue.message
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn check_gamut_non_y4m_is_visible_skip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_validate_test_gamut_notY4m.bin");
+        std::fs::write(&path, b"not a y4m file").expect("write fixture");
+
+        let mut issues = Vec::new();
+        check_gamut(&path, &mut issues).await;
+        assert_eq!(
+            issues.len(),
+            1,
+            "expected exactly one skip issue: {issues:?}"
+        );
+        assert_eq!(issues[0].severity, IssueSeverity::Info);
+        assert!(
+            issues[0].message.contains("Gamut check skipped"),
+            "skip must be visible: {}",
+            issues[0].message
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }

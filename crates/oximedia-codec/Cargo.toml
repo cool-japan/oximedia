@@ -291,11 +291,18 @@ image-io = ["png", "jpeg-decoder"]
 [dependencies]
 oximedia-core.workspace = true
 oximedia-io.workspace = true
+# SIMD kernels for the AV1 decode hot paths.  Unconditional (not feature
+# gated): oximedia-simd is dependency-free pure Rust and its default feature
+# set is `runtime-dispatch` only — the C-linking `native-asm` feature stays
+# off, so the pure-Rust default build is preserved.
+oximedia-simd.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rayon.workspace = true
 oxiarc-deflate.workspace = true
+# FLAC STREAMINFO MD5 signature of the unencoded audio (RFC 9639 §8.2).
+md-5.workspace = true
 
 # MJPEG support (wraps oximedia-image JPEG codec)
 oximedia-image = { workspace = true, optional = true }

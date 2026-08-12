@@ -359,20 +359,84 @@ impl Drop for VideoIpSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{AudioCodec, VideoCodec};
+
+    /// A configuration this crate can genuinely transmit: uncompressed video
+    /// and uncompressed audio. The compressed codecs have no working encoder
+    /// (see [`crate::codec`]) and are rejected by `VideoIpSource::new`.
+    fn transmittable_configs(width: u32, height: u32) -> (VideoConfig, AudioConfig) {
+        let video = VideoConfig::new(width, height, 30.0)
+            .expect("should succeed in test")
+            .with_codec(VideoCodec::Uyvy);
+        let audio = AudioConfig::new(48000, 2)
+            .expect("should succeed in test")
+            .with_codec(AudioCodec::Pcm16)
+            .expect("should succeed in test");
+        (video, audio)
+    }
 
     #[tokio::test]
     async fn test_source_creation() {
-        let video_config = VideoConfig::new(1920, 1080, 30.0).expect("should succeed in test");
-        let audio_config = AudioConfig::new(48000, 2).expect("should succeed in test");
+        let (video_config, audio_config) = transmittable_configs(1920, 1080);
 
         let source = VideoIpSource::new("Test Source", video_config, audio_config).await;
         assert!(source.is_ok());
     }
 
+    /// The compressed codecs must be refused at construction rather than
+    /// silently broadcasting raw frames labelled as a compressed bitstream.
+    #[tokio::test]
+    async fn test_source_rejects_codecs_without_a_real_encoder() {
+        for codec in [VideoCodec::Vp9, VideoCodec::Av1, VideoCodec::Vp8] {
+            let video_config = VideoConfig::new(640, 480, 30.0)
+                .expect("should succeed in test")
+                .with_codec(codec);
+            let audio_config = AudioConfig::new(48000, 2)
+                .expect("should succeed in test")
+                .with_codec(AudioCodec::Pcm16)
+                .expect("should succeed in test");
+
+            let err = VideoIpSource::new("Test", video_config, audio_config)
+                .await
+                .err()
+                .expect("compressed video must not be transmittable");
+            assert!(
+                matches!(
+                    err,
+                    crate::error::VideoIpError::CodecUnimplemented {
+                        operation: "encode",
+                        ..
+                    }
+                ),
+                "{codec:?}: unexpected error {err}"
+            );
+        }
+
+        // ...and likewise for Opus audio.
+        let video_config = VideoConfig::new(640, 480, 30.0)
+            .expect("should succeed in test")
+            .with_codec(VideoCodec::Uyvy);
+        let audio_config = AudioConfig::new(48000, 2).expect("should succeed in test");
+        let err = VideoIpSource::new("Test", video_config, audio_config)
+            .await
+            .err()
+            .expect("Opus must not be transmittable");
+        assert!(
+            matches!(
+                err,
+                crate::error::VideoIpError::CodecUnimplemented {
+                    codec: "Opus",
+                    operation: "encode",
+                    ..
+                }
+            ),
+            "unexpected error {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_source_add_destination() {
-        let video_config = VideoConfig::new(1920, 1080, 30.0).expect("should succeed in test");
-        let audio_config = AudioConfig::new(48000, 2).expect("should succeed in test");
+        let (video_config, audio_config) = transmittable_configs(1920, 1080);
 
         let source = VideoIpSource::new("Test", video_config, audio_config)
             .await
@@ -386,8 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_source_enable_fec() {
-        let video_config = VideoConfig::new(1920, 1080, 30.0).expect("should succeed in test");
-        let audio_config = AudioConfig::new(48000, 2).expect("should succeed in test");
+        let (video_config, audio_config) = transmittable_configs(1920, 1080);
 
         let mut source = VideoIpSource::new("Test", video_config, audio_config)
             .await
@@ -399,15 +462,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_frame() {
-        let video_config = VideoConfig::new(640, 480, 30.0).expect("should succeed in test");
-        let audio_config = AudioConfig::new(48000, 2).expect("should succeed in test");
+        let (video_config, audio_config) = transmittable_configs(64, 48);
 
         let mut source = VideoIpSource::new("Test", video_config, audio_config)
             .await
             .expect("should succeed in test");
 
-        let frame = VideoFrame::new(Bytes::from_static(b"test video data"), 640, 480, true, 0);
-        let samples = AudioSamples::new(Bytes::from_static(b"test audio"), 1024, 2, 48000, 0);
+        // A real 64x48 UYVY frame and 256 stereo 16-bit PCM samples.
+        let frame = VideoFrame::new(Bytes::from(vec![16u8; 64 * 48 * 2]), 64, 48, true, 0);
+        let samples = AudioSamples::new(Bytes::from(vec![0u8; 256 * 2 * 2]), 256, 2, 48000, 0);
 
         let result = source.send_frame(frame, Some(samples)).await;
         assert!(result.is_ok());
@@ -415,8 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_messages() {
-        let video_config = VideoConfig::new(640, 480, 30.0).expect("should succeed in test");
-        let audio_config = AudioConfig::new(48000, 2).expect("should succeed in test");
+        let (video_config, audio_config) = transmittable_configs(640, 480);
 
         let source = VideoIpSource::new("Test", video_config, audio_config)
             .await

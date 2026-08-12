@@ -1,6 +1,8 @@
 //! Simple video receiver example.
 
-use oximedia_videoip::types::{AudioCodec, VideoCodec};
+use oximedia_videoip::types::{
+    AudioCodec, AudioFormat, FrameRate, Resolution, VideoCodec, VideoFormat,
+};
 use oximedia_videoip::VideoIpReceiver;
 
 #[tokio::main]
@@ -12,7 +14,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(r) => r,
         Err(_) => {
             println!("Source not found, using default address");
-            VideoIpReceiver::connect("127.0.0.1:5000".parse()?, VideoCodec::Vp9, AudioCodec::Opus)
+            // The full formats are needed, not just the codecs: an
+            // uncompressed stream carries no geometry and PCM carries no
+            // sample count, so the receiver would otherwise have to guess.
+            let video_format =
+                VideoFormat::new(VideoCodec::Vp9, Resolution::HD_1080, FrameRate::FPS_30);
+            let audio_format = AudioFormat::new(AudioCodec::Pcm16, 48000, 2)?;
+            VideoIpReceiver::connect("127.0.0.1:5000".parse()?, &video_format, &audio_format)
                 .await?
         }
     };

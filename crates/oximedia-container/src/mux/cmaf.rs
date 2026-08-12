@@ -497,8 +497,8 @@ impl CmafMuxer {
                 c.extend_from_slice(&(-1i16).to_be_bytes()); // pre_defined
                                                              // codec configuration box
                 if !track.extradata.is_empty() {
-                    // Wrap in a generic 'glbl' box (or codec-specific – use fourcc as box type)
-                    let cfg_box = write_box(&track.codec_fourcc, &track.extradata);
+                    let cfg_fourcc = config_box_fourcc(&track.codec_fourcc);
+                    let cfg_box = write_box(&cfg_fourcc, &track.extradata);
                     c.extend(cfg_box);
                 }
             }
@@ -512,7 +512,8 @@ impl CmafMuxer {
                 let sr = track.sample_rate.unwrap_or(48000);
                 c.extend_from_slice(&write_u32_be(sr << 16)); // samplerate 16.16
                 if !track.extradata.is_empty() {
-                    let cfg_box = write_box(&track.codec_fourcc, &track.extradata);
+                    let cfg_fourcc = config_box_fourcc(&track.codec_fourcc);
+                    let cfg_box = write_box(&cfg_fourcc, &track.extradata);
                     c.extend(cfg_box);
                 }
             }
@@ -852,7 +853,14 @@ pub(crate) fn build_trun(data_offset: i32, entries: &[FragSampleEntry]) -> Vec<u
     //   0x000200 = sample-size-present
     //   0x000400 = sample-flags-present
     //   0x000800 = sample-composition-time-offsets-present
-    let flags: u32 = 0x0000_0B01; // data-offset + duration + size + flags + CTO
+    //
+    // The per-sample loop below writes FOUR 32-bit words (duration, size,
+    // flags, CTO), so all four presence bits must be set. This used to read
+    // `0x0B01`, which omits `sample-flags-present` (0x000400): every
+    // spec-conformant reader then consumed three words per sample and walked
+    // off the end of the run, mis-decoding sizes and offsets for the whole
+    // fragment.
+    let flags: u32 = 0x0000_0F01; // data-offset + duration + size + flags + CTO
     let mut c = Vec::new();
     // sample_count
     c.extend_from_slice(&write_u32_be(entries.len() as u32));
@@ -887,6 +895,44 @@ pub(crate) fn build_empty_stsz() -> Vec<u8> {
 
 pub(crate) fn build_empty_stco() -> Vec<u8> {
     write_full_box(b"stco", 0, 0, &write_u32_be(0))
+}
+
+// ─── Codec configuration box FourCC ──────────────────────────────────────────
+
+/// Maps a CMAF/ISOBMFF sample entry FourCC (e.g. `av01`, the box name of the
+/// *sample entry itself*) to the FourCC of the codec-specific configuration
+/// box that must be nested immediately inside that sample entry.
+///
+/// This used to be missing: `build_sample_entry` wrapped `track.extradata`
+/// in a box literally named after `track.codec_fourcc` again (e.g. an
+/// `av01` box nested inside the `av01` sample entry), so no ISOBMFF/CMAF
+/// reader could ever find the actual decoder configuration record — the
+/// codec-specific box name it looks for (`av1C`, `vpcC`, `dOps`, `dfLa`, …)
+/// was never written. The sample entry's own outer box name (produced by
+/// `write_box(&track.codec_fourcc, &c)` at the end of `build_sample_entry`)
+/// was always correct; only the *inner* configuration box's name was wrong.
+///
+/// Mirrors `crate::mux::mp4::writer::boxes::codec_config_fourcc` (which maps
+/// from [`oximedia_core::CodecId`] rather than a raw sample-entry FourCC, so
+/// is not directly reusable here — `CmafTrack` only carries the FourCC
+/// bytes, not a `CodecId`) so both muxers agree on the same box names and
+/// the same `conf` fallback for FourCCs neither maps explicitly.
+///
+/// | Sample entry (`codec_fourcc`) | Configuration box | Spec |
+/// |---|---|---|
+/// | `av01` | `av1C` | AV1 Codec ISOBMFF Binding §2.2.1 |
+/// | `vp09` / `vp08` | `vpcC` | VP9/VP8 in ISOBMFF (`VPCodecConfigurationBox`) |
+/// | `Opus` | `dOps` | "Encapsulation of Opus in ISOBMFF" §4.3.2 (`OpusSpecificBox`) |
+/// | `fLaC` | `dfLa` | "Encapsulation of FLAC in ISOBMFF" §3.3.2 (`FLACSpecificBox`) |
+/// | anything else | `conf` | no registered box known to this crate; a named but non-conformant placeholder rather than silently reusing the sample entry's own name |
+fn config_box_fourcc(sample_entry_fourcc: &[u8; 4]) -> [u8; 4] {
+    match sample_entry_fourcc {
+        b"av01" => *b"av1C",
+        b"vp09" | b"vp08" => *b"vpcC",
+        b"Opus" => *b"dOps",
+        b"fLaC" => *b"dfLa",
+        _ => *b"conf",
+    }
 }
 
 // ─── minf sub-boxes ──────────────────────────────────────────────────────────
@@ -954,7 +1000,7 @@ fn box_header_for_len(fourcc: &[u8; 4], payload_len: u64) -> Vec<u8> {
 
 /// Writes a standard box: `[size:u32 BE][fourcc:4][content]`, or the
 /// ISO/IEC 14496-12 §4.2 `largesize` form when `content` is too big for a
-/// 32-bit size field (see [`box_header_for_len`]).
+/// 32-bit size field (see `box_header_for_len`).
 ///
 /// This is the shared box-emission primitive for `CmafMuxer`, the CMAF
 /// chunked encoders in `crate::streaming::mux`, and
@@ -1248,5 +1294,202 @@ mod tests {
         // Count occurrences of "trak"
         let count = init.windows(4).filter(|w| *w == b"trak").count();
         assert_eq!(count, 2, "init segment must contain two trak boxes");
+    }
+
+    // ─── Box-tree walking helpers for sample-entry conformance tests ──────
+    //
+    // These mirror ordinary ISOBMFF container semantics: a box's own
+    // 8-byte header (`size:u32 BE` + `fourcc:4`) is immediately followed by
+    // a flat sequence of child boxes, which is exactly true for
+    // `moov`/`trak`/`mdia`/`minf`/`stbl`. `stsd` and the SampleEntry it
+    // contains are NOT ordinary containers in that sense (each has its own
+    // fixed-size non-box preamble before any child boxes appear), so those
+    // two levels are unpacked by hand below using the exact field layouts
+    // `build_stsd`/`build_sample_entry` emit, rather than pretending
+    // they're generic box lists.
+
+    /// Parses a flat sequence of ISOBMFF boxes starting at the beginning of
+    /// `data`, returning `(fourcc, box_start, box_end)` for each box found
+    /// (offsets relative to `data`).
+    fn iter_boxes(data: &[u8]) -> Vec<([u8; 4], usize, usize)> {
+        let mut boxes = Vec::new();
+        let mut offset = 0usize;
+        while offset + 8 <= data.len() {
+            let size =
+                u32::from_be_bytes(data[offset..offset + 4].try_into().expect("4 bytes")) as usize;
+            if size < 8 || offset + size > data.len() {
+                break;
+            }
+            let mut fourcc = [0u8; 4];
+            fourcc.copy_from_slice(&data[offset + 4..offset + 8]);
+            boxes.push((fourcc, offset, offset + size));
+            offset += size;
+        }
+        boxes
+    }
+
+    /// Returns the full bytes (header + content) of the first child box
+    /// with the given `fourcc` directly inside `data` — `data` must already
+    /// be a normal box container's *content*, i.e. everything after its
+    /// own 8-byte header.
+    fn find_box<'a>(data: &'a [u8], fourcc: &[u8; 4]) -> Option<&'a [u8]> {
+        iter_boxes(data)
+            .into_iter()
+            .find(|(f, _, _)| f == fourcc)
+            .map(|(_, start, end)| &data[start..end])
+    }
+
+    /// Strips a box's own 8-byte header, returning its content.
+    fn box_content(b: &[u8]) -> &[u8] {
+        &b[8..]
+    }
+
+    /// Walks `init` down to the single sample-entry box nested inside
+    /// `moov > trak > mdia > minf > stbl > stsd`, matching the box tree
+    /// `CmafMuxer::build_moov`/`build_stsd` actually emit, and returns
+    /// `(sample_entry_fourcc, sample_entry_full_bytes)`.
+    fn find_sample_entry(init: &[u8]) -> ([u8; 4], &[u8]) {
+        let moov = find_box(init, b"moov").expect("moov present");
+        let trak = find_box(box_content(moov), b"trak").expect("trak present");
+        let mdia = find_box(box_content(trak), b"mdia").expect("mdia present");
+        let minf = find_box(box_content(mdia), b"minf").expect("minf present");
+        let stbl = find_box(box_content(minf), b"stbl").expect("stbl present");
+        let stsd = find_box(box_content(stbl), b"stsd").expect("stsd present");
+        // stsd content = FullBox header (version:1 + flags:3 = 4 bytes) +
+        // entry_count (4 bytes) = 8 non-box bytes, then the sample entry.
+        let stsd_content = box_content(stsd);
+        let sample_entries = &stsd_content[8..];
+        let (fourcc, start, end) = iter_boxes(sample_entries)
+            .into_iter()
+            .next()
+            .expect("sample entry present");
+        (fourcc, &sample_entries[start..end])
+    }
+
+    /// Returns the fourcc of the codec configuration box nested inside the
+    /// `init` segment's sample entry, asserting it is positioned exactly
+    /// where `build_sample_entry` places it: immediately after the
+    /// SampleEntry's fixed preamble fields, and consuming every remaining
+    /// byte (i.e. it really is the last thing `build_sample_entry` wrote,
+    /// not merely *a* box found somewhere in the tail).
+    fn sample_entry_config_fourcc(init: &[u8], track_type: TrackType) -> [u8; 4] {
+        let (_, sample_entry) = find_sample_entry(init);
+        let content = box_content(sample_entry);
+        // Preamble = SampleEntry base fields (6-byte reserved + 2-byte
+        // data_reference_index = 8 bytes) plus the VisualSampleEntry
+        // (70 bytes) or AudioSampleEntry (20 bytes) fixed fields
+        // `build_sample_entry` writes before the codec configuration box.
+        let preamble_len = match track_type {
+            TrackType::Video => 8 + 70,
+            TrackType::Audio => 8 + 20,
+            TrackType::Subtitle => 8,
+        };
+        let after_preamble = &content[preamble_len..];
+        let (config_fourcc, start, end) = iter_boxes(after_preamble)
+            .into_iter()
+            .next()
+            .expect("codec configuration box present");
+        assert_eq!(
+            start, 0,
+            "configuration box must start right after the fixed preamble"
+        );
+        assert_eq!(
+            end,
+            after_preamble.len(),
+            "configuration box must be the last thing in the sample entry"
+        );
+        config_fourcc
+    }
+
+    // 13. av01 sample entry's child configuration box must be named av1C,
+    // not av01 again (the conformance bug: it used to nest the sample
+    // entry's own fourcc as the "configuration box" name).
+    #[test]
+    fn test_sample_entry_av01_child_is_av1c() {
+        let mut muxer = CmafMuxer::new(CmafConfig::default());
+        muxer.add_track(make_video_track(1));
+        let init = muxer.write_init_segment();
+        let fourcc = sample_entry_config_fourcc(&init, TrackType::Video);
+        assert_eq!(&fourcc, b"av1C");
+    }
+
+    // 14. vp09 sample entry's child configuration box must be named vpcC.
+    #[test]
+    fn test_sample_entry_vp09_child_is_vpcc() {
+        let mut muxer = CmafMuxer::new(CmafConfig::default());
+        let track = CmafTrack {
+            codec_fourcc: *b"vp09",
+            ..make_video_track(1)
+        };
+        muxer.add_track(track);
+        let init = muxer.write_init_segment();
+        let fourcc = sample_entry_config_fourcc(&init, TrackType::Video);
+        assert_eq!(&fourcc, b"vpcC");
+    }
+
+    // 15. vp08 sample entry's child configuration box must also be named
+    // vpcC (VP8 and VP9 share the same ISOBMFF configuration box).
+    #[test]
+    fn test_sample_entry_vp08_child_is_vpcc() {
+        let mut muxer = CmafMuxer::new(CmafConfig::default());
+        let track = CmafTrack {
+            codec_fourcc: *b"vp08",
+            ..make_video_track(1)
+        };
+        muxer.add_track(track);
+        let init = muxer.write_init_segment();
+        let fourcc = sample_entry_config_fourcc(&init, TrackType::Video);
+        assert_eq!(&fourcc, b"vpcC");
+    }
+
+    // 16. Opus sample entry's child configuration box must be named dOps.
+    #[test]
+    fn test_sample_entry_opus_child_is_dops() {
+        let mut muxer = CmafMuxer::new(CmafConfig::default());
+        muxer.add_track(make_audio_track(1));
+        let init = muxer.write_init_segment();
+        let fourcc = sample_entry_config_fourcc(&init, TrackType::Audio);
+        assert_eq!(&fourcc, b"dOps");
+    }
+
+    // 17. fLaC sample entry's child configuration box must be named dfLa.
+    #[test]
+    fn test_sample_entry_flac_child_is_dfla() {
+        let mut muxer = CmafMuxer::new(CmafConfig::default());
+        let track = CmafTrack {
+            codec_fourcc: *b"fLaC",
+            ..make_audio_track(1)
+        };
+        muxer.add_track(track);
+        let init = muxer.write_init_segment();
+        let fourcc = sample_entry_config_fourcc(&init, TrackType::Audio);
+        assert_eq!(&fourcc, b"dfLa");
+    }
+
+    // 18. A codec_fourcc this crate has no registered configuration box
+    // name for must fall back to a deliberately-named `conf` placeholder,
+    // not silently reuse the sample entry's own fourcc again.
+    #[test]
+    fn test_sample_entry_unknown_codec_falls_back_to_conf() {
+        let mut muxer = CmafMuxer::new(CmafConfig::default());
+        let track = CmafTrack {
+            codec_fourcc: *b"hvc1",
+            ..make_video_track(1)
+        };
+        muxer.add_track(track);
+        let init = muxer.write_init_segment();
+        let fourcc = sample_entry_config_fourcc(&init, TrackType::Video);
+        assert_eq!(&fourcc, b"conf");
+    }
+
+    // 19. Direct unit coverage of the mapping table itself.
+    #[test]
+    fn test_config_box_fourcc_mapping() {
+        assert_eq!(config_box_fourcc(b"av01"), *b"av1C");
+        assert_eq!(config_box_fourcc(b"vp09"), *b"vpcC");
+        assert_eq!(config_box_fourcc(b"vp08"), *b"vpcC");
+        assert_eq!(config_box_fourcc(b"Opus"), *b"dOps");
+        assert_eq!(config_box_fourcc(b"fLaC"), *b"dfLa");
+        assert_eq!(config_box_fourcc(b"hvc1"), *b"conf");
     }
 }

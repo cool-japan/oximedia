@@ -289,6 +289,10 @@ fn cmd_fix(
         return Ok(());
     }
 
+    if crate::progress::is_quiet() {
+        return Ok(());
+    }
+
     println!("{}", "Media Repair".green().bold());
     println!("  Input:     {}", input.display().to_string().cyan());
     println!(
@@ -388,6 +392,10 @@ fn cmd_batch(
             "results": results_json,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
+        return Ok(());
+    }
+
+    if crate::progress::is_quiet() {
         return Ok(());
     }
 

@@ -41,7 +41,7 @@ pub fn wiener_filter(frame: &VideoFrame, strength: f32) -> DenoiseResult<VideoFr
 
             wiener_filter_plane(
                 input_plane.data.as_ref(),
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,
@@ -151,7 +151,7 @@ pub fn adaptive_wiener_filter(frame: &VideoFrame, strength: f32) -> DenoiseResul
 
             wiener_filter_plane(
                 input_plane.data.as_ref(),
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,

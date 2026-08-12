@@ -1,19 +1,22 @@
 //! Shared media decoding helpers for the OxiMedia CLI.
 //!
-//! Provides a WAV-audio decode helper used by `normalize_cmd` to produce
-//! real f32 sample data instead of synthetic silence.  Future expansion
-//! can add video decode paths here.
+//! Provides WAV and FLAC audio decode helpers.  [`decode_wav_f32`] is used
+//! by `normalize_cmd` to produce real f32 sample data instead of synthetic
+//! silence; [`decode_audio_f32`] (WAV or FLAC) backs `validate`'s
+//! `--loudness-check`.  Future expansion can add video decode paths here.
 //!
 //! # Design
 //!
-//! The helper uses the OxiMedia container/codec stack:
+//! The helpers use the OxiMedia container/codec stack:
 //!
 //! - [`oximedia_container::demux::WavDemuxer`] for WAV/RIFF demuxing
 //! - [`oximedia_codec::pcm::PcmDecoder`] for PCM → f32 decoding
+//! - [`oximedia_codec::flac::FlacDecoder`] for whole-stream FLAC → i32 decoding
+//!   (RFC 9639; the same decoder the codec crate's own conformance tests use)
 //! - [`oximedia_io::source::MemorySource`] as the in-memory media source
 //!
 //! All demuxer operations are async; callers must be inside a Tokio context.
-//! Non-WAV formats return [`DecodeError::UnsupportedFormat`]; callers in
+//! Unrecognised formats return [`DecodeError::UnsupportedFormat`]; callers in
 //! `normalize_cmd` fall back to synthetic silence on that error.
 
 use anyhow::Result;
@@ -46,6 +49,10 @@ pub enum DecodeError {
     /// PCM decoding failed.
     #[error("pcm decode error: {0}")]
     PcmDecode(String),
+
+    /// FLAC decoding failed.
+    #[error("flac decode error: {0}")]
+    FlacDecode(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +219,107 @@ pub async fn decode_wav_f32(path: &Path) -> Result<DecodedAudio, DecodeError> {
         channels: u32::from(channels),
         sample_rate,
     })
+}
+
+// ---------------------------------------------------------------------------
+// FLAC decode helper
+// ---------------------------------------------------------------------------
+
+/// Decode a FLAC file to interleaved f32 PCM samples.
+///
+/// Reads the entire file into memory and decodes it with
+/// [`oximedia_codec::flac::FlacDecoder`] — a from-scratch RFC 9639 decoder
+/// (frame header + CRC-8/CRC-16, fixed/LPC subframes, partitioned Rice
+/// residuals), not the older simplified `flac_codec` module.
+///
+/// Returns [`DecodeError::UnsupportedFormat`] for non-FLAC files, which is
+/// the signal [`decode_audio_f32`] uses to try the next decoder.
+///
+/// # Errors
+///
+/// - [`DecodeError::Io`] — file read failed
+/// - [`DecodeError::UnsupportedFormat`] — not a FLAC file
+/// - [`DecodeError::FlacDecode`] — the FLAC stream is malformed, or declares
+///   a bits-per-sample the f32 normalisation below cannot handle (0 or >32)
+pub async fn decode_flac_f32(path: &Path) -> Result<DecodedAudio, DecodeError> {
+    // ------------------------------------------------------------------
+    // 1. Check magic bytes — reject non-FLAC early without decoding
+    // ------------------------------------------------------------------
+    let magic = read_magic_bytes(path)?;
+    if !magic.starts_with(b"fLaC") {
+        return Err(DecodeError::UnsupportedFormat(format!(
+            "{} does not appear to be a FLAC file",
+            path.display()
+        )));
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Load the whole file and decode every frame
+    // ------------------------------------------------------------------
+    let raw = std::fs::read(path)?;
+
+    let mut decoder = oximedia_codec::flac::FlacDecoder::new();
+    let samples_i32 = decoder
+        .decode_stream(&raw)
+        .map_err(|e| DecodeError::FlacDecode(e.to_string()))?;
+
+    let info = decoder.stream_info().ok_or_else(|| {
+        DecodeError::FlacDecode("FLAC stream has no STREAMINFO after decode".to_string())
+    })?;
+    let channels = u32::from(info.channels);
+    let sample_rate = info.sample_rate;
+    let bits = info.bits_per_sample;
+    if bits == 0 || bits > 32 {
+        return Err(DecodeError::FlacDecode(format!(
+            "unsupported bits-per-sample: {bits}"
+        )));
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Normalise signed PCM samples to f32 in [-1.0, 1.0] using the
+    //    stream's own bit depth (not a hardcoded 16-bit assumption).
+    // ------------------------------------------------------------------
+    let scale = (1i64 << (bits - 1)) as f32;
+    let samples: Vec<f32> = samples_i32.into_iter().map(|s| s as f32 / scale).collect();
+
+    Ok(DecodedAudio {
+        samples,
+        channels,
+        sample_rate,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Combined dispatcher
+// ---------------------------------------------------------------------------
+
+/// Decode a file's audio to interleaved f32 PCM, trying every format this
+/// module supports: WAV/PCM first, then FLAC.
+///
+/// This is the entry point `validate --loudness-check` uses. Returns
+/// [`DecodeError::UnsupportedFormat`] naming both formats that were tried
+/// when neither recognises the file — never a silent skip.
+///
+/// # Errors
+///
+/// Same error set as [`decode_wav_f32`] and [`decode_flac_f32`]; a decode
+/// failure from a *recognised* format (bad WAV header, malformed FLAC frame)
+/// is returned as-is rather than masked as `UnsupportedFormat`.
+pub async fn decode_audio_f32(path: &Path) -> Result<DecodedAudio, DecodeError> {
+    match decode_wav_f32(path).await {
+        Ok(audio) => return Ok(audio),
+        Err(DecodeError::UnsupportedFormat(_)) => {}
+        Err(e) => return Err(e),
+    }
+
+    match decode_flac_f32(path).await {
+        Ok(audio) => Ok(audio),
+        Err(DecodeError::UnsupportedFormat(_)) => Err(DecodeError::UnsupportedFormat(format!(
+            "{} is neither a WAV/PCM nor a FLAC file; supported: WAV, FLAC",
+            path.display()
+        ))),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +493,121 @@ mod tests {
             audio.frame_count(),
             expected_frames
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Build a minimal valid FLAC file in memory: `FlacEncoder` header +
+    /// encoded frames, exactly as `oximedia-codec`'s own decoder round-trip
+    /// tests assemble one.
+    fn make_ramp_flac(channels: u8, sample_rate: u32) -> Vec<u8> {
+        use oximedia_codec::flac::{FlacConfig, FlacEncoder};
+
+        let mut enc = FlacEncoder::new(FlacConfig {
+            sample_rate,
+            channels,
+            bits_per_sample: 16,
+        });
+        let samples_per_channel = 256usize;
+        let ramp: Vec<i32> = (0..samples_per_channel * channels as usize)
+            .map(|i| ((i / channels as usize) as i32 % 2000) - 1000)
+            .collect();
+        let (header, frames) = enc.encode(&ramp).expect("encode ramp");
+
+        let mut stream = header;
+        for f in &frames {
+            stream.extend_from_slice(&f.data);
+        }
+        stream
+    }
+
+    #[tokio::test]
+    async fn decode_flac_produces_samples() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_dh_test_ramp.flac");
+        std::fs::write(&path, make_ramp_flac(1, 44100)).expect("write test FLAC");
+
+        let audio = decode_flac_f32(&path).await.expect("decode FLAC");
+        assert_eq!(audio.channels, 1);
+        assert_eq!(audio.sample_rate, 44100);
+        assert!(!audio.samples.is_empty(), "samples must not be empty");
+        for &s in &audio.samples {
+            assert!(s >= -1.0 && s <= 1.0, "sample out of range: {s}");
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn decode_flac_stereo_reports_channels() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_dh_test_ramp_stereo.flac");
+        std::fs::write(&path, make_ramp_flac(2, 48000)).expect("write test FLAC");
+
+        let audio = decode_flac_f32(&path).await.expect("decode stereo FLAC");
+        assert_eq!(audio.channels, 2);
+        assert_eq!(audio.sample_rate, 48000);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn decode_non_flac_returns_unsupported() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_dh_test_notaflac.bin");
+        std::fs::write(&path, b"not a flac file at all").expect("write fake file");
+
+        let result = decode_flac_f32(&path).await;
+        assert!(
+            matches!(result, Err(DecodeError::UnsupportedFormat(_))),
+            "expected UnsupportedFormat, got: {result:?}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn decode_audio_f32_dispatches_wav() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_dh_test_dispatch.wav");
+        std::fs::write(&path, make_sine_wav(1000.0, 44100, 1, 0.1)).expect("write WAV");
+
+        let audio = decode_audio_f32(&path)
+            .await
+            .expect("decode via dispatcher");
+        assert_eq!(audio.sample_rate, 44100);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn decode_audio_f32_dispatches_flac() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_dh_test_dispatch.flac");
+        std::fs::write(&path, make_ramp_flac(1, 44100)).expect("write FLAC");
+
+        let audio = decode_audio_f32(&path)
+            .await
+            .expect("decode via dispatcher");
+        assert_eq!(audio.sample_rate, 44100);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn decode_audio_f32_names_both_formats_when_neither_matches() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oximedia_dh_test_dispatch_neither.bin");
+        std::fs::write(&path, b"neither wav nor flac").expect("write fake file");
+
+        let result = decode_audio_f32(&path).await;
+        match result {
+            Err(DecodeError::UnsupportedFormat(msg)) => {
+                assert!(msg.contains("WAV"), "message should name WAV: {msg}");
+                assert!(msg.contains("FLAC"), "message should name FLAC: {msg}");
+            }
+            other => panic!("expected UnsupportedFormat naming both formats, got: {other:?}"),
+        }
 
         std::fs::remove_file(&path).ok();
     }

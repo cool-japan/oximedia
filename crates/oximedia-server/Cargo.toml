@@ -26,7 +26,11 @@ cdn-all = ["cdn-aws", "cdn-azure", "cdn-gcs"]
 oximedia-core = { workspace = true }
 oximedia-io = { workspace = true }
 oxiarc-deflate = { workspace = true }
-oximedia-codec = { workspace = true, default-features = true }
+# `vp9` is enabled on top of the default features so the RTMP ingest
+# depacketizer can read a VP9 keyframe's real frame dimensions out of its
+# uncompressed header (`vpcC` does not carry them). See
+# `src/ingest_depacketizer.rs::vp9_dimensions_from_keyframe`.
+oximedia-codec = { workspace = true, default-features = true, features = ["vp9"] }
 oximedia-container = { workspace = true }
 oximedia-audio = { workspace = true }
 oximedia-cv = { workspace = true }

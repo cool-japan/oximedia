@@ -17,11 +17,14 @@ pub enum DistributedCommand {
         #[arg(long, default_value = "0.0.0.0:9000")]
         bind: String,
 
-        /// Maximum number of workers allowed
+        /// Maximum number of workers allowed (enforced by the coordinator's
+        /// real worker-registration cap; defaults to 1000 when omitted)
         #[arg(long)]
         max_workers: Option<u32>,
 
-        /// Data directory for persistent state
+        /// Data directory for persistent state (not implemented yet: the
+        /// coordinator has no persistence-directory config field; warns and
+        /// proceeds)
         #[arg(long)]
         data_dir: Option<PathBuf>,
 
@@ -102,7 +105,9 @@ pub enum DistributedCommand {
         #[arg(long)]
         job_id: Option<String>,
 
-        /// Watch mode: continuously refresh status
+        /// Watch mode: continuously refresh status (not implemented yet: no
+        /// real coordinator RPC transport exists to poll; errors rather
+        /// than silently doing a single query)
         #[arg(long)]
         watch: bool,
 
@@ -216,27 +221,58 @@ async fn start_coordinator(
     fault_tolerance: bool,
     json_output: bool,
 ) -> Result<()> {
-    // DistributedConfig has no coordinator-side worker cap or state
-    // directory, so these flags cannot configure anything real; warn
-    // instead of silently accepting them.
-    // TODO(0.2.x): add max_workers/data_dir to
-    // oximedia_distributed::DistributedConfig alongside the pending gRPC
-    // server integration, then thread these through.
-    if max_workers.is_some() {
-        eprintln!("warning: --max-workers is not implemented yet and is ignored");
-    }
+    // `--data-dir` has nowhere real to go: `oximedia_distributed::coordinator
+    // ::CoordinatorConfig` has no persistence-directory field, so nothing in
+    // the real coordinator can be configured with it. Warn instead of
+    // silently dropping it.
+    // TODO(0.2.x): add a state/persistence-directory field to
+    // oximedia_distributed::coordinator::CoordinatorConfig, then thread this
+    // through.
     if data_dir.is_some() {
-        eprintln!("warning: --data-dir is not implemented yet and is ignored");
+        eprintln!(
+            "warning: --data-dir is not implemented yet and is ignored (\
+             oximedia_distributed::coordinator::CoordinatorConfig has no \
+             persistence-directory field yet)"
+        );
     }
 
-    let config = oximedia_distributed::DistributedConfig {
-        coordinator_addr: bind.to_string(),
-        heartbeat_interval: std::time::Duration::from_secs(heartbeat_timeout),
-        fault_tolerance,
-        ..oximedia_distributed::DistributedConfig::default()
-    };
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid --bind address '{bind}': {e}"))?;
 
-    let _encoder = oximedia_distributed::DistributedEncoder::new(config);
+    // `--max-workers` IS honored for real: it is threaded straight into the
+    // `Coordinator`'s own `CoordinatorConfig` (constructed directly here,
+    // rather than via `DistributedEncoder::new`, which always builds the
+    // coordinator with `CoordinatorConfig::default()` and ignores whatever
+    // `DistributedConfig` it was given). The real `register_worker` handler
+    // enforces this cap — see `coordinator.rs`: `if
+    // self.coordinator.workers.len() >= self.coordinator.config.max_workers`.
+    // Caveat kept honest: that handler is only reachable by a worker that
+    // actually issues the RPC over the wire, and this workspace's bundled
+    // `CoordinatorServiceClient` (`pb.rs`) is a stub whose methods return a
+    // default response without ever sending one — so the cap is genuinely
+    // *wired*, not yet genuinely *reachable* end-to-end.
+    let default_coordinator_config =
+        oximedia_distributed::coordinator::CoordinatorConfig::default();
+    let resolved_max_workers = max_workers
+        .map(|w| w as usize)
+        .unwrap_or(default_coordinator_config.max_workers);
+    let coordinator_config = oximedia_distributed::coordinator::CoordinatorConfig {
+        max_workers: resolved_max_workers,
+        worker_timeout: std::time::Duration::from_secs(heartbeat_timeout),
+        ..default_coordinator_config
+    };
+    let coordinator = oximedia_distributed::coordinator::Coordinator::new(coordinator_config);
+
+    // Background server task, aborted when its `JoinHandle` drops at the end
+    // of this function — the same lifecycle `DistributedEncoder::new` uses
+    // internally. This command reports the coordinator's resolved
+    // configuration rather than blocking as a persistent daemon.
+    let _server_handle = tokio::spawn(async move {
+        if let Err(e) = coordinator.serve(addr).await {
+            tracing::warn!("Coordinator server stopped on {addr}: {e}");
+        }
+    });
 
     let data_path = data_dir
         .map(|p| p.display().to_string())
@@ -246,27 +282,22 @@ async fn start_coordinator(
         let result = serde_json::json!({
             "command": "start-coordinator",
             "bind_address": bind,
-            "max_workers": max_workers,
+            "max_workers": resolved_max_workers,
+            "max_workers_explicit": max_workers.is_some(),
             "data_dir": data_path,
             "heartbeat_timeout_secs": heartbeat_timeout,
             "fault_tolerance": fault_tolerance,
             "status": "initialized",
-            "message": "Coordinator initialized; gRPC server integration pending",
+            "message": "Coordinator initialized with a real worker cap; gRPC server integration pending",
         });
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Distributed Coordinator".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:25} {}", "Bind address:", bind);
-        println!(
-            "{:25} {}",
-            "Max workers:",
-            max_workers
-                .map(|w| w.to_string())
-                .unwrap_or_else(|| "unlimited".to_string())
-        );
+        println!("{:25} {}", "Max workers:", resolved_max_workers);
         println!("{:25} {}", "Data directory:", data_path);
         println!("{:25} {}s", "Heartbeat timeout:", heartbeat_timeout);
         println!("{:25} {}", "Fault tolerance:", fault_tolerance);
@@ -321,7 +352,7 @@ async fn start_worker(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Distributed Worker".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:25} {}", "Coordinator:", coordinator);
@@ -434,7 +465,7 @@ async fn submit_job(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Job Submitted".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:25} {}", "Job ID:", returned_id);
@@ -478,17 +509,24 @@ async fn query_status(
     watch: bool,
     output_format: &str,
 ) -> Result<()> {
-    // A watch loop would need a live coordinator connection; each CLI
-    // invocation only sees its own in-process (empty) job table today, so
-    // polling it would fabricate liveness. Warn instead of silently
-    // dropping the flag.
-    // TODO(0.2.x): implement a real polling loop once the gRPC client path
-    // to a remote coordinator lands.
+    // A real polling loop needs a live coordinator connection. This
+    // workspace's only gRPC-shaped client, `oximedia_distributed::pb::
+    // coordinator_service_client::CoordinatorServiceClient`, is a stub: every
+    // RPC method (`get_job_status`, `heartbeat`, ...) ignores its request and
+    // immediately returns `Ok(Response::new(T::default()))` without ever
+    // writing to the connected `tonic::transport::Channel`. `Coordinator::
+    // serve` (the real server side, started by `start-coordinator`) doesn't
+    // mount that gRPC service either — it runs a bespoke plain-TCP
+    // status/nodes/jobs text protocol instead. So there is no real transport
+    // a `--watch` loop could poll: refuse rather than spin printing
+    // synthetic "no change" output or fabricating repeated liveness.
     if watch {
-        eprintln!(
-            "warning: --watch is not implemented yet and is ignored (requires a live \
-             coordinator connection)"
-        );
+        return Err(anyhow::anyhow!(
+            "--watch requires a live coordinator connection, which does not exist yet: \
+             oximedia_distributed's CoordinatorServiceClient RPCs (see pb.rs) are stubs that \
+             return a default response without contacting a remote coordinator over the wire. \
+             Run 'status' without --watch for a single real query instead."
+        ));
     }
 
     let config = oximedia_distributed::DistributedConfig {
@@ -577,7 +615,7 @@ async fn cancel_job(coordinator: &str, job_id: &str, json_output: bool) -> Resul
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Job Cancelled".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:25} {}", "Job ID:", job_id);
@@ -654,5 +692,60 @@ mod tests {
             job_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         };
         assert!(matches!(cmd, DistributedCommand::Cancel { .. }));
+    }
+
+    // ── `--watch` honest-err and `--max-workers` real-config tests ────────
+    //
+    // `--watch` previously warned "not implemented" and silently fell
+    // through to a single query; `--max-workers`/`--data-dir` were parsed
+    // but never reached any real config struct. These assert the fixed
+    // behavior.
+
+    #[tokio::test]
+    async fn test_query_status_watch_is_honest_err_naming_the_stub_client() {
+        let result = query_status("127.0.0.1:19999", None, true, "text").await;
+        let err = result.expect_err("--watch must be a real error, not a silent no-op");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CoordinatorServiceClient"),
+            "error must name the stub client that has no real transport: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_status_without_watch_still_works() {
+        // No job_id => cluster overview path; must not error just because
+        // `watch` is false.
+        let result = query_status("127.0.0.1:19999", None, false, "text").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_start_coordinator_invalid_bind_is_err() {
+        let result = start_coordinator("not-an-address", None, None, 60, false, true).await;
+        assert!(
+            result.is_err(),
+            "an unparseable --bind address must be a real error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_coordinator_binds_ephemeral_port_with_default_max_workers() {
+        // Port 0 => OS assigns a free ephemeral port, so this cannot collide
+        // with another test or a real coordinator.
+        let result = start_coordinator("127.0.0.1:0", None, None, 5, false, true).await;
+        assert!(
+            result.is_ok(),
+            "coordinator must start with a valid bind address"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_coordinator_accepts_explicit_max_workers() {
+        let result = start_coordinator("127.0.0.1:0", Some(3), None, 5, false, true).await;
+        assert!(
+            result.is_ok(),
+            "coordinator must start with an explicit --max-workers"
+        );
     }
 }

@@ -14,7 +14,7 @@
 
 #![allow(dead_code)]
 
-use rayon::prelude::*;
+use crate::parallel::map_range;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -364,61 +364,58 @@ pub fn bilateral_filter_rgba8_inplace(
     let src = pixels.to_vec();
 
     // Process rows in parallel
-    let row_results: Vec<Vec<u8>> = (0..h)
-        .into_par_iter()
-        .map(|y| {
-            let mut row_buf = vec![0u8; w * 4];
-            for x in 0..w {
-                let base = (y * w + x) * 4;
-                // Copy alpha unchanged
-                row_buf[x * 4 + 3] = src[base + 3];
+    let row_results: Vec<Vec<u8>> = map_range(h, |y| {
+        let mut row_buf = vec![0u8; w * 4];
+        for x in 0..w {
+            let base = (y * w + x) * 4;
+            // Copy alpha unchanged
+            row_buf[x * 4 + 3] = src[base + 3];
 
-                // Process R, G, B channels
-                for ch in 0..3 {
-                    let center_val = src[base + ch] as f64;
-                    let mut weighted_sum = 0.0_f64;
-                    let mut total_weight = 0.0_f64;
+            // Process R, G, B channels
+            for ch in 0..3 {
+                let center_val = src[base + ch] as f64;
+                let mut weighted_sum = 0.0_f64;
+                let mut total_weight = 0.0_f64;
 
-                    let y_lo = (y as isize - kernel_radius).max(0) as usize;
-                    let y_hi = (y as isize + kernel_radius).min(h as isize - 1) as usize;
-                    let x_lo = (x as isize - kernel_radius).max(0) as usize;
-                    let x_hi = (x as isize + kernel_radius).min(w as isize - 1) as usize;
+                let y_lo = (y as isize - kernel_radius).max(0) as usize;
+                let y_hi = (y as isize + kernel_radius).min(h as isize - 1) as usize;
+                let x_lo = (x as isize - kernel_radius).max(0) as usize;
+                let x_hi = (x as isize + kernel_radius).min(w as isize - 1) as usize;
 
-                    for ny in y_lo..=y_hi {
-                        let dy = ny as f64 - y as f64;
-                        for nx in x_lo..=x_hi {
-                            let dx = nx as f64 - x as f64;
-                            let neighbor_idx = (ny * w + nx) * 4 + ch;
-                            let neighbor_val = src[neighbor_idx] as f64;
+                for ny in y_lo..=y_hi {
+                    let dy = ny as f64 - y as f64;
+                    for nx in x_lo..=x_hi {
+                        let dx = nx as f64 - x as f64;
+                        let neighbor_idx = (ny * w + nx) * 4 + ch;
+                        let neighbor_val = src[neighbor_idx] as f64;
 
-                            let spatial_w = (-(dx * dx + dy * dy) / spatial_denom).exp();
+                        let spatial_w = (-(dx * dx + dy * dy) / spatial_denom).exp();
 
-                            let diff = center_val - neighbor_val;
-                            let range_w = if range_denom > 0.0 {
-                                (-(diff * diff) / range_denom).exp()
-                            } else if diff.abs() < 0.5 {
-                                1.0
-                            } else {
-                                0.0
-                            };
+                        let diff = center_val - neighbor_val;
+                        let range_w = if range_denom > 0.0 {
+                            (-(diff * diff) / range_denom).exp()
+                        } else if diff.abs() < 0.5 {
+                            1.0
+                        } else {
+                            0.0
+                        };
 
-                            let w_combined = spatial_w * range_w;
-                            weighted_sum += w_combined * neighbor_val;
-                            total_weight += w_combined;
-                        }
+                        let w_combined = spatial_w * range_w;
+                        weighted_sum += w_combined * neighbor_val;
+                        total_weight += w_combined;
                     }
-
-                    let result = if total_weight > 0.0 {
-                        (weighted_sum / total_weight).clamp(0.0, 255.0).round() as u8
-                    } else {
-                        src[base + ch]
-                    };
-                    row_buf[x * 4 + ch] = result;
                 }
+
+                let result = if total_weight > 0.0 {
+                    (weighted_sum / total_weight).clamp(0.0, 255.0).round() as u8
+                } else {
+                    src[base + ch]
+                };
+                row_buf[x * 4 + ch] = result;
             }
-            row_buf
-        })
-        .collect();
+        }
+        row_buf
+    });
 
     // Write back results
     for (y, row) in row_results.into_iter().enumerate() {
@@ -453,52 +450,49 @@ pub fn bilateral_filter_gray_u8_inplace(
 
     let src = pixels.to_vec();
 
-    let row_results: Vec<Vec<u8>> = (0..h)
-        .into_par_iter()
-        .map(|y| {
-            let mut row_buf = vec![0u8; w];
-            for x in 0..w {
-                let center_val = src[y * w + x] as f64;
-                let mut weighted_sum = 0.0_f64;
-                let mut total_weight = 0.0_f64;
+    let row_results: Vec<Vec<u8>> = map_range(h, |y| {
+        let mut row_buf = vec![0u8; w];
+        for x in 0..w {
+            let center_val = src[y * w + x] as f64;
+            let mut weighted_sum = 0.0_f64;
+            let mut total_weight = 0.0_f64;
 
-                let y_lo = (y as isize - kernel_radius).max(0) as usize;
-                let y_hi = (y as isize + kernel_radius).min(h as isize - 1) as usize;
-                let x_lo = (x as isize - kernel_radius).max(0) as usize;
-                let x_hi = (x as isize + kernel_radius).min(w as isize - 1) as usize;
+            let y_lo = (y as isize - kernel_radius).max(0) as usize;
+            let y_hi = (y as isize + kernel_radius).min(h as isize - 1) as usize;
+            let x_lo = (x as isize - kernel_radius).max(0) as usize;
+            let x_hi = (x as isize + kernel_radius).min(w as isize - 1) as usize;
 
-                for ny in y_lo..=y_hi {
-                    let dy = ny as f64 - y as f64;
-                    for nx in x_lo..=x_hi {
-                        let dx = nx as f64 - x as f64;
-                        let neighbor_val = src[ny * w + nx] as f64;
+            for ny in y_lo..=y_hi {
+                let dy = ny as f64 - y as f64;
+                for nx in x_lo..=x_hi {
+                    let dx = nx as f64 - x as f64;
+                    let neighbor_val = src[ny * w + nx] as f64;
 
-                        let spatial_w = (-(dx * dx + dy * dy) / spatial_denom).exp();
+                    let spatial_w = (-(dx * dx + dy * dy) / spatial_denom).exp();
 
-                        let diff = center_val - neighbor_val;
-                        let range_w = if range_denom > 0.0 {
-                            (-(diff * diff) / range_denom).exp()
-                        } else if diff.abs() < 0.5 {
-                            1.0
-                        } else {
-                            0.0
-                        };
+                    let diff = center_val - neighbor_val;
+                    let range_w = if range_denom > 0.0 {
+                        (-(diff * diff) / range_denom).exp()
+                    } else if diff.abs() < 0.5 {
+                        1.0
+                    } else {
+                        0.0
+                    };
 
-                        let w_combined = spatial_w * range_w;
-                        weighted_sum += w_combined * neighbor_val;
-                        total_weight += w_combined;
-                    }
+                    let w_combined = spatial_w * range_w;
+                    weighted_sum += w_combined * neighbor_val;
+                    total_weight += w_combined;
                 }
-
-                row_buf[x] = if total_weight > 0.0 {
-                    (weighted_sum / total_weight).clamp(0.0, 255.0).round() as u8
-                } else {
-                    src[y * w + x]
-                };
             }
-            row_buf
-        })
-        .collect();
+
+            row_buf[x] = if total_weight > 0.0 {
+                (weighted_sum / total_weight).clamp(0.0, 255.0).round() as u8
+            } else {
+                src[y * w + x]
+            };
+        }
+        row_buf
+    });
 
     for (y, row) in row_results.into_iter().enumerate() {
         let start = y * w;

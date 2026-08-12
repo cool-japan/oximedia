@@ -14,6 +14,13 @@
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_possible_wrap)]
 
+// `mb_mode`'s enums are deprecated (0.2.1, defective early seeds superseded
+// by the internal RFC 6386 pipeline behind `Vp8Decoder`), but the dispatch
+// functions in this file (`predict_intra_16x16`, `predict_intra_4x4`,
+// `predict_chroma`) are standalone building blocks that predate that
+// pipeline and are not themselves deprecated -- deprecating them would be a
+// separate, larger API decision out of scope here. Internal reference site.
+#[allow(deprecated)]
 use super::mb_mode::{ChromaMode, IntraMode16, IntraMode4};
 
 /// Performs DC prediction for a 16x16 block.
@@ -104,6 +111,9 @@ pub fn predict_tm_16x16(dst: &mut [u8], stride: usize, top: &[u8], left: &[u8], 
 /// * `top` - Top neighbor pixels (16 pixels), if available
 /// * `left` - Left neighbor pixels (16 pixels), if available
 /// * `top_left` - Top-left corner pixel, if available
+// Takes the deprecated `mb_mode::IntraMode16` by design (see the `use`
+// import's note above); internal reference site, not itself deprecated.
+#[allow(deprecated)]
 pub fn predict_intra_16x16(
     mode: IntraMode16,
     dst: &mut [u8],
@@ -201,6 +211,9 @@ pub fn predict_tm_4x4(dst: &mut [u8], stride: usize, top: &[u8], left: &[u8], to
 /// * `top` - Top neighbor pixels (4 pixels), if available
 /// * `left` - Left neighbor pixels (4 pixels), if available
 /// * `top_left` - Top-left corner pixel, if available
+// Takes the deprecated `mb_mode::IntraMode4` by design (see the `use`
+// import's note above); internal reference site, not itself deprecated.
+#[allow(deprecated)]
 #[allow(clippy::too_many_lines)]
 pub fn predict_intra_4x4(
     mode: IntraMode4,
@@ -259,6 +272,9 @@ pub fn predict_intra_4x4(
 /// * `top` - Top neighbor pixels (8 pixels), if available
 /// * `left` - Left neighbor pixels (8 pixels), if available
 /// * `top_left` - Top-left corner pixel, if available
+// Takes the deprecated `mb_mode::ChromaMode` by design (see the `use`
+// import's note above); internal reference site, not itself deprecated.
+#[allow(deprecated)]
 pub fn predict_chroma(
     mode: ChromaMode,
     dst: &mut [u8],
@@ -485,6 +501,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_predict_intra_16x16_dc() {
         let mut dst = vec![0u8; 16 * 16];
         let top = [100u8; 16];
@@ -529,6 +546,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_predict_intra_4x4() {
         let mut dst = vec![0u8; 4 * 4];
         let top = [80u8; 4];
@@ -539,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_predict_chroma_dc() {
         let mut dst = vec![0u8; 8 * 8];
         let top = [90u8; 8];
@@ -557,6 +576,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_predict_chroma_v() {
         let mut dst = vec![0u8; 8 * 8];
         let top = [70u8; 8];

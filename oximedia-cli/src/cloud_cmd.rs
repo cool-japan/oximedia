@@ -43,7 +43,10 @@ pub enum CloudCommand {
         #[arg(long)]
         region: Option<String>,
 
-        /// Use multipart upload for large files
+        /// Force chunked multipart/resumable upload, even for files below
+        /// the backend's automatic size threshold (all three backends
+        /// already select this path automatically above their own
+        /// threshold, so this only changes behaviour for smaller files)
         #[arg(long)]
         multipart: bool,
 
@@ -478,19 +481,6 @@ async fn run_upload(
     bandwidth_limit: Option<u32>,
     json_output: bool,
 ) -> Result<()> {
-    // The storage backends choose multipart automatically by file size
-    // (e.g. the S3 backend switches above its 10 MB threshold); no
-    // force-multipart knob is exposed, so the flag cannot change behaviour.
-    // Warn instead of silently dropping it.
-    // TODO(0.2.x): expose a force-multipart option on the oximedia-storage
-    // upload API and thread this flag through.
-    if multipart {
-        eprintln!(
-            "warning: --multipart has no effect; multipart uploads are selected automatically \
-             by file size for backends that support them"
-        );
-    }
-
     validate_provider(provider)?;
 
     if !input.exists() {
@@ -514,9 +504,16 @@ async fn run_upload(
     let config = build_unified_config(&creds, bucket);
 
     // Perform the upload using the real oximedia-storage backend.
-    let etag = upload_file_via_storage(config, creds.kind, input, &remote_key, meta.len())
-        .await
-        .with_context(|| format!("Upload to {}/{} failed", bucket, remote_key))?;
+    let etag = upload_file_via_storage(
+        config,
+        creds.kind,
+        input,
+        &remote_key,
+        meta.len(),
+        multipart,
+    )
+    .await
+    .with_context(|| format!("Upload to {}/{} failed", bucket, remote_key))?;
 
     if let Some(limit) = bandwidth_limit {
         // Bandwidth limiting is handled at the OS / network layer; log intent.
@@ -537,11 +534,12 @@ async fn run_upload(
             "region": region_str,
             "size_bytes": meta.len(),
             "etag": etag,
+            "multipart_forced": multipart,
             "status": "uploaded",
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Cloud Upload".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:22} {}", "Provider:", format_provider(provider));
@@ -555,26 +553,103 @@ async fn run_upload(
             meta.len() as f64 / (1024.0 * 1024.0)
         );
         println!("{:22} {}", "ETag:", etag);
+        if multipart {
+            println!("{:22} {}", "Multipart:", "forced".cyan());
+        }
         println!("{:22} {}", "Status:", "uploaded".green().bold());
     }
 
     Ok(())
 }
 
+/// Decide the size hint passed to [`oximedia_storage::CloudStorage::upload_stream`]
+/// for a given upload, honoring `--multipart`.
+///
+/// All three backends (S3 `multipart_upload`, Azure `upload_blocks`, GCS
+/// `resumable_upload`) already select their chunked/resumable upload path
+/// whenever the size hint is `None` — see each backend's `upload_stream`:
+/// `size.map_or(true, |s| s > THRESHOLD)` (S3, Azure) / `size.is_none_or(...)`
+/// (GCS) — and each already selects that same chunked path automatically
+/// once the real size crosses its own threshold (10 MB for S3, comparable
+/// values for Azure/GCS). So passing `None` genuinely forces the chunked
+/// path via the crate's real "unknown size" branch; it only changes
+/// observable behaviour for files *below* every backend's auto-multipart
+/// threshold.
+///
+/// For files at or above `FORCE_MULTIPART_SAFE_MAX` we pass the real size
+/// instead of `None` even when `--multipart` was requested: multipart
+/// already triggers naturally there (so honoring the flag's intent is a
+/// truthful no-op), and passing `None` would make S3's chunk-size
+/// calculator size chunks from an unknown 0-byte total (a fixed 5 MB
+/// chunk), which for very large files can exceed the 10 000-part ceiling
+/// and fail an upload that unforced multipart would have completed.
+fn upload_size_hint(force_multipart: bool, size: u64) -> Option<u64> {
+    /// Conservative safe ceiling for forcing multipart via an unknown-size
+    /// hint: comfortably below the point where any backend's fixed minimum
+    /// chunk size, applied to the real `size`, would need more than its
+    /// maximum part count.
+    const FORCE_MULTIPART_SAFE_MAX: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+    if force_multipart && size <= FORCE_MULTIPART_SAFE_MAX {
+        None
+    } else {
+        Some(size)
+    }
+}
+
+/// Wrap a local file as an [`oximedia_storage::ByteStream`], read in
+/// bounded chunks so large files are not buffered into memory at once.
+///
+/// Only called from the `#[cfg(feature = "s3"/"azure"/"gcs")]` arms of
+/// [`upload_file_via_storage`]; with none of those compiled in there is no
+/// caller, so this is feature-gated identically rather than left dead.
+#[cfg(any(feature = "s3", feature = "azure", feature = "gcs"))]
+async fn file_byte_stream(path: &std::path::Path) -> Result<oximedia_storage::ByteStream> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("Failed to open file for streaming: {}", path.display()))?;
+
+    let stream = futures::stream::try_unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt;
+        const CHUNK: usize = 256 * 1024;
+        let mut buffer = vec![0u8; CHUNK];
+        let n = file
+            .read(&mut buffer)
+            .await
+            .map_err(oximedia_storage::StorageError::from)?;
+        if n == 0 {
+            Ok(None)
+        } else {
+            buffer.truncate(n);
+            Ok(Some((bytes::Bytes::from(buffer), file)))
+        }
+    });
+
+    Ok(Box::pin(stream))
+}
+
 /// Dispatch file upload to the appropriate storage backend.
 ///
 /// Uses compile-time feature gates to ensure only compiled backends are called.
 /// Returns the ETag string on success.
+///
+/// Always goes through `CloudStorage::upload_stream` (rather than
+/// `upload_file`) so `force_multipart` can genuinely change behaviour via
+/// [`upload_size_hint`]: passing an unknown size makes every backend select
+/// its real chunked/resumable upload path instead of a single PUT, even for
+/// small files.
 async fn upload_file_via_storage(
     config: oximedia_storage::UnifiedConfig,
     kind: ProviderKind,
     file_path: &std::path::Path,
     key: &str,
-    _size: u64,
+    size: u64,
+    force_multipart: bool,
 ) -> Result<String> {
     use oximedia_storage::UploadOptions;
 
     let opts = UploadOptions::default();
+    let size_hint = upload_size_hint(force_multipart, size);
 
     match kind {
         ProviderKind::S3 => {
@@ -584,14 +659,15 @@ async fn upload_file_via_storage(
                 let storage = oximedia_storage::s3::S3Storage::new(config)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create S3 client: {}", e))?;
+                let stream = file_byte_stream(file_path).await?;
                 storage
-                    .upload_file(key, file_path, opts)
+                    .upload_stream(key, stream, size_hint, opts)
                     .await
                     .map_err(|e| anyhow::anyhow!("S3 upload failed: {}", e))
             }
             #[cfg(not(feature = "s3"))]
             {
-                let _ = (config, file_path, key, opts);
+                let _ = (config, file_path, key, opts, size_hint);
                 Err(anyhow::anyhow!(
                     "S3 backend is not compiled in; rebuild oximedia-cli with --features s3"
                 ))
@@ -604,14 +680,15 @@ async fn upload_file_via_storage(
                 let storage = oximedia_storage::azure::AzureStorage::new(config)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create Azure client: {}", e))?;
+                let stream = file_byte_stream(file_path).await?;
                 storage
-                    .upload_file(key, file_path, opts)
+                    .upload_stream(key, stream, size_hint, opts)
                     .await
                     .map_err(|e| anyhow::anyhow!("Azure upload failed: {}", e))
             }
             #[cfg(not(feature = "azure"))]
             {
-                let _ = (config, file_path, key, opts);
+                let _ = (config, file_path, key, opts, size_hint);
                 Err(anyhow::anyhow!(
                     "Azure backend is not compiled in; rebuild oximedia-cli with --features azure"
                 ))
@@ -624,14 +701,15 @@ async fn upload_file_via_storage(
                 let storage = oximedia_storage::gcs::GcsStorage::new(config)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create GCS client: {}", e))?;
+                let stream = file_byte_stream(file_path).await?;
                 storage
-                    .upload_file(key, file_path, opts)
+                    .upload_stream(key, stream, size_hint, opts)
                     .await
                     .map_err(|e| anyhow::anyhow!("GCS upload failed: {}", e))
             }
             #[cfg(not(feature = "gcs"))]
             {
-                let _ = (config, file_path, key, opts);
+                let _ = (config, file_path, key, opts, size_hint);
                 Err(anyhow::anyhow!(
                     "GCS backend is not compiled in; rebuild oximedia-cli with --features gcs"
                 ))
@@ -679,7 +757,7 @@ async fn run_download(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Cloud Download".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:22} {}", "Provider:", format_provider(provider));
@@ -987,5 +1065,65 @@ mod tests {
         assert_eq!(ProviderKind::from_str("gcs"), Some(ProviderKind::Gcs));
         assert_eq!(ProviderKind::from_str("google"), Some(ProviderKind::Gcs));
         assert_eq!(ProviderKind::from_str("dropbox"), None);
+    }
+
+    // ── --multipart real-behaviour tests ─────────────────────────────────
+    //
+    // `--multipart` previously had no effect at all (a warning said so).
+    // These test the pure decision function that now genuinely changes
+    // which upload path every backend takes; there is no live-cloud test
+    // here on purpose (no fabricated network calls in a unit test).
+
+    #[test]
+    fn upload_size_hint_unforced_always_passes_real_size() {
+        assert_eq!(upload_size_hint(false, 0), Some(0));
+        assert_eq!(upload_size_hint(false, 1_000), Some(1_000));
+        assert_eq!(
+            upload_size_hint(false, 100 * 1024 * 1024 * 1024),
+            Some(100 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn upload_size_hint_forced_small_file_forces_unknown_size() {
+        // Below the safe ceiling: forcing must genuinely change the hint to
+        // `None`, which is what drives every backend's chunked path.
+        assert_eq!(upload_size_hint(true, 0), None);
+        assert_eq!(upload_size_hint(true, 1_000), None);
+        assert_eq!(upload_size_hint(true, 1024 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn upload_size_hint_forced_huge_file_keeps_real_size() {
+        // Above the safe ceiling: multipart already triggers automatically
+        // from the real size, so honoring `--multipart` must not risk the
+        // 10 000-part ceiling by reporting an unknown (0-byte) total.
+        let huge = 100 * 1024 * 1024 * 1024; // 100 GiB
+        assert_eq!(upload_size_hint(true, huge), Some(huge));
+    }
+
+    #[cfg(any(feature = "s3", feature = "azure", feature = "gcs"))]
+    #[tokio::test]
+    async fn file_byte_stream_round_trips_real_bytes() {
+        use futures::StreamExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "oximedia_cloud_cmd_test_stream_{}.bin",
+            std::process::id()
+        ));
+        let payload = vec![7u8; 600 * 1024]; // > one 256 KiB chunk
+        std::fs::write(&path, &payload).expect("write fixture");
+
+        let mut stream = file_byte_stream(&path).await.expect("open stream");
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.expect("chunk read"));
+        }
+
+        assert_eq!(
+            collected, payload,
+            "stream must reproduce the file bytes exactly"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

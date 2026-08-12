@@ -4,35 +4,40 @@
 //! FLAC uses Rice coding (partition coding) to compress the LPC residuals.
 //!
 //! Each partition's Rice parameter `k` is optimised to minimise bit usage.
+//!
+//! Per RFC 9639 §9.2.7.1 the quotient is coded in unary as **zero bits
+//! terminated by a one bit**, followed by the `k` low bits of the folded
+//! residual.  [`crate::flac::residual`] builds the partitioned residual blocks
+//! that FLAC frames actually carry; the helpers here cover a single flat run.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_possible_wrap)]
 
-/// Maximum Rice parameter (FLAC allows 0-14 for Rice1, 0-30 for Rice2).
+use super::bitio::{BitReader, BitWriter};
+
+/// Maximum Rice parameter for coding method 0 (4-bit parameters); 15 escapes.
 pub const MAX_RICE_PARAM: u8 = 14;
 
-/// Map a signed residual to an unsigned zigzag-encoded value.
+/// Maximum Rice parameter for coding method 1 (5-bit parameters); 31 escapes.
+pub const MAX_RICE_PARAM_WIDE: u8 = 30;
+
+/// Map a signed residual to an unsigned zigzag ("folded") value.
 ///
-/// FLAC encodes signed residuals as zigzag: `0 → 0, -1 → 1, 1 → 2, -2 → 3, 2 → 4, ...`
+/// FLAC folds signed residuals as `0 → 0, -1 → 1, 1 → 2, -2 → 3, 2 → 4, ...`.
+/// The branchless form is used so that `i32::MIN` folds without overflowing.
 #[inline]
+#[must_use]
 pub fn zigzag_encode(v: i32) -> u32 {
-    if v >= 0 {
-        (v as u32) << 1
-    } else {
-        ((-v - 1) as u32) << 1 | 1
-    }
+    ((v as u32) << 1) ^ ((v >> 31) as u32)
 }
 
 /// Decode a zigzag-encoded unsigned value back to signed.
 #[inline]
+#[must_use]
 pub fn zigzag_decode(u: u32) -> i32 {
-    if u & 1 == 0 {
-        (u >> 1) as i32
-    } else {
-        -((u >> 1) as i32) - 1
-    }
+    ((u >> 1) as i32) ^ -((u & 1) as i32)
 }
 
 /// Compute the Rice bit cost for encoding `residuals` with parameter `k`.
@@ -70,54 +75,45 @@ pub fn optimal_rice_param(residuals: &[i32]) -> u8 {
     best_k
 }
 
-/// Encode residuals using Rice coding with parameter `k`.
-///
-/// Returns the packed bit stream as a `Vec<u8>` (MSB-first, zero-padded to byte boundary).
-#[must_use]
-pub fn rice_encode(residuals: &[i32], k: u8) -> Vec<u8> {
-    let mut bits: Vec<bool> = Vec::new();
-
-    for &r in residuals {
-        let u = zigzag_encode(r);
-        let quotient = u >> k;
-        let remainder = u & ((1u32 << k) - 1);
-
-        // Unary-coded quotient: `quotient` ones followed by a zero
-        for _ in 0..quotient {
-            bits.push(true);
-        }
-        bits.push(false);
-
-        // Binary `k` bits of remainder (MSB first)
-        for bit_idx in (0..k).rev() {
-            bits.push((remainder >> bit_idx) & 1 != 0);
-        }
+/// Write one Rice-coded residual with parameter `k` (RFC 9639 §9.2.7.1).
+pub fn write_rice_signed(w: &mut BitWriter, value: i32, k: u32) {
+    let u = zigzag_encode(value);
+    let quotient = u >> k;
+    w.write_unary(quotient);
+    if k > 0 {
+        w.write_bits(u64::from(u), k);
     }
-
-    // Pack bits into bytes (MSB-first)
-    let mut out = Vec::with_capacity((bits.len() + 7) / 8);
-    let mut byte = 0u8;
-    let mut fill = 0u8;
-    for bit in bits {
-        byte = (byte << 1) | u8::from(bit);
-        fill += 1;
-        if fill == 8 {
-            out.push(byte);
-            byte = 0;
-            fill = 0;
-        }
-    }
-    if fill > 0 {
-        out.push(byte << (8 - fill));
-    }
-    out
 }
 
-/// Rice decoder state.
+/// Read one Rice-coded residual with parameter `k`.
+///
+/// Returns `None` on truncated input or an implausibly long unary run.
+pub fn read_rice_signed(r: &mut BitReader<'_>, k: u32) -> Option<i32> {
+    // A quotient can never legitimately exceed 2^32 / 2^k; bound generously
+    // but finitely so corrupt data cannot spin.
+    let quotient = r.read_unary(1 << 20)?;
+    let remainder = if k > 0 { r.read_bits(k)? as u32 } else { 0 };
+    let u = (u64::from(quotient) << k) | u64::from(remainder);
+    Some(zigzag_decode(u as u32))
+}
+
+/// Encode residuals using Rice coding with parameter `k`.
+///
+/// Returns the packed bit stream as a `Vec<u8>` (MSB-first, zero-padded to a
+/// byte boundary).  This is a flat, unpartitioned run — FLAC frames use
+/// [`crate::flac::residual`] instead.
+#[must_use]
+pub fn rice_encode(residuals: &[i32], k: u8) -> Vec<u8> {
+    let mut w = BitWriter::with_capacity(residuals.len());
+    for &r in residuals {
+        write_rice_signed(&mut w, r, u32::from(k));
+    }
+    w.into_bytes()
+}
+
+/// Rice decoder over a flat (unpartitioned) Rice-coded byte stream.
 pub struct RiceDecoder<'a> {
-    data: &'a [u8],
-    byte_pos: usize,
-    bit_pos: u8,
+    reader: BitReader<'a>,
 }
 
 impl<'a> RiceDecoder<'a> {
@@ -125,49 +121,13 @@ impl<'a> RiceDecoder<'a> {
     #[must_use]
     pub fn new(data: &'a [u8]) -> Self {
         Self {
-            data,
-            byte_pos: 0,
-            bit_pos: 0,
+            reader: BitReader::new(data),
         }
-    }
-
-    fn read_bit(&mut self) -> Option<bool> {
-        if self.byte_pos >= self.data.len() {
-            return None;
-        }
-        let bit = (self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1 != 0;
-        self.bit_pos += 1;
-        if self.bit_pos == 8 {
-            self.byte_pos += 1;
-            self.bit_pos = 0;
-        }
-        Some(bit)
     }
 
     /// Decode one Rice-coded residual with parameter `k`.
     pub fn decode_one(&mut self, k: u8) -> Option<i32> {
-        // Read unary quotient
-        let mut quotient = 0u32;
-        loop {
-            let bit = self.read_bit()?;
-            if !bit {
-                break;
-            }
-            quotient += 1;
-            if quotient > 1024 * 1024 {
-                return None; // guard against corrupt data
-            }
-        }
-
-        // Read `k` remainder bits
-        let mut remainder = 0u32;
-        for _ in 0..k {
-            let bit = self.read_bit()?;
-            remainder = (remainder << 1) | u32::from(bit);
-        }
-
-        let u = (quotient << k) | remainder;
-        Some(zigzag_decode(u))
+        read_rice_signed(&mut self.reader, u32::from(k))
     }
 
     /// Decode `count` residuals with parameter `k`.

@@ -339,7 +339,7 @@ async fn run_create(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Clip Created".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Clip ID:", clip_id);
@@ -537,7 +537,7 @@ async fn run_export(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Clips Exported".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Output:", output.display());
@@ -588,7 +588,7 @@ async fn run_trim(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Clip Trimmed".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Clip ID:", clip_id);
@@ -663,7 +663,7 @@ async fn run_merge(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Clips Merged".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Merged ID:", merged_id);
@@ -722,7 +722,7 @@ async fn run_tag(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Clip Tagged".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Clip ID:", clip_id);

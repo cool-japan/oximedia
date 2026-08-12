@@ -1,5 +1,14 @@
 //! VP8 motion compensation and sub-pixel interpolation.
 //!
+//! # Deprecated: defective early seed, not RFC 6386-accurate
+//!
+//! **Every public item in this module is `#[deprecated]`** (since 0.2.1,
+//! scheduled for removal in 0.3.0). [`MotionVector`]'s unit handling and
+//! this module's 6-tap filter tap/stride arithmetic do not match RFC 6386
+//! SS18, and nothing in the decoder uses them. The real, bit-exact
+//! sub-pixel motion compensation lives in `vp8::dec::mc` (used by
+//! `Vp8Decoder`) and does not use these types. Kept only for API stability.
+//!
 //! This module implements motion compensation for VP8 inter prediction.
 //! Motion vectors in VP8 have quarter-pixel precision and use 6-tap
 //! Sinc-based interpolation filters.
@@ -18,6 +27,10 @@
 #![allow(clippy::too_many_arguments)]
 
 /// Motion vector with quarter-pixel precision.
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (motion-vector units and 6-tap filter tap/stride do not match RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MotionVector {
     /// Horizontal component (quarter-pixel units).
@@ -26,6 +39,11 @@ pub struct MotionVector {
     pub y: i16,
 }
 
+// Internal reference site: this impl block's own methods necessarily name
+// `MotionVector`'s deprecated fields; the impl itself is not deprecated
+// (see the module doc's policy on inherent methods), so it needs its own
+// targeted allow.
+#[allow(deprecated)]
 impl MotionVector {
     /// Creates a new motion vector.
     #[must_use]
@@ -92,6 +110,14 @@ const SUBPEL_FILTERS: [[i32; 6]; 8] = [
 /// * `block_h` - Block height
 /// * `ref_x` - Reference block X position (integer pixels)
 /// * `ref_y` - Reference block Y position (integer pixels)
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (motion-vector units and 6-tap filter tap/stride do not match RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
+// `#[deprecated]` on this function does not exempt its own signature/body
+// from separately warning about the (also deprecated) `MotionVector`
+// parameter and its methods; internal reference site.
+#[allow(deprecated)]
 #[allow(clippy::similar_names)]
 pub fn motion_compensate(
     dst: &mut [u8],
@@ -283,6 +309,14 @@ fn filter_2d(
 /// * `height` - Block height
 /// * `frame_w` - Frame width
 /// * `frame_h` - Frame height
+#[deprecated(
+    since = "0.2.1",
+    note = "defective early seed (motion-vector units and 6-tap filter tap/stride do not match RFC 6386) superseded by the internal RFC 6386 pipeline behind Vp8Decoder; scheduled for removal in 0.3.0"
+)]
+// `#[deprecated]` on this function does not exempt its own signature/body
+// from separately warning about the (also deprecated) `MotionVector`
+// parameter, return type, and field accesses; internal reference site.
+#[allow(deprecated)]
 #[must_use]
 pub fn clamp_mv(
     mv: MotionVector,
@@ -316,6 +350,9 @@ pub fn clamp_mv(
 }
 
 #[cfg(test)]
+// This module's entire purpose is exercising the deprecated types declared
+// above; targeted (not blanket/crate-wide) allow for exactly that site.
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

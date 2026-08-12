@@ -12,7 +12,9 @@
 use std::path::PathBuf;
 
 use oximedia_transcode::flac_decode::decode_flac_to_i16;
-use oximedia_transcode::{ScaleSpec, TranscodePipelineBuilder};
+#[cfg(feature = "mjpeg")]
+use oximedia_transcode::ScaleSpec;
+use oximedia_transcode::TranscodePipelineBuilder;
 
 // ─── Fixture helpers ──────────────────────────────────────────────────────────
 
@@ -93,6 +95,7 @@ async fn run_pipeline(builder: TranscodePipelineBuilder) -> oximedia_transcode::
 }
 
 /// Extract the first JPEG image (SOI..EOI) embedded in a byte stream.
+#[cfg(feature = "mjpeg")]
 fn first_jpeg(data: &[u8]) -> Option<&[u8]> {
     let start = data.windows(3).position(|w| w == [0xFF, 0xD8, 0xFF])?;
     let end = data[start..].windows(2).position(|w| w == [0xFF, 0xD9])?;

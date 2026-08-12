@@ -11,10 +11,10 @@ use crate::ptz::PtzMessage;
 use crate::stats::StatsTracker;
 use crate::tally::TallyMessage;
 use crate::transport::UdpTransport;
-use crate::types::{AudioCodec, VideoCodec};
+use crate::types::{AudioFormat, VideoFormat};
 use bytes::{Bytes, BytesMut};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +23,10 @@ use tokio::time::timeout;
 
 /// Maximum time to wait for a complete frame (milliseconds).
 const FRAME_TIMEOUT_MS: u64 = 100;
+
+/// Maximum number of decoded audio blocks held while waiting for the video
+/// frame they accompany. Older blocks are dropped once this is exceeded.
+const MAX_BUFFERED_AUDIO_BLOCKS: usize = 64;
 
 /// Video-over-IP receiver for receiving streams.
 #[allow(dead_code)]
@@ -45,6 +49,8 @@ pub struct VideoIpReceiver {
     last_sequence: Option<u16>,
     /// Incomplete frames being assembled.
     frame_assembly: HashMap<u64, FrameAssembly>,
+    /// Decoded audio waiting to be paired with a video frame.
+    audio_buffer: VecDeque<AudioSamples>,
     /// Control message sender.
     control_tx: mpsc::Sender<ControlEvent>,
     /// Control message receiver (for external access).
@@ -78,19 +84,36 @@ pub enum ControlEvent {
 }
 
 impl VideoIpReceiver {
-    /// Creates a new video-over-IP receiver.
+    /// Creates a new video-over-IP receiver for the announced stream formats.
+    ///
+    /// The full [`VideoFormat`] / [`AudioFormat`] is required rather than just
+    /// the codec: an uncompressed stream carries no geometry in its payload and
+    /// PCM carries no sample count, so without the announced resolution and
+    /// sample rate the receiver would have to invent them. Compressed video
+    /// takes its dimensions from the bitstream and ignores the announced
+    /// resolution.
     ///
     /// # Errors
     ///
-    /// Returns an error if the receiver cannot be created.
-    pub async fn new(video_codec: VideoCodec, audio_codec: AudioCodec) -> VideoIpResult<Self> {
+    /// Returns an error if the receiver cannot be created, in particular
+    /// [`VideoIpError::CodecUnimplemented`] if either format names a codec this
+    /// crate cannot honestly decode (see [`crate::codec`]).
+    pub async fn new(
+        video_format: &VideoFormat,
+        audio_format: &AudioFormat,
+    ) -> VideoIpResult<Self> {
         let bind_addr = "0.0.0.0:0"
             .parse()
             .map_err(|e: std::net::AddrParseError| VideoIpError::Transport(e.to_string()))?;
         let transport = UdpTransport::bind(bind_addr).await?;
 
-        let video_decoder = create_video_decoder(video_codec)?;
-        let audio_decoder = create_audio_decoder(audio_codec)?;
+        let video_decoder =
+            create_video_decoder(video_format.codec, Some(video_format.resolution))?;
+        let audio_decoder = create_audio_decoder(
+            audio_format.codec,
+            audio_format.sample_rate,
+            audio_format.channels,
+        )?;
 
         let jitter_buffer = JitterBuffer::new(100, 20);
 
@@ -106,6 +129,7 @@ impl VideoIpReceiver {
             stats: StatsTracker::new(),
             last_sequence: None,
             frame_assembly: HashMap::new(),
+            audio_buffer: VecDeque::new(),
             control_tx,
             control_rx: Arc::new(RwLock::new(control_rx)),
         })
@@ -120,11 +144,8 @@ impl VideoIpReceiver {
         let client = DiscoveryClient::new()?;
         let source = client.discover_by_name(name, 5).await?;
 
-        // Use the discovered codec types
-        let video_codec = source.video_format.codec;
-        let audio_codec = source.audio_format.codec;
-
-        let mut receiver = Self::new(video_codec, audio_codec).await?;
+        // Use the announced stream formats verbatim.
+        let mut receiver = Self::new(&source.video_format, &source.audio_format).await?;
         receiver.source_addr = Some(source.socket_addr());
 
         Ok(receiver)
@@ -137,10 +158,10 @@ impl VideoIpReceiver {
     /// Returns an error if connection fails.
     pub async fn connect(
         addr: SocketAddr,
-        video_codec: VideoCodec,
-        audio_codec: AudioCodec,
+        video_format: &VideoFormat,
+        audio_format: &AudioFormat,
     ) -> VideoIpResult<Self> {
-        let mut receiver = Self::new(video_codec, audio_codec).await?;
+        let mut receiver = Self::new(video_format, audio_format).await?;
         receiver.source_addr = Some(addr);
         Ok(receiver)
     }
@@ -202,9 +223,9 @@ impl VideoIpReceiver {
                 while let Some(packet) = self.jitter_buffer.get_packet() {
                     if packet.header.flags.contains(PacketFlags::VIDEO) {
                         if let Some(frame) = self.process_video_packet(packet)? {
-                            // We have a complete video frame
-                            // Try to get corresponding audio
-                            let audio = self.get_audio_sample().await.ok();
+                            // We have a complete video frame; hand over the
+                            // oldest decoded audio block, if any has arrived.
+                            let audio = self.audio_buffer.pop_front();
                             return Ok((frame, audio));
                         }
                     } else if packet.header.flags.contains(PacketFlags::AUDIO) {
@@ -274,26 +295,29 @@ impl VideoIpReceiver {
     }
 
     /// Decodes a complete video frame.
+    ///
+    /// The transport's keyframe flag and timestamp are handed to the decoder;
+    /// for compressed codecs the decoder overrides the keyframe flag (and the
+    /// dimensions) with what the bitstream actually says.
     fn decode_video_frame(
         &mut self,
         data: Bytes,
-        _is_keyframe: bool,
-        _pts: u64,
+        is_keyframe: bool,
+        pts: u64,
     ) -> VideoIpResult<Option<VideoFrame>> {
-        self.video_decoder.decode(&data)
+        self.video_decoder.decode(&data, pts, is_keyframe)
     }
 
-    /// Processes an audio packet.
-    fn process_audio_packet(&mut self, _packet: Packet) -> VideoIpResult<()> {
-        // Store for later retrieval
-        // In a real implementation, we'd maintain an audio buffer
+    /// Decodes an audio packet and queues it for the next video frame.
+    fn process_audio_packet(&mut self, packet: Packet) -> VideoIpResult<()> {
+        let pts = packet.header.timestamp;
+        if let Some(samples) = self.audio_decoder.decode(&packet.payload, pts)? {
+            if self.audio_buffer.len() >= MAX_BUFFERED_AUDIO_BLOCKS {
+                self.audio_buffer.pop_front();
+            }
+            self.audio_buffer.push_back(samples);
+        }
         Ok(())
-    }
-
-    /// Gets an audio sample if available.
-    async fn get_audio_sample(&mut self) -> VideoIpResult<AudioSamples> {
-        // In a real implementation, retrieve from audio buffer
-        Err(VideoIpError::Timeout)
     }
 
     /// Processes a metadata packet.
@@ -373,23 +397,60 @@ impl VideoIpReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{AudioCodec, Resolution, VideoCodec};
+
+    /// VP9 video (a real decoder) plus PCM audio (a real decoder).
+    fn receivable_formats() -> (VideoFormat, AudioFormat) {
+        let video = VideoFormat::new(
+            VideoCodec::Vp9,
+            Resolution::HD_1080,
+            crate::types::FrameRate::FPS_30,
+        );
+        let audio = AudioFormat::new(AudioCodec::Pcm16, 48000, 2).expect("should succeed in test");
+        (video, audio)
+    }
 
     #[tokio::test]
     async fn test_receiver_creation() {
-        let receiver = VideoIpReceiver::new(VideoCodec::Vp9, AudioCodec::Opus).await;
+        let (video, audio) = receivable_formats();
+        let receiver = VideoIpReceiver::new(&video, &audio).await;
         assert!(receiver.is_ok());
+    }
+
+    /// Opus has no honest decoder, so a receiver cannot claim to accept it.
+    #[tokio::test]
+    async fn test_receiver_rejects_opus() {
+        let (video, _) = receivable_formats();
+        let audio = AudioFormat::new(AudioCodec::Opus, 48000, 2).expect("should succeed in test");
+        let err = VideoIpReceiver::new(&video, &audio)
+            .await
+            .err()
+            .expect("Opus must not be receivable");
+        assert!(
+            matches!(
+                err,
+                VideoIpError::CodecUnimplemented {
+                    codec: "Opus",
+                    operation: "decode",
+                    ..
+                }
+            ),
+            "unexpected error {err}"
+        );
     }
 
     #[tokio::test]
     async fn test_receiver_connect() {
         let addr = "127.0.0.1:5000".parse().expect("should succeed in test");
-        let receiver = VideoIpReceiver::connect(addr, VideoCodec::Vp9, AudioCodec::Opus).await;
+        let (video, audio) = receivable_formats();
+        let receiver = VideoIpReceiver::connect(addr, &video, &audio).await;
         assert!(receiver.is_ok());
     }
 
     #[tokio::test]
     async fn test_receiver_enable_fec() {
-        let mut receiver = VideoIpReceiver::new(VideoCodec::Vp9, AudioCodec::Opus)
+        let (video, audio) = receivable_formats();
+        let mut receiver = VideoIpReceiver::new(&video, &audio)
             .await
             .expect("should succeed in test");
 
@@ -397,11 +458,59 @@ mod tests {
         assert!(receiver.fec_decoder.is_some());
     }
 
+    /// PCM audio packets are really decoded and queued for the next frame.
+    #[tokio::test]
+    async fn test_audio_packets_are_decoded_and_buffered() {
+        let (video, audio) = receivable_formats();
+        let mut receiver = VideoIpReceiver::new(&video, &audio)
+            .await
+            .expect("should succeed in test");
+
+        // 400 bytes = 100 stereo 16-bit samples per channel.
+        let packet = crate::packet::PacketBuilder::new(0)
+            .audio()
+            .with_timestamp(4242)
+            .build(Bytes::from(vec![0u8; 400]))
+            .expect("should succeed in test");
+
+        receiver
+            .process_audio_packet(packet)
+            .expect("PCM decode should succeed");
+
+        let samples = receiver
+            .audio_buffer
+            .pop_front()
+            .expect("decoded audio should be queued");
+        assert_eq!(samples.sample_count, 100);
+        assert_eq!(samples.channels, 2);
+        assert_eq!(samples.sample_rate, 48000);
+        assert_eq!(samples.pts, 4242);
+    }
+
+    /// A payload that is not a whole number of PCM samples is reported, not
+    /// rounded off into a fabricated sample count.
+    #[tokio::test]
+    async fn test_ragged_audio_packet_is_reported() {
+        let (video, audio) = receivable_formats();
+        let mut receiver = VideoIpReceiver::new(&video, &audio)
+            .await
+            .expect("should succeed in test");
+
+        let packet = crate::packet::PacketBuilder::new(0)
+            .audio()
+            .build(Bytes::from(vec![0u8; 401]))
+            .expect("should succeed in test");
+
+        assert!(receiver.process_audio_packet(packet).is_err());
+        assert!(receiver.audio_buffer.is_empty());
+    }
+
     #[test]
     fn test_sequence_check() {
         let rt = tokio::runtime::Runtime::new().expect("should succeed in test");
+        let (video, audio) = receivable_formats();
         let mut receiver = rt
-            .block_on(VideoIpReceiver::new(VideoCodec::Vp9, AudioCodec::Opus))
+            .block_on(VideoIpReceiver::new(&video, &audio))
             .expect("should succeed in test");
 
         receiver.check_sequence(0);
@@ -420,8 +529,9 @@ mod tests {
     #[test]
     fn test_cleanup_old_frames() {
         let rt = tokio::runtime::Runtime::new().expect("should succeed in test");
+        let (video, audio) = receivable_formats();
         let mut receiver = rt
-            .block_on(VideoIpReceiver::new(VideoCodec::Vp9, AudioCodec::Opus))
+            .block_on(VideoIpReceiver::new(&video, &audio))
             .expect("should succeed in test");
 
         // Add an old frame assembly

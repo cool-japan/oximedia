@@ -25,6 +25,12 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 
+# Persistence for the review/comment/task/version/change/notification store
+# (crates/oximedia-review/src/store/). Pure-Rust SQLite via the OxiSQL
+# ecosystem -- no libsqlite3/C dependency.
+oxisql-core = { workspace = true }
+oxisql-sqlite-compat = { workspace = true }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["full"] }
 

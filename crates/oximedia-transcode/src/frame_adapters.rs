@@ -13,19 +13,22 @@
 //! | Adapter                    | Role                                            |
 //! |----------------------------|-------------------------------------------------|
 //! | [`Y4mFrameDecoder`]        | lazy Y4M (YUV4MPEG2) file reader → raw frames   |
+//! | [`Ffv1FrameDecoder`]       | lazy reader for [`crate::raw_sinks::Ffv1RawFileMuxer`] output → raw frames |
 //! | [`FpsResamplingDecoder`]   | `-r` frame-rate conversion (dup/drop) wrapper   |
 //! | [`CodecVideoFrameEncoder`] | any `oximedia_codec` `VideoEncoder` → packets   |
 
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::VecDeque;
+use std::io::Read as _;
 
 use crate::pipeline_context::{Frame, FrameDecoder, FrameEncoder};
 use crate::pipeline_executor::TimestampManager;
 use crate::{Result, TranscodeError};
 
 use oximedia_codec::frame::{Plane, VideoFrame};
-use oximedia_codec::traits::VideoEncoder;
+use oximedia_codec::traits::{VideoDecoder, VideoEncoder};
+use oximedia_codec::Ffv1Decoder;
 use oximedia_container::demux::y4m::{Y4mChroma, Y4mDemuxer};
 use oximedia_core::{PixelFormat, Rational, Timestamp};
 
@@ -72,6 +75,52 @@ pub fn flat_yuv420_to_video_frame(
     ];
     frame.timestamp = Timestamp::new(pts_ms, Rational::new(1, 1_000));
     Ok(frame)
+}
+
+/// Flattens a decoded 8-bit YUV 4:2:0 `VideoFrame` (Y, then U, then V
+/// planes) into the same no-stride-padding layout [`flat_yuv420_to_video_frame`]
+/// consumes — the inverse conversion, used by video decoders (e.g.
+/// [`Ffv1FrameDecoder`]) feeding the flat-buffer [`Frame`] pipeline.
+///
+/// # Errors
+///
+/// Returns [`TranscodeError::CodecError`] if the frame is not 8-bit
+/// `Yuv420p`, does not have exactly 3 planes, or any plane's stride is
+/// wider than its width (this pipeline has no use for stride padding and
+/// would otherwise silently fold garbage padding bytes into the output).
+fn video_frame_to_flat_yuv420(frame: &VideoFrame) -> Result<Vec<u8>> {
+    if frame.format != PixelFormat::Yuv420p {
+        return Err(TranscodeError::CodecError(format!(
+            "expected 8-bit Yuv420p, decoder produced {:?}",
+            frame.format
+        )));
+    }
+    if frame.planes.len() != 3 {
+        return Err(TranscodeError::CodecError(format!(
+            "expected 3 YUV planes, decoder produced {}",
+            frame.planes.len()
+        )));
+    }
+    let expected = yuv420_frame_len(frame.width, frame.height);
+    let mut out = Vec::with_capacity(expected);
+    for (i, plane) in frame.planes.iter().enumerate() {
+        if plane.stride != plane.width as usize {
+            return Err(TranscodeError::CodecError(format!(
+                "plane {i} has stride {} but width {} (padded planes are not supported)",
+                plane.stride, plane.width
+            )));
+        }
+        out.extend_from_slice(&plane.data);
+    }
+    if out.len() != expected {
+        return Err(TranscodeError::CodecError(format!(
+            "assembled {} bytes but {}x{} YUV 4:2:0 requires {expected}",
+            out.len(),
+            frame.width,
+            frame.height
+        )));
+    }
+    Ok(out)
 }
 
 // ─── Y4mFrameDecoder ──────────────────────────────────────────────────────────
@@ -175,6 +224,181 @@ impl FrameDecoder for Y4mFrameDecoder {
 
     fn eof(&self) -> bool {
         self.done
+    }
+}
+
+// ─── Ffv1FrameDecoder ─────────────────────────────────────────────────────────
+
+/// A [`FrameDecoder`] over [`crate::raw_sinks::Ffv1RawFileMuxer`] output.
+///
+/// Every packet is decoded with a **fresh** context-state via
+/// [`VideoDecoder::reset`] between frames: the frame-level FFV1 encoder
+/// always configures `keyint = 1` (every packet is an independently
+/// intra-coded frame — see `codec_dispatch::make_ffv1_encoder`), so
+/// correctness never depends on adaptive range-coder state surviving
+/// across packets. Resetting proactively sidesteps relying on the
+/// decoder's own internal keyframe bookkeeping.
+pub struct Ffv1FrameDecoder {
+    decoder: Ffv1Decoder,
+    width: u32,
+    height: u32,
+    fps: (u32, u32),
+    /// Remaining `[len][payload]`-framed packets, in file order.
+    remaining: VecDeque<Vec<u8>>,
+    frame_index: u64,
+    done: bool,
+}
+
+impl Ffv1FrameDecoder {
+    /// Opens a [`crate::raw_sinks::Ffv1RawFileMuxer`]-written file and
+    /// parses its header + frame table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscodeError::InvalidInput`] if the file cannot be read,
+    /// is too short, does not start with the expected magic, or is
+    /// internally truncated; [`TranscodeError::Unsupported`] for an
+    /// unrecognized format version; [`TranscodeError::CodecError`] if the
+    /// embedded extradata cannot initialize an [`Ffv1Decoder`].
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .map_err(|e| {
+                TranscodeError::IoError(format!(
+                    "cannot open raw FFV1 input '{}': {e}",
+                    path.display()
+                ))
+            })?;
+
+        let magic = crate::raw_sinks::FFV1_RAW_MAGIC;
+        if bytes.len() < magic.len() + 1 + 16 + 4 || bytes[..magic.len()] != magic[..] {
+            return Err(TranscodeError::InvalidInput(format!(
+                "'{}' is not a raw FFV1 file written by Ffv1RawFileMuxer (bad magic)",
+                path.display()
+            )));
+        }
+        let version = bytes[magic.len()];
+        if version != 1 {
+            return Err(TranscodeError::Unsupported(format!(
+                "raw FFV1 file format version {version} is not supported \
+                 (this build writes/reads version 1)"
+            )));
+        }
+
+        let read_u32 = |b: &[u8], o: usize| -> u32 {
+            u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+        };
+
+        let mut off = magic.len() + 1;
+        let width = read_u32(&bytes, off);
+        off += 4;
+        let height = read_u32(&bytes, off);
+        off += 4;
+        let fps_num = read_u32(&bytes, off);
+        off += 4;
+        let fps_den = read_u32(&bytes, off);
+        off += 4;
+        let extradata_len = read_u32(&bytes, off) as usize;
+        off += 4;
+        if off + extradata_len > bytes.len() {
+            return Err(TranscodeError::InvalidInput(format!(
+                "'{}' is truncated: extradata declares {extradata_len} bytes past EOF",
+                path.display()
+            )));
+        }
+        let extradata = &bytes[off..off + extradata_len];
+        off += extradata_len;
+
+        let decoder = Ffv1Decoder::with_extradata(extradata)
+            .map_err(|e| TranscodeError::CodecError(format!("FFV1 extradata rejected: {e}")))?;
+
+        let mut remaining = VecDeque::new();
+        while off + 4 <= bytes.len() {
+            let len = read_u32(&bytes, off) as usize;
+            off += 4;
+            if off + len > bytes.len() {
+                return Err(TranscodeError::InvalidInput(format!(
+                    "'{}' is truncated: a frame declares {len} bytes past EOF",
+                    path.display()
+                )));
+            }
+            remaining.push_back(bytes[off..off + len].to_vec());
+            off += len;
+        }
+
+        Ok(Self {
+            decoder,
+            width,
+            height,
+            fps: (fps_num.max(1), fps_den.max(1)),
+            remaining,
+            frame_index: 0,
+            done: false,
+        })
+    }
+
+    /// Source frame dimensions.
+    #[must_use]
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Source frame rate as a `(numerator, denominator)` pair.
+    #[must_use]
+    pub fn fps(&self) -> (u32, u32) {
+        self.fps
+    }
+}
+
+impl FrameDecoder for Ffv1FrameDecoder {
+    fn decode_next(&mut self) -> Option<Frame> {
+        if self.done {
+            return None;
+        }
+        let Some(packet) = self.remaining.pop_front() else {
+            self.done = true;
+            return None;
+        };
+        let pts_ms = (self
+            .frame_index
+            .saturating_mul(1_000)
+            .saturating_mul(u64::from(self.fps.1))
+            / u64::from(self.fps.0)) as i64;
+        self.frame_index += 1;
+
+        // Proactive per-frame reset — see the struct doc for why.
+        self.decoder.reset();
+        if let Err(e) = self.decoder.send_packet(&packet, pts_ms) {
+            tracing::warn!("FFV1 decode error treated as EOF: {e}");
+            self.done = true;
+            return None;
+        }
+        let frame = match self.decoder.receive_frame() {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                tracing::warn!("FFV1 decoder produced no frame for a packet; treating as EOF");
+                self.done = true;
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("FFV1 decode error treated as EOF: {e}");
+                self.done = true;
+                return None;
+            }
+        };
+        match video_frame_to_flat_yuv420(&frame) {
+            Ok(data) => Some(Frame::video(data, pts_ms, self.width, self.height)),
+            Err(e) => {
+                tracing::warn!("FFV1 decoded frame rejected: {e}");
+                self.done = true;
+                None
+            }
+        }
+    }
+
+    fn eof(&self) -> bool {
+        self.done || self.remaining.is_empty()
     }
 }
 
@@ -351,6 +575,7 @@ impl FrameEncoder for RawVideoFrameEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "mjpeg")]
     use crate::pipeline_context::FilterGraph;
 
     /// Build a flat YUV420 frame with distinct plane fills.

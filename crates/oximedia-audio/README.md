@@ -6,7 +6,7 @@ Audio codec implementations and DSP tools for the OxiMedia multimedia framework.
 
 Part of the [oximedia](https://github.com/cool-japan/oximedia) workspace — a comprehensive pure-Rust media processing framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 ## Overview
 
@@ -28,7 +28,7 @@ Enable specific codecs via Cargo features (all enabled by default):
 
 ```toml
 [dependencies]
-oximedia-audio = { version = "0.1.9", features = ["opus", "vorbis", "flac", "mp3"] }
+oximedia-audio = { version = "0.2.0", features = ["opus", "vorbis", "flac", "mp3"] }
 ```
 
 ### DSP

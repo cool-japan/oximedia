@@ -468,7 +468,7 @@ impl SeparableFilter {
 // ---------------------------------------------------------------------------
 
 /// Apply a separable 2D convolution kernel to a `u8` image using tiled rayon
-/// parallelism.
+/// parallelism (sequential tile processing on `wasm32`, which has no threads).
 ///
 /// # Parameters
 ///
@@ -497,7 +497,7 @@ pub fn convolve_tiled(
     kernel: &[f32],
     tile_size: u32,
 ) -> Vec<u8> {
-    use rayon::prelude::*;
+    use crate::parallel::map_slice;
 
     let w = w as usize;
     let h = h as usize;
@@ -609,9 +609,8 @@ pub fn convolve_tiled(
     // ── Process tiles in parallel ───────────────────────────────────────
     // Each tile: extract halo-padded slice → horiz pass → vert pass →
     // u8 result for (tile_w × tile_h × channels).
-    let tile_results: Vec<(usize, usize, usize, usize, Vec<u8>)> = tile_descs
-        .par_iter()
-        .map(|&(ox, oy, tw, th)| {
+    let tile_results: Vec<(usize, usize, usize, usize, Vec<u8>)> =
+        map_slice(&tile_descs, |&(ox, oy, tw, th)| {
             // Expanded read region including halo
             let read_x_start = ox.saturating_sub(pad);
             let read_y_start = oy.saturating_sub(pad);
@@ -689,8 +688,7 @@ pub fn convolve_tiled(
             // suppress warnings from the unused local variables for rw/rh
             let _ = (rw, rh, read_x_start, read_y_start);
             (ox, oy, tw, th, tile_out)
-        })
-        .collect();
+        });
 
     // ── Reassemble ──────────────────────────────────────────────────────
     let mut dst = vec![0u8; w * h * channels];

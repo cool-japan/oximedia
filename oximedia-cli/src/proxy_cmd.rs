@@ -383,7 +383,7 @@ async fn run_generate(
 
     for input_path in inputs {
         if !input_path.is_file() {
-            if !json_output {
+            if !json_output && !crate::progress::is_quiet() {
                 println!(
                     "  {} {} (not a file)",
                     "Skip:".yellow(),
@@ -449,7 +449,7 @@ async fn run_generate(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Proxy Generation".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Output:", output.display());
@@ -589,7 +589,7 @@ async fn run_link(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Proxy Linked".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "ID:", record.id);
@@ -716,7 +716,7 @@ async fn run_clean(
         });
         let s = serde_json::to_string_pretty(&result).context("Failed to serialize")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Proxy Cleanup".green().bold());
         println!("{}", "=".repeat(60));
         if dry_run {

@@ -33,6 +33,10 @@ memmap2 = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["full"] }
+# Process enumeration for GameCapture::auto_detect. Pure Rust (no build.rs,
+# no C compiler needed) but its process-listing backend is only meaningful
+# on desktop OSes, so it is scoped out of wasm32 like tokio above.
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 

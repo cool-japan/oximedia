@@ -41,6 +41,8 @@
 
 #![forbid(unsafe_code)]
 
+use crate::{AudioError, AudioResult};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,7 +109,11 @@ struct ChannelState {
 }
 
 impl ChannelState {
-    fn new(rms_window_samples: usize, peak_hold_samples: usize, overload_threshold_db: f64) -> Self {
+    fn new(
+        rms_window_samples: usize,
+        peak_hold_samples: usize,
+        overload_threshold_db: f64,
+    ) -> Self {
         let overload_threshold_linear = db_to_linear(overload_threshold_db);
         Self {
             rms_buf: vec![0.0; rms_window_samples.max(1)],
@@ -327,9 +333,14 @@ impl BatchMeterProcessor {
     ///
     /// # Errors
     ///
-    /// Returns `Err(())` if `channel` is out of range.
-    pub fn process_channel(&mut self, channel: usize, samples: &[f32]) -> Result<(), ()> {
-        let state = self.states.get_mut(channel).ok_or(())?;
+    /// Returns [`AudioError::InvalidParameter`] if `channel` is out of range.
+    pub fn process_channel(&mut self, channel: usize, samples: &[f32]) -> AudioResult<()> {
+        let channels = self.config.channels;
+        let state = self.states.get_mut(channel).ok_or_else(|| {
+            AudioError::InvalidParameter(format!(
+                "batch meter channel {channel} out of range (have {channels})"
+            ))
+        })?;
         for &s in samples {
             state.push_sample(f64::from(s));
         }
@@ -455,7 +466,7 @@ mod tests {
         BatchMeterConfig {
             channels,
             sample_rate: 48_000.0,
-            rms_window_ms: 10.0,   // short window for fast test convergence
+            rms_window_ms: 10.0, // short window for fast test convergence
             peak_hold_ms: 500.0,
             overload_threshold_db: -0.1,
         }
@@ -485,9 +496,7 @@ mod tests {
     #[test]
     fn test_full_scale_peak() {
         let mut proc = BatchMeterProcessor::new(make_config(1));
-        let samples: Vec<f32> = (0..1024)
-            .map(|i| (i as f32 * 0.01).sin())
-            .collect();
+        let samples: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.01).sin()).collect();
         proc.process_interleaved(&samples);
         let peak = proc.peak_dbfs(0).expect("channel exists");
         // Peak of a sine with amplitude ~1 should be close to 0 dBFS
@@ -517,8 +526,8 @@ mod tests {
         let mut proc = BatchMeterProcessor::new(make_config(2));
         // Ch 0: below threshold; Ch 1: at threshold
         let samples: Vec<f32> = vec![
-            0.5,  // ch 0 – below -0.1 dBFS
-            1.0,  // ch 1 – exactly 0 dBFS (above -0.1 dBFS threshold)
+            0.5, // ch 0 – below -0.1 dBFS
+            1.0, // ch 1 – exactly 0 dBFS (above -0.1 dBFS threshold)
         ];
         proc.process_interleaved(&samples);
         assert!(!proc.channel_overload(0), "ch0 should not overload");
@@ -535,9 +544,15 @@ mod tests {
         proc.reset();
         let r = proc.reading();
         for &p in &r.peak_dbfs {
-            assert!(p <= SILENCE_DB + 1.0, "after reset, expected silence, got {p}");
+            assert!(
+                p <= SILENCE_DB + 1.0,
+                "after reset, expected silence, got {p}"
+            );
         }
-        assert!(!proc.any_overload(), "overload flag should be cleared after reset");
+        assert!(
+            !proc.any_overload(),
+            "overload flag should be cleared after reset"
+        );
         assert_eq!(proc.frames_processed(), 0);
     }
 
@@ -604,7 +619,7 @@ mod tests {
 
         assert!(r.max_peak_dbfs > r.peak_dbfs[0], "max should exceed ch0");
         assert!(r.any_overload || !r.any_overload); // just checking it compiles
-        // ch2 at 0.9 is below the -0.1 dBFS threshold (0.9 < ~0.989) → no overload
+                                                    // ch2 at 0.9 is below the -0.1 dBFS threshold (0.9 < ~0.989) → no overload
         assert!(!r.any_overload, "0.9 is below -0.1 dBFS threshold");
     }
 

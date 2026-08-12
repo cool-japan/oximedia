@@ -42,9 +42,9 @@
 //!
 //! | Codec | Encode | Decode | Bit Depths | Chroma |
 //! |-------|--------|--------|------------|--------|
-//! | AV1 | ✓ | keyframe/intra ✓ (8-bit 4:2:0 profile 0, bit-exact vs dav1d/aomdec incl. deblock, CDEF and loop restoration; superres, film grain, palette, intrabc, qmatrix, 10/12-bit and inter are honest `Err`) | 8 | 4:2:0 |
-//! | VP9 | ✓ | keyframe/intra ✓ (8-bit 4:2:0, bit-exact vs libvpx); inter not yet (honest `Err`) | 8 | 4:2:0 |
-//! | VP8 | ✓ | keyframe/intra ✓ (full RFC 6386 pipeline); inter not yet (honest `Err`) | 8 | 4:2:0 |
+//! | AV1 | encodes, but the output is not decodable by a reference decoder — see `docs/rate_control.md` | keyframe/intra ✓ (8-bit 4:2:0 profile 0, bit-exact vs dav1d/aomdec incl. deblock, CDEF and loop restoration; superres, film grain, palette, intrabc, qmatrix, 10/12-bit and inter are honest `Err`) | 8 | 4:2:0 |
+//! | VP9 | encodes, but the output is not decodable by a reference decoder — see `docs/rate_control.md` | keyframe/intra **and** inter ✓ (8-bit 4:2:0, bit-exact vs libvpx on 10 conformance streams via the public `VideoDecoder` API; inter-frame segmentation and reference scaling remain honest `Err` refusals at a pinned packet index) | 8 | 4:2:0 |
+//! | VP8 | encodes, but the output is not decodable by a reference decoder — see `docs/rate_control.md` | keyframe/intra **and** inter ✓ (full RFC 6386 pipeline incl. motion compensation and golden/altref management; bit-exact vs libvpx on 5 multi-frame conformance streams) | 8 | 4:2:0 |
 //! | Theora | ✓ | ✓ | 8 | 4:2:0 |
 //! | MJPEG | ✓ | ✓ | 8 | 4:2:0, 4:2:2, 4:4:4 |
 //! | APV | ✓ | ✓ | 8, 10, 12 | 4:2:0, 4:2:2, 4:4:4 |
@@ -52,11 +52,11 @@
 //! | H.263 | ✓ | ✓ | 8 | 4:2:0 |
 //! | ProRes 422 | ✓ | ✓ | 10 | 4:2:2 |
 //! | JPEG-XL | ✓ | ✓ | 8, 10, 12 | 4:2:0, 4:2:2, 4:4:4 |
-//! | AVIF/AV1 | ✓ | not supported (honest `Err`; depends on the AV1 decoder gap) | 8, 10, 12 | 4:2:0, 4:4:4 |
+//! | AVIF/AV1 | ✓ | ✓ (8-bit 4:2:0 colour items via the AV1 keyframe decoder; byte-identical to ffmpeg's own dav1d decode on a real ffmpeg+libaom fixture; alpha and 10/12-bit items honest `Err`) | 8, 10, 12 | 4:2:0, 4:4:4 |
 //! | APNG/PNG | ✓ | ✓ | 8, 16 | RGBA, Grayscale |
 //! | GIF | ✓ | ✓ | 8 | Paletted |
-//! | WebP | ✓ | ✓ (lossless VP8L only; no lossy VP8 WebP decode) | 8 | 4:2:0 (lossy), lossless |
-//! | Opus | ✓ (CELT + SILK; Hybrid encode not implemented) | ✓ (CELT + SILK + Hybrid) | — | Mono/Stereo/Surround |
+//! | WebP | ✓ (lossy VP8 rebuilt to RFC 6386 in 0.2.1; round-trips through this crate's own bit-exact decoder — no external libwebp validation yet) | ✓ (VP8L lossless **and** VP8 lossy, via the existing bit-exact `vp8::decode_keyframe`; verified against `dwebp -yuv` on 3 real-bitstream vectors; VP8L-compressed alpha honest `Err`, uncompressed alpha works) | 8 | 4:2:0 (lossy), lossless |
+//! | Opus | ✓ (CELT + SILK; Hybrid encode not implemented) | Bitstream-parsing (decode returns silence / out-of-range output on real packets) | — | Mono/Stereo/Surround |
 //! | Vorbis | ✓ | not yet (honest `Err`; headers parse) | — | Mono/Stereo/Surround |
 //! | FLAC | ✓ | ✓ | 16, 24 | Mono/Stereo/Multi |
 //! | PCM | ✓ | ✓ | 8, 16, 24, 32, f32 | Any |
@@ -65,7 +65,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oximedia-codec = { version = "0.2.0", features = ["av1", "vp9", "opus", "jpegxl"] }
+//! oximedia-codec = { version = "0.2.1", features = ["av1", "vp9", "opus", "jpegxl"] }
 //! ```
 //!
 //! Available features: `av1` (default), `vp9`, `vp8`, `theora`, `h263`, `opus`,

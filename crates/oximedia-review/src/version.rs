@@ -67,6 +67,13 @@ impl Version {
 
 /// Create a new version.
 ///
+/// `number` is assigned as one past however many versions already exist for
+/// `session_id`, and `parent_id` is set to the latest existing version (by
+/// number) for the session, if any -- so repeated calls for the same session
+/// build a linear version chain rather than every version claiming to be
+/// version 1 with no parent. A [`timeline::EventType::Created`] event is
+/// recorded for the new version (see [`timeline::get_timeline_events`]).
+///
 /// # Errors
 ///
 /// Returns error if version creation fails.
@@ -75,10 +82,19 @@ pub async fn create_version(
     label: String,
     content_url: String,
 ) -> ReviewResult<Version> {
+    let store = crate::store::default_store().await?;
+    let existing = store.list_versions_by_session(session_id).await?;
+    let number = u32::try_from(existing.len())
+        .map_err(|e| crate::error::ReviewError::Other(format!("too many versions: {e}")))?
+        + 1;
+    let parent_id = existing.last().map(|v| v.id);
+    let created_by = "system".to_string();
+    let created_at = Utc::now();
+
     let version = Version {
         id: VersionId::new(),
         session_id,
-        number: 1,
+        number,
         label,
         description: None,
         content_url,
@@ -87,10 +103,22 @@ pub async fn create_version(
         duration_frames: 0,
         frame_rate: 24.0,
         resolution: (1920, 1080),
-        created_by: "system".to_string(),
-        created_at: Utc::now(),
-        parent_id: None,
+        created_by: created_by.clone(),
+        created_at,
+        parent_id,
     };
+
+    store.insert_version(&version).await?;
+
+    let event = timeline::TimelineEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        version_id: version.id,
+        event_type: timeline::EventType::Created,
+        description: format!("Version {} created", version.number),
+        user: created_by,
+        timestamp: created_at,
+    };
+    store.insert_timeline_event(&event, session_id).await?;
 
     Ok(version)
 }
@@ -101,22 +129,18 @@ pub async fn create_version(
 ///
 /// Returns error if version not found.
 pub async fn get_version(version_id: VersionId) -> ReviewResult<Version> {
-    // In a real implementation, this would load from database
-    let _ = version_id;
-    Err(crate::error::ReviewError::VersionNotFound(
-        version_id.to_string(),
-    ))
+    let store = crate::store::default_store().await?;
+    store.get_version(version_id).await
 }
 
-/// List all versions for a session.
+/// List all versions for a session, ordered by version number ascending.
 ///
 /// # Errors
 ///
 /// Returns error if listing fails.
 pub async fn list_versions(session_id: SessionId) -> ReviewResult<Vec<Version>> {
-    // In a real implementation, this would query database
-    let _ = session_id;
-    Ok(Vec::new())
+    let store = crate::store::default_store().await?;
+    store.list_versions_by_session(session_id).await
 }
 
 /// Delete a version.
@@ -125,8 +149,8 @@ pub async fn list_versions(session_id: SessionId) -> ReviewResult<Vec<Version>> 
 ///
 /// Returns error if deletion fails.
 pub async fn delete_version(version_id: VersionId) -> ReviewResult<()> {
-    let _ = version_id;
-    Ok(())
+    let store = crate::store::default_store().await?;
+    store.delete_version(version_id).await
 }
 
 #[cfg(test)]
@@ -147,6 +171,75 @@ mod tests {
         let version = result.expect("should succeed in test");
         assert_eq!(version.number, 1);
         assert!(version.is_initial());
+    }
+
+    #[tokio::test]
+    async fn test_create_version_chains_number_and_parent() {
+        // Uses a fresh, never-before-seen session ID, so this is
+        // deterministic even when other tests share the process-wide
+        // default store.
+        let session_id = SessionId::new();
+
+        let v1 = create_version(session_id, "v1".to_string(), "url1".to_string())
+            .await
+            .expect("v1 should succeed");
+        assert_eq!(v1.number, 1);
+        assert_eq!(v1.parent_id, None);
+
+        let v2 = create_version(session_id, "v2".to_string(), "url2".to_string())
+            .await
+            .expect("v2 should succeed");
+        assert_eq!(v2.number, 2);
+        assert_eq!(v2.parent_id, Some(v1.id));
+
+        let v3 = create_version(session_id, "v3".to_string(), "url3".to_string())
+            .await
+            .expect("v3 should succeed");
+        assert_eq!(v3.number, 3);
+        assert_eq!(v3.parent_id, Some(v2.id));
+
+        let listed = list_versions(session_id)
+            .await
+            .expect("list should succeed");
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].id, v1.id);
+        assert_eq!(listed[1].id, v2.id);
+        assert_eq!(listed[2].id, v3.id);
+    }
+
+    #[tokio::test]
+    async fn test_get_and_delete_version() {
+        let session_id = SessionId::new();
+        let version = create_version(session_id, "v1".to_string(), "url".to_string())
+            .await
+            .expect("create should succeed");
+
+        let loaded = get_version(version.id).await.expect("get should succeed");
+        assert_eq!(loaded.id, version.id);
+        assert_eq!(loaded.label, "v1");
+
+        delete_version(version.id)
+            .await
+            .expect("delete should succeed");
+        let result = get_version(version.id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_version_not_found() {
+        let result = get_version(VersionId::new()).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::ReviewError::VersionNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_list_versions_empty_for_fresh_session() {
+        let versions = list_versions(SessionId::new())
+            .await
+            .expect("list should succeed");
+        assert!(versions.is_empty());
     }
 
     #[test]

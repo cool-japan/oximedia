@@ -163,6 +163,12 @@ pub enum GamingError {
     #[error("Audio mixing error: {0}")]
     AudioMixingError(String),
 
+    /// The requested operation needs a platform-specific facility (an OS
+    /// process-enumeration API, an OS-level input hook, ...) that is not
+    /// available on the current target or not implemented by this crate.
+    #[error("Unsupported on this platform: {0}")]
+    UnsupportedPlatform(String),
+
     /// Core error
     #[error("Core error: {0}")]
     Core(#[from] OxiError),

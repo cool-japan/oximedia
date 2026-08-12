@@ -6,7 +6,7 @@ High-level transcoding pipeline for OxiMedia with professional features and indu
 
 Part of the [oximedia](https://github.com/cool-japan/oximedia) workspace — a comprehensive pure-Rust media processing framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 ## Features
 
@@ -36,7 +36,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-transcode = "0.1.9"
+oximedia-transcode = "0.2.0"
 ```
 
 ```rust

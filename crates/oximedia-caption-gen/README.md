@@ -8,7 +8,7 @@ Advanced caption and subtitle generation — speech alignment, line breaking, WC
 
 Part of the [OxiMedia](https://github.com/cool-japan/oximedia) sovereign media framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 ## Features
 
@@ -27,7 +27,7 @@ Version: 0.2.0 — 2026-07-15 — extensively tested
 
 ```toml
 [dependencies]
-oximedia-caption-gen = "0.1.9"
+oximedia-caption-gen = "0.2.0"
 ```
 
 ### Speech Alignment and Caption Blocks

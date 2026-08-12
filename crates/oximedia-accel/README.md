@@ -8,7 +8,7 @@ Vulkan compute backend for systems that want real GPU dispatch via `vulkano`.
 
 Part of the [oximedia](https://github.com/cool-japan/oximedia) workspace — a comprehensive pure-Rust media processing framework.
 
-Version: 0.2.0 — 409+ tests
+Version: 0.2.1 — 409+ tests
 
 ## Features
 
@@ -47,7 +47,7 @@ These prerequisites are only needed when explicitly opting in:
 
 ```toml
 [dependencies]
-oximedia-accel = { version = "0.1.9", features = ["vulkan-backend"] }
+oximedia-accel = { version = "0.2.0", features = ["vulkan-backend"] }
 ```
 
 Without `vulkan-backend` (the default), `vulkano`/`vulkano-shaders` are not
@@ -69,7 +69,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-accel = "0.1.9"
+oximedia-accel = "0.2.0"
 ```
 
 ```rust

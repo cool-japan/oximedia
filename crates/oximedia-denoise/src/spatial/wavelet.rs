@@ -54,7 +54,7 @@ pub fn wavelet_denoise(
 
             wavelet_denoise_plane(
                 input_plane.data.as_ref(),
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,

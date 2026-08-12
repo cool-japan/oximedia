@@ -714,7 +714,15 @@ fn pf_is_yuv420(f: &PixelFormat) -> bool {
 
 /// Helper — returns `true` if `f` belongs to the YUV 4:2:2 family.
 fn pf_is_yuv422(f: &PixelFormat) -> bool {
-    matches!(f, PixelFormat::Yuv422p)
+    // The packed capture formats belong to the 4:2:2 family too, so a
+    // Yuyv422/Uyvy422 <-> Yuv422p negotiation scores as a same-family
+    // conversion rather than "other family". (The 10/12/16-bit planar
+    // variants predate this helper and are deliberately left unlisted so
+    // their negotiation cost does not silently change here.)
+    matches!(
+        f,
+        PixelFormat::Yuv422p | PixelFormat::Yuyv422 | PixelFormat::Uyvy422
+    )
 }
 
 /// Helper — returns `true` if `f` belongs to the YUV 4:4:4 family.

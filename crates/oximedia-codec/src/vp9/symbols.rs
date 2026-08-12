@@ -14,14 +14,74 @@
 #![allow(clippy::fn_params_excessive_bools)]
 
 use super::bitstream::BoolDecoder;
-use super::compressed::ReferenceMode;
-use super::inter::{CompoundMode, InterMode, RefFrameType};
 use super::intra::IntraMode;
 use super::mv::{MotionVector, MvClass, MvJoint};
 use super::partition::{Partition, TxSize};
 use super::probability::{FrameContext, Prob, INTRA_MODES};
 use super::segmentation::MAX_SEGMENTS;
 use crate::error::{CodecError, CodecResult};
+
+// =============================================================================
+// Inter / Reference Frame Types
+// =============================================================================
+//
+// `InterMode` and `RefFrameType` used to live in the now-deleted `vp9::inter`
+// (VP9 PACKAGE P13: superseded by the real decode path in `vp9::dec`, whose
+// `INTER_MODES` / reference-frame handling has its own libvpx-verified
+// constants). These two enums are the correct VP9 shapes — unlike the rest of
+// that module (`COMPOUND_MODES = 8` was AV1's count, not VP9's) — and this
+// file is their one remaining real consumer, so they were relocated here
+// rather than deleted. Only the pieces this file (and its tests) use came
+// along: the mode-index -> variant lookup, not the `MvRefType` conversions
+// `vp9::inter::RefFrameType` also carried.
+
+/// Inter prediction mode.
+///
+/// These modes describe how motion vectors are derived for inter blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+#[repr(u8)]
+pub enum InterMode {
+    /// Use the nearest motion vector from spatial neighbors.
+    #[default]
+    NearestMv = 0,
+    /// Use the near motion vector from spatial neighbors.
+    NearMv = 1,
+    /// Use a zero motion vector.
+    ZeroMv = 2,
+    /// Use a new motion vector read from the bitstream.
+    NewMv = 3,
+}
+
+impl InterMode {
+    /// Converts from u8 value to `InterMode`.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::NearestMv),
+            1 => Some(Self::NearMv),
+            2 => Some(Self::ZeroMv),
+            3 => Some(Self::NewMv),
+            _ => None,
+        }
+    }
+}
+
+/// Reference frame type for VP9.
+///
+/// VP9 supports three inter reference frames and one intra (no reference) type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+#[repr(u8)]
+pub enum RefFrameType {
+    /// Intra prediction (no reference frame).
+    #[default]
+    Intra = 0,
+    /// Last decoded frame.
+    Last = 1,
+    /// Golden reference frame.
+    Golden = 2,
+    /// Alternate reference frame.
+    AltRef = 3,
+}
 
 // =============================================================================
 // Boolean Decoder Extension

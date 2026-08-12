@@ -60,12 +60,13 @@ impl RicePartition {
     /// Returns error if decoding fails.
     #[allow(dead_code)]
     pub fn decode_value(&self, bits: &mut dyn Iterator<Item = bool>) -> Result<i32, AudioError> {
-        // Count unary part (number of 1 bits before 0)
+        // Count unary part: RFC 9639 section 9.2.7 — zero bits before a
+        // terminating one bit.
         let mut quotient = 0u32;
         loop {
             match bits.next() {
-                Some(true) => quotient += 1,
-                Some(false) => break,
+                Some(false) => quotient += 1,
+                Some(true) => break,
                 None => return Err(AudioError::NeedMoreData),
             }
         }
@@ -136,14 +137,20 @@ impl RiceDecoder {
         }
     }
 
-    /// Calculate samples per partition.
+    /// Get the number of residual samples in the **first** Rice partition.
+    ///
+    /// Per the FLAC spec, partition 0 is `predictor_order` samples shorter than
+    /// every other partition, because the warmup samples occupy that space
+    /// instead of being Rice-coded. Every later partition has exactly
+    /// `block_size >> partition_order` samples with no such adjustment — this
+    /// helper only covers the first partition's (shorter) size.
     #[must_use]
     pub fn samples_per_partition(&self, block_size: usize, predictor_order: usize) -> usize {
         let partition_count = self.partition_count();
         if partition_count == 0 {
             return 0;
         }
-        (block_size - predictor_order) / partition_count
+        (block_size >> self.partition_order).saturating_sub(predictor_order)
     }
 
     /// Decode all residuals.
@@ -196,12 +203,13 @@ impl RiceDecoder {
         bits: &mut dyn Iterator<Item = bool>,
         parameter: u8,
     ) -> Result<i32, AudioError> {
-        // Count unary part
+        // Count unary part: RFC 9639 section 9.2.7 — zero bits before a
+        // terminating one bit.
         let mut quotient = 0u32;
         loop {
             match bits.next() {
-                Some(true) => quotient += 1,
-                Some(false) => break,
+                Some(false) => quotient += 1,
+                Some(true) => break,
                 None => return Err(AudioError::NeedMoreData),
             }
         }
@@ -273,14 +281,17 @@ impl<'a> BitReader<'a> {
         Some(value)
     }
 
-    /// Read unary coded value (count of 1 bits before 0).
+    /// Read unary coded value (count of 0 bits before a terminating 1 bit).
+    ///
+    /// Per RFC 9639 section 9.2.7, FLAC's unary coding is zero bits
+    /// terminated by a one bit.
     #[must_use]
     pub fn read_unary(&mut self) -> Option<u32> {
         let mut count = 0u32;
         loop {
             match self.read_bit() {
-                Some(true) => count += 1,
-                Some(false) => return Some(count),
+                Some(false) => count += 1,
+                Some(true) => return Some(count),
                 None => return None,
             }
         }
@@ -365,9 +376,10 @@ mod tests {
     #[test]
     fn test_samples_per_partition() {
         let decoder = RiceDecoder::new(2, 0);
-        // 4096 samples, order 4, 4 partitions
-        // (4096 - 4) / 4 = 1023
-        assert_eq!(decoder.samples_per_partition(4096, 4), 1023);
+        // 4096 samples, predictor order 4, 4 partitions: first partition is
+        // (4096 >> 2) - 4 = 1024 - 4 = 1020 samples (spec: shorter by the
+        // predictor order; every later partition has the full 1024).
+        assert_eq!(decoder.samples_per_partition(4096, 4), 1020);
     }
 
     #[test]
@@ -392,11 +404,11 @@ mod tests {
 
     #[test]
     fn test_bit_reader_read_unary() {
-        let data = vec![0b11101000];
+        let data = vec![0b0001_0100];
         let mut reader = BitReader::new(&data);
 
-        assert_eq!(reader.read_unary(), Some(3)); // 111 followed by 0
-        assert_eq!(reader.read_unary(), Some(1)); // 1 followed by 0
+        assert_eq!(reader.read_unary(), Some(3)); // 000 followed by 1
+        assert_eq!(reader.read_unary(), Some(1)); // 0 followed by 1
     }
 
     #[test]

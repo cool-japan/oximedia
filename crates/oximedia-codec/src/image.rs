@@ -468,27 +468,14 @@ impl ImageDecoder {
     /// Decode a VP8 lossy bitstream to an RGB24 `VideoFrame`.
     #[cfg(feature = "vp8")]
     fn decode_vp8_to_frame(data: &[u8], _width: u32, _height: u32) -> CodecResult<VideoFrame> {
-        use crate::traits::{DecoderConfig, VideoDecoder};
-        use crate::vp8::Vp8Decoder;
-
-        let config = DecoderConfig::default();
-        let mut decoder = Vp8Decoder::new(config)?;
-        decoder.send_packet(data, 0)?;
-        let yuv_frame = decoder
-            .receive_frame()?
-            .ok_or_else(|| CodecError::DecoderError("VP8 decoder produced no frame".into()))?;
-
-        // VP8 decoder produces YUV420p; convert to RGB24
-        if yuv_frame.format == PixelFormat::Yuv420p {
-            convert_yuv420p_to_rgb(&yuv_frame)
-        } else if yuv_frame.format == PixelFormat::Rgb24 {
-            Ok(yuv_frame)
-        } else {
-            Err(CodecError::UnsupportedFeature(format!(
-                "VP8 decoder produced unexpected format: {}",
-                yuv_frame.format
-            )))
-        }
+        // Delegates to the dedicated `webp::vp8_decoder` module (bit-exact
+        // vs libwebp; see `crates/oximedia-codec/tests/webp_vp8_lossy.rs`)
+        // rather than driving a full `Vp8Decoder` `VideoDecoder` state
+        // machine for what is always exactly one still-image key frame, so
+        // there is a single lossy-WebP decode implementation, not two. Both
+        // ultimately call the same `vp8::decode_keyframe` pipeline.
+        let yuv_frame = crate::webp::vp8_decoder::decode_vp8_keyframe(data)?;
+        convert_yuv420p_to_rgb(&yuv_frame)
     }
 
     /// Decode a VP8 lossy bitstream to an RGB24 `VideoFrame` (stub when vp8 feature disabled).
@@ -730,9 +717,18 @@ pub fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
 
 /// Convert a video frame from RGB to YUV420p format.
 ///
+/// Chroma planes are sized by ceiling division (`div_ceil(2)`) of width and
+/// height, matching the VP8/WebP odd-dimension convention (see
+/// `webp::vp8_decoder::yuv420p_to_rgb24`): an odd width or height still
+/// produces one extra chroma column/row rather than being truncated. For
+/// even `width`/`height` this is identical to floor division.
+///
 /// # Errors
 ///
-/// Returns error if frame is not in RGB24 or Rgba32 format.
+/// - Returns [`CodecError::InvalidParameter`] if frame is not in RGB24 or
+///   Rgba32 format.
+/// - Returns [`CodecError::InvalidData`] if the frame has no planes, or if
+///   the RGB/RGBA plane is shorter than `width * height * bytes_per_pixel`.
 pub fn convert_rgb_to_yuv420p(frame: &VideoFrame) -> CodecResult<VideoFrame> {
     if !matches!(frame.format, PixelFormat::Rgb24 | PixelFormat::Rgba32) {
         return Err(CodecError::InvalidParameter(
@@ -753,10 +749,20 @@ pub fn convert_rgb_to_yuv420p(frame: &VideoFrame) -> CodecResult<VideoFrame> {
         4
     };
 
-    // Allocate YUV planes
+    let expected_rgb_len = width * height * bytes_per_pixel;
+    if rgb_data.len() < expected_rgb_len {
+        return Err(CodecError::InvalidData(format!(
+            "RGB plane too short: expected at least {expected_rgb_len}, got {}",
+            rgb_data.len()
+        )));
+    }
+
+    // Allocate YUV planes. 4:2:0 chroma planes are ceiling-divided
+    // (VP8/WebP odd-dimension convention), not floor-divided -- an odd
+    // width/height still gets one extra chroma column/row.
     let y_size = width * height;
-    let uv_width = width / 2;
-    let uv_height = height / 2;
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
     let uv_size = uv_width * uv_height;
 
     let mut y_plane = vec![0u8; y_size];
@@ -774,7 +780,13 @@ pub fn convert_rgb_to_yuv420p(frame: &VideoFrame) -> CodecResult<VideoFrame> {
             let (y_val, u_val, v_val) = rgb_to_yuv(r, g, b);
             y_plane[y * width + x] = y_val;
 
-            // Subsample U and V (4:2:0)
+            // Subsample U and V (4:2:0): sample the top-left pixel of each
+            // 2x2 block. `uv_width` is ceil-divided, so the last (partial)
+            // column/row of an odd-sized frame still lands on a valid
+            // chroma index -- before this fix, `uv_width` was floor-divided
+            // here while `x`/`y` still walked up to the odd `width`/
+            // `height`, writing `u_plane[(y / 2) * uv_width + x / 2]` out of
+            // bounds (e.g. 3x3: index 1 into a 1-byte plane).
             if x % 2 == 0 && y % 2 == 0 {
                 let uv_idx = (y / 2) * uv_width + (x / 2);
                 u_plane[uv_idx] = u_val;
@@ -794,14 +806,14 @@ pub fn convert_rgb_to_yuv420p(frame: &VideoFrame) -> CodecResult<VideoFrame> {
         Plane {
             data: u_plane,
             stride: uv_width,
-            width: frame.width / 2,
-            height: frame.height / 2,
+            width: frame.width.div_ceil(2),
+            height: frame.height.div_ceil(2),
         },
         Plane {
             data: v_plane,
             stride: uv_width,
-            width: frame.width / 2,
-            height: frame.height / 2,
+            width: frame.width.div_ceil(2),
+            height: frame.height.div_ceil(2),
         },
     ];
     yuv_frame.timestamp = frame.timestamp;
@@ -813,9 +825,20 @@ pub fn convert_rgb_to_yuv420p(frame: &VideoFrame) -> CodecResult<VideoFrame> {
 
 /// Convert a video frame from YUV420p to RGB24 format.
 ///
+/// Chroma planes are addressed using ceiling division (`div_ceil(2)`) for
+/// both width and height, matching the VP8/WebP odd-dimension convention
+/// (see `webp::vp8_decoder::yuv420p_to_rgb24`): for an odd `width` or
+/// `height`, a 4:2:0 chroma plane has one extra row/column beyond floor
+/// division. For even `width`/`height` this is identical to floor division.
+///
 /// # Errors
 ///
-/// Returns error if frame is not in YUV420p format.
+/// - Returns [`CodecError::InvalidParameter`] if frame is not in YUV420p
+///   format.
+/// - Returns [`CodecError::InvalidData`] if the frame does not have exactly
+///   3 planes, if the Y plane is shorter than `width * height`, or if the U
+///   or V plane is shorter than the ceil-divided 4:2:0 chroma size
+///   (`div_ceil(width, 2) * div_ceil(height, 2)`).
 pub fn convert_yuv420p_to_rgb(frame: &VideoFrame) -> CodecResult<VideoFrame> {
     if frame.format != PixelFormat::Yuv420p {
         return Err(CodecError::InvalidParameter("Frame must be YUV420p".into()));
@@ -831,10 +854,39 @@ pub fn convert_yuv420p_to_rgb(frame: &VideoFrame) -> CodecResult<VideoFrame> {
     let u_data = &frame.planes[1].data;
     let v_data = &frame.planes[2].data;
 
+    // 4:2:0 chroma planes are ceiling-divided (VP8/WebP odd-dimension
+    // convention), not floor-divided: an odd width/height leaves one extra
+    // chroma column/row. Before this fix, a floor-divided `uv_width` here
+    // silently sheared chroma for an odd-width WebP decoded through
+    // `ImageDecoder` (`decode_vp8_to_frame` emits correctly ceil-sized
+    // planes; this converter then read them with the wrong stride).
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
+
+    if y_data.len() < width * height {
+        return Err(CodecError::InvalidData(format!(
+            "Y plane too short: expected at least {}, got {}",
+            width * height,
+            y_data.len()
+        )));
+    }
+    if u_data.len() < uv_width * uv_height {
+        return Err(CodecError::InvalidData(format!(
+            "U plane too short for ceil-divided 4:2:0 chroma: expected at least {}, got {}",
+            uv_width * uv_height,
+            u_data.len()
+        )));
+    }
+    if v_data.len() < uv_width * uv_height {
+        return Err(CodecError::InvalidData(format!(
+            "V plane too short for ceil-divided 4:2:0 chroma: expected at least {}, got {}",
+            uv_width * uv_height,
+            v_data.len()
+        )));
+    }
+
     let rgb_size = width * height * 3;
     let mut rgb_data = vec![0u8; rgb_size];
-
-    let uv_width = width / 2;
 
     // Convert YUV420p to RGB
     for y in 0..height {
@@ -865,4 +917,228 @@ pub fn convert_yuv420p_to_rgb(frame: &VideoFrame) -> CodecResult<VideoFrame> {
     rgb_frame.color_info = frame.color_info;
 
     Ok(rgb_frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a 3x3 (odd-dimension) YUV420p `VideoFrame` by hand with
+    /// correctly ceil-sized (2x2) chroma planes -- exactly what
+    /// `webp::vp8_decoder::decode_vp8_keyframe` actually emits for an
+    /// odd-width/height frame. Every chroma sample is distinct so a wrong
+    /// index reads a visibly wrong value instead of coincidentally matching.
+    fn make_odd_yuv420p_frame() -> VideoFrame {
+        let width = 3u32;
+        let height = 3u32;
+        let y_plane: Vec<u8> = (0..9u32).map(|i| (20 + i * 20) as u8).collect();
+        let u_plane = vec![10u8, 60, 110, 160];
+        let v_plane = vec![20u8, 70, 120, 170];
+
+        let mut frame = VideoFrame::new(PixelFormat::Yuv420p, width, height);
+        frame.planes = vec![
+            Plane {
+                data: y_plane,
+                stride: width as usize,
+                width,
+                height,
+            },
+            Plane {
+                data: u_plane,
+                stride: 2,
+                width: 2,
+                height: 2,
+            },
+            Plane {
+                data: v_plane,
+                stride: 2,
+                width: 2,
+                height: 2,
+            },
+        ];
+        frame
+    }
+
+    #[test]
+    fn convert_yuv420p_to_rgb_odd_width_reads_ceil_sized_chroma_correctly() {
+        let frame = make_odd_yuv420p_frame();
+        let y_data = frame.planes[0].data.clone();
+        let u_data = frame.planes[1].data.clone();
+        let v_data = frame.planes[2].data.clone();
+
+        let rgb_frame = convert_yuv420p_to_rgb(&frame)
+            .expect("odd-dimension 4:2:0 frame with correctly ceil-sized chroma must convert");
+        assert_eq!(rgb_frame.width, 3);
+        assert_eq!(rgb_frame.height, 3);
+        let rgb = &rgb_frame.planes[0].data;
+        let width = 3usize;
+
+        let pixel = |x: usize, y: usize| -> (u8, u8, u8) {
+            let idx = (y * width + x) * 3;
+            (rgb[idx], rgb[idx + 1], rgb[idx + 2])
+        };
+
+        // (0,0): top-left, chroma index 0 -- baseline sanity check.
+        assert_eq!(pixel(0, 0), yuv_to_rgb(y_data[0], u_data[0], v_data[0]));
+
+        // (2,0): rightmost column of the top row. Chroma column = x/2 = 1,
+        // which exists only because `uv_width` is ceil-divided to 2 (a
+        // genuinely floor-sized plane would be 1 column wide and not have
+        // this column at all). Row 0 makes the row-stride term zero, so
+        // this pixel alone does not distinguish a floor-*stride* bug from
+        // the fix -- see (0,2)/(2,2) below for that -- but it does pin the
+        // column-index arithmetic.
+        assert_eq!(pixel(2, 0), yuv_to_rgb(y_data[2], u_data[1], v_data[1]));
+
+        // (0,2): bottom-left. Chroma row = y/2 = 1, column = x/2 = 0, so the
+        // chroma index is `1 * uv_width + 0`. This is the silent-shear
+        // pixel: a floor-divided `uv_width` (1, matching the pre-fix
+        // `width / 2`) would read index `1 * 1 + 0 = 1` (`u_data[1]`,
+        // in-bounds but WRONG) instead of the correct
+        // `1 * 2 + 0 = 2` (`u_data[2]`) -- exactly the reported bug (wrong
+        // pixel value, no panic), not an out-of-bounds crash.
+        assert_eq!(pixel(0, 2), yuv_to_rgb(y_data[6], u_data[2], v_data[2]));
+
+        // (2,2): bottom-right, chroma (row 1, col 1) of the 2-wide plane =
+        // index 3. A floor-divided `uv_width` would read index
+        // `1 * 1 + 1 = 2` (`u_data[2]`, also wrong) instead of the correct
+        // `1 * 2 + 1 = 3` (`u_data[3]`).
+        assert_eq!(pixel(2, 2), yuv_to_rgb(y_data[8], u_data[3], v_data[3]));
+    }
+
+    #[test]
+    fn convert_yuv420p_to_rgb_rejects_short_floor_sized_chroma() {
+        let width = 3u32;
+        let height = 3u32;
+        let y_plane = vec![128u8; 9];
+        // Old floor-sized (1x1) chroma plane -- exactly what the pre-fix
+        // `width / 2` computation would have sized it to.
+        let u_plane = vec![128u8; 1];
+        let v_plane = vec![128u8; 1];
+
+        let mut frame = VideoFrame::new(PixelFormat::Yuv420p, width, height);
+        frame.planes = vec![
+            Plane {
+                data: y_plane,
+                stride: 3,
+                width,
+                height,
+            },
+            Plane {
+                data: u_plane,
+                stride: 1,
+                width: 1,
+                height: 1,
+            },
+            Plane {
+                data: v_plane,
+                stride: 1,
+                width: 1,
+                height: 1,
+            },
+        ];
+
+        let result = convert_yuv420p_to_rgb(&frame);
+        assert!(
+            matches!(result, Err(CodecError::InvalidData(_))),
+            "short (floor-sized) chroma planes must be a typed error, not a panic or Ok: {result:?}"
+        );
+    }
+
+    #[test]
+    fn convert_yuv420p_to_rgb_even_dims_4x2_unchanged() {
+        // Even dimensions: div_ceil(2) == floor division, so this pins the
+        // fix as a provable no-op for even dims (uv 2x1, as before).
+        let width = 4u32;
+        let height = 2u32;
+        let y_plane = vec![128u8; 8];
+        let u_plane = vec![64u8; 2];
+        let v_plane = vec![192u8; 2];
+
+        let mut frame = VideoFrame::new(PixelFormat::Yuv420p, width, height);
+        frame.planes = vec![
+            Plane {
+                data: y_plane,
+                stride: 4,
+                width,
+                height,
+            },
+            Plane {
+                data: u_plane,
+                stride: 2,
+                width: 2,
+                height: 1,
+            },
+            Plane {
+                data: v_plane,
+                stride: 2,
+                width: 2,
+                height: 1,
+            },
+        ];
+
+        let rgb_frame = convert_yuv420p_to_rgb(&frame).expect("even-dimension frame must convert");
+        assert_eq!(rgb_frame.planes[0].data.len(), 8 * 3);
+        let expected = yuv_to_rgb(128, 64, 192);
+        for px in rgb_frame.planes[0].data.chunks_exact(3) {
+            assert_eq!((px[0], px[1], px[2]), expected);
+        }
+    }
+
+    #[test]
+    fn convert_rgb_to_yuv420p_odd_dims_no_longer_panics() {
+        // 3x3 RGB24: before the fix, the chroma subsample loop wrote
+        // u_plane[(y/2)*uv_width + x/2] with a floor-sized (1-byte) plane,
+        // panicking out of bounds at x=2 or y=2.
+        let width = 3u32;
+        let height = 3u32;
+        let rgb_data: Vec<u8> = (0..(width * height * 3))
+            .map(|i| (i * 7 % 256) as u8)
+            .collect();
+
+        let mut frame = VideoFrame::new(PixelFormat::Rgb24, width, height);
+        frame.planes = vec![Plane {
+            data: rgb_data,
+            stride: (width as usize) * 3,
+            width,
+            height,
+        }];
+
+        let yuv_frame = convert_rgb_to_yuv420p(&frame)
+            .expect("odd-dimension RGB24 frame must convert without panicking");
+        assert_eq!(yuv_frame.planes.len(), 3);
+        assert_eq!(yuv_frame.planes[1].data.len(), 4); // ceil(3/2) * ceil(3/2) = 2*2
+        assert_eq!(yuv_frame.planes[2].data.len(), 4);
+        assert_eq!(yuv_frame.planes[1].width, 2);
+        assert_eq!(yuv_frame.planes[1].height, 2);
+        assert_eq!(yuv_frame.planes[2].width, 2);
+        assert_eq!(yuv_frame.planes[2].height, 2);
+    }
+
+    #[test]
+    fn convert_rgb_to_yuv420p_even_dims_4x2_unchanged() {
+        // 4x2: even in both dimensions, so ceil == floor division and this
+        // pins the pre-fix plane sizes/strides as a regression guard.
+        let width = 4u32;
+        let height = 2u32;
+        let rgb_data = vec![128u8; (width * height * 3) as usize];
+
+        let mut frame = VideoFrame::new(PixelFormat::Rgb24, width, height);
+        frame.planes = vec![Plane {
+            data: rgb_data,
+            stride: (width as usize) * 3,
+            width,
+            height,
+        }];
+
+        let yuv_frame = convert_rgb_to_yuv420p(&frame).expect("even-dimension frame must convert");
+        assert_eq!(yuv_frame.planes[0].data.len(), 8); // 4*2
+        assert_eq!(yuv_frame.planes[1].data.len(), 2); // uv 2x1
+        assert_eq!(yuv_frame.planes[2].data.len(), 2);
+        assert_eq!(yuv_frame.planes[1].width, 2);
+        assert_eq!(yuv_frame.planes[1].height, 1);
+        assert_eq!(yuv_frame.planes[1].stride, 2);
+        assert_eq!(yuv_frame.planes[2].width, 2);
+        assert_eq!(yuv_frame.planes[2].height, 1);
+    }
 }

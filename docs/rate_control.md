@@ -38,6 +38,19 @@ Encoder-side support; decoder coverage is in `codec_status.md`.
 | Vorbis | —   | —   | `-q` only | —   | —   |
 | FLAC / PCM | — | — | —      | —   | —   (lossless) |
 
+> **Honesty note (0.2.1, 2026-08-12).** This table describes which
+> rate-control *knobs* each encoder exposes. It is **not** a statement that
+> the resulting bitstream is decodable. Measured during the 0.2.1 audit: the
+> **AV1, VP9, VP8 and Opus encoders do not emit valid bitstreams** — a
+> reference decoder either rejects their output or decodes it to something
+> different from the input, and the Opus encoder additionally writes a TOC
+> byte that misdescribes its own payload. Consumers that need a trustworthy
+> compressed encoder are expected to refuse rather than call these; several
+> in this workspace now do (`oximedia-videoip`, `oximedia-server`'s
+> transcode engine, `oximedia-cli`'s `switcher record`). FFV1, MJPEG and
+> FLAC encode are real. See `codec_status.md` for decoder status and
+> `CHANGELOG.md`'s `[0.2.1]` section for the measurements.
+
 ## Target bitrate spec
 
 CBR/VBR targets live in `TargetBitrate`

@@ -6,7 +6,7 @@ Video and audio codec implementations for the OxiMedia multimedia framework. Pur
 
 Part of the [oximedia](https://github.com/cool-japan/oximedia) workspace — a comprehensive pure-Rust media processing framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 ## Overview
 
@@ -26,7 +26,7 @@ per codec, and the effort required to close each gap.
 |----------|------------|---------------------|-------------------|-------|
 | AV1      | Functional | **Functional** (keyframe/intra only) | `av1` (default)   | Keyframe/intra decode real, bit-exact vs dav1d/aomdec (8-bit 4:2:0 profile 0), incl. deblocking/CDEF/loop restoration; inter-frame decode, super-resolution, film grain, palette mode, intra block copy, quantizer matrices, 10/12-bit not yet implemented (honest `Err`). GitHub issue #9. |
 | VP9      | Functional | **Functional** (keyframe/intra only) | `vp9`             | Keyframe/intra decode real, bit-exact vs libvpx (8-bit 4:2:0); inter-frame decode not yet implemented (honest `Err`). |
-| VP8      | Functional | **Functional** (keyframe/intra only) | `vp8`             | Full RFC 6386 §11–§15 keyframe/intra pipeline, bit-exact vs libwebp; inter-frame decode not yet implemented (honest `Err`). |
+| VP8      | Functional | **Verified** (key + inter frames) | `vp8`             | Full RFC 6386 decode: §11–§15 intra pipeline (bit-exact vs libwebp) plus §16–§18 inter frames — motion vectors, sub-pixel motion compensation, last/golden/altref management — bit-exact vs libvpx on 5 multi-frame conformance streams. |
 | Theora   | Functional | Bitstream-parsing   | `theora`          | DCT, motion compensation, and per-frame pixel hand-off into `VideoFrame` (decode hand-off bug fixed in 0.1.8, issue #9); encoder↔decoder bitstream alignment for full round-trip remains outstanding. |
 | H.263    | Functional | Functional          | *(always)*        | Real macroblock decode, motion compensation, loop filter. |
 | MJPEG    | Functional | Functional          | `mjpeg`           | Wraps `oximedia-image` JPEG baseline; ≥28 dB PSNR at Q85. |
@@ -48,9 +48,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-codec = "0.1.9"
+oximedia-codec = "0.2.0"
 # or with additional codecs:
-oximedia-codec = { version = "0.1.9", features = ["av1", "vp9", "vp8", "opus"] }
+oximedia-codec = { version = "0.2.0", features = ["av1", "vp9", "vp8", "opus"] }
 ```
 
 ### AV1 / VP9 / VP8 / Theora Bitstream Parsing

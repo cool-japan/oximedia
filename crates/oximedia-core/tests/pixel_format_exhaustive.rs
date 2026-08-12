@@ -206,6 +206,29 @@ fn exhaustive_table() -> Vec<Expected> {
             is_rgb: false,
             has_alpha: false,
         },
+        // ── packed YUV 4:2:2 (single interleaved plane) ──────────────
+        Expected {
+            format: PixelFormat::Yuyv422,
+            planes: 1,
+            bpc: 8,
+            chroma: (2, 1),
+            is_planar: false,
+            is_semi_planar: false,
+            is_yuv: true,
+            is_rgb: false,
+            has_alpha: false,
+        },
+        Expected {
+            format: PixelFormat::Uyvy422,
+            planes: 1,
+            bpc: 8,
+            chroma: (2, 1),
+            is_planar: false,
+            is_semi_planar: false,
+            is_yuv: true,
+            is_rgb: false,
+            has_alpha: false,
+        },
         // ── packed RGB ────────────────────────────────────────────────
         Expected {
             format: PixelFormat::Rgb24,
@@ -392,11 +415,14 @@ fn test_planar_and_semi_planar_are_mutually_exclusive() {
     }
 }
 
-/// All YUV formats have at least 2 planes (one for luma, at least one for chroma).
+/// Planar / semi-planar YUV formats have at least 2 planes (one for luma,
+/// at least one for chroma). Packed YUV formats (e.g. YUYV/UYVY 4:2:2)
+/// interleave luma and chroma into a single plane, so they are excluded
+/// from this invariant.
 #[test]
 fn test_yuv_formats_have_at_least_two_planes() {
     for row in exhaustive_table() {
-        if row.is_yuv {
+        if row.is_yuv && (row.is_planar || row.is_semi_planar) {
             assert!(
                 row.format.plane_count() >= 2,
                 "{:?} is YUV but has only {} plane(s)",

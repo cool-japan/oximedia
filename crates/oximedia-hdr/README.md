@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/oximedia-hdr/badge.svg)](https://docs.rs/oximedia-hdr)
 [![License](https://img.shields.io/crates/l/oximedia-hdr.svg)](LICENSE)
 ![Tests: 506](https://img.shields.io/badge/tests-506-brightgreen)
-![Updated: 2026-07-08](https://img.shields.io/badge/updated-2026--07--08-blue)
+![Updated: 2026-08-12](https://img.shields.io/badge/updated-2026--08--12-blue)
 
 HDR (High Dynamic Range) video processing for [OxiMedia](https://github.com/cool-japan/oximedia) -- the Sovereign Media Framework.
 

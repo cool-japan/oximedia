@@ -217,7 +217,7 @@ async fn cmd_fix(input: &PathBuf, output: &PathBuf, issues: &str, json_output: b
             Err(e) => {
                 // Pipeline failed; fall back to a byte-level copy so the caller
                 // still gets an output file rather than a hard failure.
-                if !json_output {
+                if !json_output && !crate::progress::is_quiet() {
                     println!("  Note: conform pipeline failed ({}); byte copy used.", e);
                 }
                 let sz = std::fs::copy(input, output).with_context(|| {
@@ -232,7 +232,7 @@ async fn cmd_fix(input: &PathBuf, output: &PathBuf, issues: &str, json_output: b
         }
     } else {
         // Output format not supported by the pipeline; use a direct copy.
-        if !json_output {
+        if !json_output && !crate::progress::is_quiet() {
             println!(
                 "  Note: output format '.{}' is not supported by the transcode pipeline; \
                  byte copy used. Use .mkv or .webm for pipeline-based fixes.",
@@ -260,7 +260,7 @@ async fn cmd_fix(input: &PathBuf, output: &PathBuf, issues: &str, json_output: b
             "pipeline_remux": pipeline_used,
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!(
             "{} Conform fix applied: {} -> {}",
             "OK".green().bold(),
@@ -350,7 +350,7 @@ fn cmd_report(input: &PathBuf, output: &PathBuf, json_output: bool) -> Result<()
 
     if json_output {
         println!("{}", report_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         let status = if report.overall_passed {
             "PASS".green().bold()
         } else {

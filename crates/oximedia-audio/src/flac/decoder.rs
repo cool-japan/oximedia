@@ -7,7 +7,7 @@
 //! - Subframe decoding (constant, verbatim, fixed, LPC)
 //! - Rice residual decoding
 //! - Stereo decorrelation (Independent, LeftSide, RightSide, MidSide)
-//! - CRC-16 frame validation
+//! - CRC-8 header validation and CRC-16 frame validation
 //!
 //! # MD5 verification
 //!
@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    crc::crc16,
+    crc::{crc16, crc8},
     frame::{ChannelAssignment, FrameHeader},
     rice::zigzag_decode,
     subframe::{LpcCoefficients, Subframe, SubframeHeader, SubframeType},
@@ -105,13 +105,16 @@ impl<'a> BitReader<'a> {
         Some(((v << shift) as i64) >> shift)
     }
 
-    /// Read unary coded value: count 1-bits until a 0-bit.
+    /// Read unary coded value: count 0-bits until a 1-bit.
+    ///
+    /// Per RFC 9639 section 9.2.7, FLAC's unary coding is zero bits
+    /// terminated by a one bit (see `BitWriter::write_unary`).
     fn read_unary(&mut self) -> Option<u32> {
         let mut count = 0u32;
         loop {
             match self.read_bit()? {
-                true => count += 1,
-                false => return Some(count),
+                false => count += 1,
+                true => return Some(count),
             }
         }
     }
@@ -283,6 +286,18 @@ impl FlacDecoder {
             }
             Err(e) => return Err(e),
         };
+
+        // Verify the header CRC-8. This is the spec's defence against false
+        // syncs: a 0xFF 0xF8-like byte pair occurring by coincidence inside
+        // subframe data would otherwise be parsed as a plausible-looking
+        // header. Treat a mismatch exactly like a bad sync — skip ahead and
+        // let the next scan find the real frame boundary — rather than
+        // hard-failing the whole stream over one false positive.
+        let computed_crc8 = crc8(&buf[..header_len - 1]);
+        if computed_crc8 != header.crc8 {
+            self.buffer.drain(..2);
+            return Ok(None);
+        }
 
         // Resolve sample_rate from STREAMINFO if header says "FromStreamInfo"
         let sample_rate = if header.sample_rate == 0 {
@@ -602,7 +617,17 @@ impl FlacDecoder {
             let samples_in_partition = if partition_order == 0 {
                 total_residuals
             } else if p == 0 {
-                (block_size >> partition_order) - predictor_order
+                // A well-formed (spec-conformant) encoder never emits a
+                // partition_order this large relative to predictor_order, but a
+                // corrupt or adversarial frame could — guard the subtraction
+                // instead of trusting the bitstream.
+                (block_size >> partition_order)
+                    .checked_sub(predictor_order)
+                    .ok_or_else(|| {
+                        AudioError::InvalidData(
+                            "Rice partition order too large for predictor order".into(),
+                        )
+                    })?
             } else {
                 block_size >> partition_order
             };

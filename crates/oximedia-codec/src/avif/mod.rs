@@ -1,26 +1,34 @@
-//! AVIF (AV1 Image File Format) encoder, prober, and payload extractor.
+//! AVIF (AV1 Image File Format) encoder and decoder.
 //!
 //! AVIF stores still images using AV1 intra-frame compression inside an
-//! ISOBMFF (ISO Base Media File Format) container.  This implementation
-//! writes and reads a structurally valid AVIF file, with a minimal AV1
-//! Sequence Header OBU as the bitstream payload.
+//! ISOBMFF (ISO Base Media File Format) container.
 //!
-//! # Honest status: pixel decode is NOT implemented
+//! # Decode status
 //!
-//! Per `docs/codec_status.md`, decoding an AVIF file to pixels requires AV1
-//! pixel reconstruction, which is not yet implemented in this workspace
-//! (the AV1 decoder is bitstream-parsing only; deferred to 0.2.0+, tracked
-//! by GitHub issue #9). Accordingly:
+//! - [`AvifDecoder::probe`] — parses the container and returns dimensions,
+//!   bit depth, colour metadata, and alpha presence, without touching AV1
+//!   pixel decode at all.
+//! - [`AvifDecoder::extract_av1_payload`] — parses the container and
+//!   returns the raw AV1 OBU bitstream(s), honestly labelled as bitstream
+//!   data (for handoff to an external AV1 decoder, or for inspecting a
+//!   payload this crate's own decoder can't yet decode).
+//! - [`AvifDecoder::decode`] — decodes real pixels through
+//!   [`crate::av1::Av1Decoder`]'s bit-exact keyframe/intra pipeline
+//!   (verified against dav1d and aomdec; see `av1::kf`). That pipeline
+//!   implements 8-bit 4:2:0 (profile 0) reconstruction only — 10/12-bit,
+//!   non-4:2:0, and monochrome AV1 (which real-world encoders typically use
+//!   for the alpha auxiliary image) fail honestly with
+//!   [`CodecError::UnsupportedFeature`] rather than fabricating pixels.
+//!   When the `av1` cargo feature is disabled, `decode` always returns
+//!   `CodecError::UnsupportedFeature`.
 //!
-//! - [`AvifDecoder::probe`] — **works**: parses the container and returns
-//!   dimensions, bit depth, colour metadata, and alpha presence.
-//! - [`AvifDecoder::extract_av1_payload`] — **works**: parses the container
-//!   and returns the raw AV1 OBU bitstream(s), honestly labelled as
-//!   bitstream data (for handoff to an external AV1 decoder).
-//! - [`AvifDecoder::decode`] — returns an honest
-//!   [`CodecError::UnsupportedFeature`] error. An earlier revision returned
-//!   the raw AV1 bitstream in the `y_plane` field of an [`AvifImage`] as if
-//!   it were decoded pixels; that misleading behaviour has been removed.
+//! Note that this crate's own [`AvifEncoder`] does not implement real AV1
+//! encoding: it writes a structurally valid container around a minimal
+//! placeholder AV1 payload (sequence header only, no coded frame), so
+//! `AvifDecoder::decode`-ing `AvifEncoder`'s own output always fails
+//! honestly too (there is no frame to decode). See
+//! `src/avif/testdata/README.md` for real AV1-encoded fixtures (produced by
+//! ffmpeg + libaom) used to test real decoding.
 //!
 //! # Container structure
 //!
@@ -42,6 +50,14 @@
 //! ```
 
 use crate::error::CodecError;
+
+mod container;
+use container::{
+    check_avif_signature, find_box_in, find_top_level_box, locate_mdat_items, parse_meta_for_probe,
+};
+
+#[cfg(feature = "av1")]
+mod decode;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -223,33 +239,43 @@ impl AvifDecoder {
 
     /// Decode a complete AVIF byte stream to pixels.
     ///
-    /// # Honest limitation
-    ///
-    /// **This always fails** with [`CodecError::UnsupportedFeature`] after
-    /// validating the container: producing an [`AvifImage`] with real pixel
-    /// planes requires AV1 pixel reconstruction, which is not yet
-    /// implemented in this workspace (the AV1 decoder is bitstream-parsing
-    /// only; deferred to 0.2.0+). An earlier revision returned the raw AV1
-    /// bitstream in `y_plane` as if it were decoded luma — that misleading
-    /// pass-through has been removed.
-    ///
-    /// Use [`Self::probe`] for metadata and [`Self::extract_av1_payload`]
-    /// for the raw AV1 OBU bitstream(s).
+    /// Validates the ISOBMFF container, extracts the AV1 OBU payload(s),
+    /// and decodes them through the crate's real, bit-exact AV1
+    /// keyframe/intra pipeline ([`crate::av1::Av1Decoder`] — verified
+    /// against dav1d and aomdec). If an alpha auxiliary item is present it
+    /// is decoded too; an image whose alpha channel cannot be decoded is
+    /// never silently returned as if it were fully opaque (see
+    /// [`Self::extract_av1_payload`] to still recover the raw AV1
+    /// bitstream(s) in that case).
     ///
     /// # Errors
     ///
     /// Returns `CodecError::InvalidBitstream` if the container is
-    /// malformed, otherwise `CodecError::UnsupportedFeature` as described
-    /// above.
+    /// malformed. Returns the AV1 decoder's own honest errors otherwise —
+    /// notably `CodecError::UnsupportedFeature` for surfaces the keyframe
+    /// decoder does not (yet) implement: 10/12-bit depth, non-4:2:0 chroma,
+    /// or monochrome AV1 (which is how real-world encoders typically encode
+    /// the alpha auxiliary image, so files with alpha commonly hit this
+    /// today even when their colour image decodes fine on its own). When
+    /// the `av1` cargo feature is disabled, always returns
+    /// `CodecError::UnsupportedFeature`.
     pub fn decode(data: &[u8]) -> Result<AvifImage, CodecError> {
         // Validate the container first so malformed input is still
         // reported as such (signature, meta/iloc structure, mdat extents).
-        let _payload = Self::extract_av1_payload(data)?;
+        let payload = Self::extract_av1_payload(data)?;
+        Self::decode_payload(payload)
+    }
 
+    #[cfg(feature = "av1")]
+    fn decode_payload(payload: AvifPayload) -> Result<AvifImage, CodecError> {
+        decode::decode_still_image(&payload)
+    }
+
+    #[cfg(not(feature = "av1"))]
+    fn decode_payload(_payload: AvifPayload) -> Result<AvifImage, CodecError> {
         Err(CodecError::UnsupportedFeature(
-            "AVIF decode requires AV1 pixel reconstruction, not yet implemented \
-             (deferred to 0.2.0+; see docs/codec_status.md). Use \
-             AvifDecoder::extract_av1_payload for the raw AV1 OBU bitstream, or \
+            "AVIF pixel decode requires the `av1` cargo feature, which is disabled in this \
+             build. Use AvifDecoder::extract_av1_payload for the raw AV1 OBU bitstream, or \
              AvifDecoder::probe for container metadata"
                 .to_string(),
         ))
@@ -882,22 +908,6 @@ fn patch_iloc_offsets(
     Ok(())
 }
 
-/// Find a 4-byte box type within `data[start..end]`, return byte offset.
-fn find_box_in(data: &[u8], start: usize, end: usize, box_type: &[u8; 4]) -> Option<usize> {
-    let mut pos = start;
-    while pos + 8 <= end.min(data.len()) {
-        let size = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
-        if size < 8 {
-            break;
-        }
-        if &data[pos + 4..pos + 8] == box_type {
-            return Some(pos);
-        }
-        pos += size;
-    }
-    None
-}
-
 /// Overwrite 4 bytes at `pos` in `buf` with big-endian `value`.
 fn patch_u32(buf: &mut Vec<u8>, pos: usize, value: u32) -> Result<(), CodecError> {
     if pos + 4 > buf.len() {
@@ -914,279 +924,9 @@ fn patch_u32(buf: &mut Vec<u8>, pos: usize, value: u32) -> Result<(), CodecError
     Ok(())
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Internal helpers – parser
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// Verify the byte stream starts with an AVIF `ftyp` box.
-fn check_avif_signature(data: &[u8]) -> Result<(), CodecError> {
-    if data.len() < 12 {
-        return Err(CodecError::InvalidBitstream(
-            "file too short to be AVIF".into(),
-        ));
-    }
-    let size = u32::from_be_bytes(
-        data[0..4]
-            .try_into()
-            .map_err(|_| CodecError::InvalidBitstream("cannot read ftyp size".into()))?,
-    ) as usize;
-    if size < 12 || size > data.len() {
-        return Err(CodecError::InvalidBitstream("invalid ftyp box size".into()));
-    }
-    if &data[4..8] != b"ftyp" {
-        return Err(CodecError::InvalidBitstream("first box is not ftyp".into()));
-    }
-    // Check that 'avif' appears among the brands.
-    let brands_region = &data[8..size];
-    let has_avif = brands_region
-        .chunks(4)
-        .any(|c| c.len() == 4 && c == b"avif");
-    if !has_avif {
-        return Err(CodecError::InvalidBitstream(
-            "ftyp does not contain 'avif' brand".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Parse the `meta` box to extract spatial/colour metadata.
-fn parse_meta_for_probe(data: &[u8]) -> Result<AvifProbeResult, CodecError> {
-    // Find meta box (typically immediately after ftyp, but walk to be safe).
-    let meta_pos = find_top_level_box(data, b"meta")
-        .ok_or_else(|| CodecError::InvalidBitstream("meta box not found".into()))?;
-    let meta_size = u32::from_be_bytes(
-        data[meta_pos..meta_pos + 4]
-            .try_into()
-            .map_err(|_| CodecError::InvalidBitstream("meta size read error".into()))?,
-    ) as usize;
-    let meta_end = meta_pos + meta_size;
-
-    // meta is a FullBox: skip box header(8) + fullbox flags(4) = 12.
-    let meta_body = meta_pos + 12;
-
-    // ── ispe ──────────────────────────────────────────────────────────
-    let (width, height) = parse_ispe(data, meta_body, meta_end)?;
-
-    // ── colr ──────────────────────────────────────────────────────────
-    let (color_primaries, transfer_characteristics) =
-        parse_colr(data, meta_body, meta_end).unwrap_or((1, 1));
-
-    // ── pixi ──────────────────────────────────────────────────────────
-    let bit_depth = parse_pixi(data, meta_body, meta_end).unwrap_or(8);
-
-    // ── alpha: check iinf for a second item with auxiliary type ───────
-    let has_alpha = parse_iinf_has_alpha(data, meta_body, meta_end);
-
-    Ok(AvifProbeResult {
-        width,
-        height,
-        bit_depth,
-        has_alpha,
-        color_primaries,
-        transfer_characteristics,
-    })
-}
-
-fn parse_ispe(data: &[u8], start: usize, end: usize) -> Result<(u32, u32), CodecError> {
-    let pos = find_box_in(data, start, end, b"iprp")
-        .and_then(|iprp| {
-            let iprp_end =
-                iprp + u32::from_be_bytes(data[iprp..iprp + 4].try_into().ok()?) as usize;
-            find_box_in(data, iprp + 8, iprp_end, b"ipco").and_then(|ipco| {
-                let ipco_end =
-                    ipco + u32::from_be_bytes(data[ipco..ipco + 4].try_into().ok()?) as usize;
-                find_box_in(data, ipco + 8, ipco_end, b"ispe")
-            })
-        })
-        .ok_or_else(|| CodecError::InvalidBitstream("ispe not found".into()))?;
-
-    // ispe: FullBox(12) + width(4) + height(4)
-    if pos + 20 > data.len() {
-        return Err(CodecError::InvalidBitstream("ispe box truncated".into()));
-    }
-    let w = u32::from_be_bytes(
-        data[pos + 12..pos + 16]
-            .try_into()
-            .map_err(|_| CodecError::InvalidBitstream("ispe width read error".into()))?,
-    );
-    let h = u32::from_be_bytes(
-        data[pos + 16..pos + 20]
-            .try_into()
-            .map_err(|_| CodecError::InvalidBitstream("ispe height read error".into()))?,
-    );
-    Ok((w, h))
-}
-
-fn parse_colr(data: &[u8], start: usize, end: usize) -> Option<(u8, u8)> {
-    let iprp = find_box_in(data, start, end, b"iprp")?;
-    let iprp_end = iprp + u32::from_be_bytes(data[iprp..iprp + 4].try_into().ok()?) as usize;
-    let ipco = find_box_in(data, iprp + 8, iprp_end, b"ipco")?;
-    let ipco_end = ipco + u32::from_be_bytes(data[ipco..ipco + 4].try_into().ok()?) as usize;
-    let pos = find_box_in(data, ipco + 8, ipco_end, b"colr")?;
-    // colr: box(8) + colour_type(4) + nclx primaries(2) + transfer(2) + ...
-    // The reads below touch bytes up to `pos+16`, so the guard must cover them;
-    // a `pos+15` guard left `data[pos+14..pos+16]` able to panic on a truncated
-    // box.
-    if pos + 16 > data.len() {
-        return None;
-    }
-    if &data[pos + 8..pos + 12] != b"nclx" {
-        return None;
-    }
-    // nclx: colour_primaries(2) + transfer_characteristics(2) + ...
-    let cp = u16::from_be_bytes(data[pos + 12..pos + 14].try_into().ok()?) as u8;
-    let tc = u16::from_be_bytes(data[pos + 14..pos + 16].try_into().ok()?) as u8;
-    Some((cp, tc))
-}
-
-fn parse_pixi(data: &[u8], start: usize, end: usize) -> Option<u8> {
-    let iprp = find_box_in(data, start, end, b"iprp")?;
-    let iprp_end = iprp + u32::from_be_bytes(data[iprp..iprp + 4].try_into().ok()?) as usize;
-    let ipco = find_box_in(data, iprp + 8, iprp_end, b"ipco")?;
-    let ipco_end = ipco + u32::from_be_bytes(data[ipco..ipco + 4].try_into().ok()?) as usize;
-    let pos = find_box_in(data, ipco + 8, ipco_end, b"pixi")?;
-    // pixi: FullBox(12) + num_channels(1) + depth[0](1)
-    if pos + 14 > data.len() {
-        return None;
-    }
-    Some(data[pos + 13])
-}
-
-fn parse_iinf_has_alpha(data: &[u8], start: usize, end: usize) -> bool {
-    let pos = match find_box_in(data, start, end, b"iinf") {
-        Some(p) => p,
-        None => return false,
-    };
-    let iinf_size = u32::from_be_bytes(match data[pos..pos + 4].try_into() {
-        Ok(b) => b,
-        Err(_) => return false,
-    }) as usize;
-    // iinf FullBox version=0: box(8) + fullbox(4) + entry_count(2)
-    let entry_count = u16::from_be_bytes(match data[pos + 12..pos + 14].try_into() {
-        Ok(b) => b,
-        Err(_) => return false,
-    });
-    // If there's more than one item, we treat the second as alpha.
-    entry_count >= 2 && iinf_size >= 14
-}
-
-/// Locate the `mdat` box and return `(color_offset, color_len, alpha_offset, alpha_len)`.
-///
-/// We use the iloc information to find actual item extents, but for our
-/// simplified writer we can rely on the fact that color data is first in mdat
-/// and alpha follows.  For a robust implementation one would parse iloc.
-fn locate_mdat_items(
-    data: &[u8],
-    has_alpha: bool,
-) -> Result<(usize, usize, usize, usize), CodecError> {
-    // Find iloc to read the actual extents.
-    let meta_pos = find_top_level_box(data, b"meta")
-        .ok_or_else(|| CodecError::InvalidBitstream("meta box not found".into()))?;
-    let meta_size = u32::from_be_bytes(
-        data[meta_pos..meta_pos + 4]
-            .try_into()
-            .map_err(|_| CodecError::InvalidBitstream("meta size".into()))?,
-    ) as usize;
-    let meta_end = meta_pos + meta_size;
-    let meta_body = meta_pos + 12;
-
-    let iloc_pos = find_box_in(data, meta_body, meta_end, b"iloc")
-        .ok_or_else(|| CodecError::InvalidBitstream("iloc not found".into()))?;
-
-    // Parse iloc version=1 (as written by our encoder).
-    // box(8) + fullbox(4) + offset_size/length_size(1) + base/index(1) + item_count(2)
-    // iloc box layout:
-    //   size(4) + 'iloc'(4) + version(1) + flags(3) = 12 bytes header
-    //   offset_size|length_size(1) + base_offset_size|index_size(1) + item_count(2)
-    // Defend against a truncated iloc box: we read the version at `+8` and the
-    // item_count at `+14..16`, so those first 16 bytes must be present before
-    // any indexing.
-    if iloc_pos + 16 > data.len() {
-        return Err(CodecError::InvalidBitstream("iloc box truncated".into()));
-    }
-    let version = data[iloc_pos + 8];
-    if version != 1 {
-        return Err(CodecError::UnsupportedFeature(format!(
-            "iloc version {version} not supported"
-        )));
-    }
-
-    // offset 12: offset_size/length_size byte
-    // offset 13: base_offset_size/index_size byte
-    // offset 14..16: item_count
-    let item_count = u16::from_be_bytes(
-        data[iloc_pos + 14..iloc_pos + 16]
-            .try_into()
-            .map_err(|_| CodecError::InvalidBitstream("iloc item_count".into()))?,
-    );
-
-    if item_count == 0 {
-        return Err(CodecError::InvalidBitstream("iloc has no items".into()));
-    }
-
-    // First item entry starts at offset 16
-    let item0 = iloc_pos + 16;
-    // item entry (version=1, offset_size=4, length_size=4):
-    //   ID(2) + method(2) + ref(2) + count(2) + offset(4) + length(4) = 16
-    // The color extent reads below span item0+8..item0+16; bound them so a
-    // truncated iloc cannot read out of bounds.
-    if item0 + 16 > data.len() {
-        return Err(CodecError::InvalidBitstream(
-            "iloc item entry truncated".into(),
-        ));
-    }
-    let color_offset = u32::from_be_bytes(
-        data[item0 + 8..item0 + 12]
-            .try_into()
-            .map_err(|_| CodecError::InvalidBitstream("color extent offset".into()))?,
-    ) as usize;
-    let color_len = u32::from_be_bytes(
-        data[item0 + 12..item0 + 16]
-            .try_into()
-            .map_err(|_| CodecError::InvalidBitstream("color extent length".into()))?,
-    ) as usize;
-
-    let (alpha_offset, alpha_len) = if has_alpha && item_count >= 2 {
-        let item1 = item0 + 16;
-        // The alpha extent reads below span item1+8..item1+16; bound them.
-        if item1 + 16 > data.len() {
-            return Err(CodecError::InvalidBitstream(
-                "iloc alpha item entry truncated".into(),
-            ));
-        }
-        let ao = u32::from_be_bytes(
-            data[item1 + 8..item1 + 12]
-                .try_into()
-                .map_err(|_| CodecError::InvalidBitstream("alpha extent offset".into()))?,
-        ) as usize;
-        let al = u32::from_be_bytes(
-            data[item1 + 12..item1 + 16]
-                .try_into()
-                .map_err(|_| CodecError::InvalidBitstream("alpha extent length".into()))?,
-        ) as usize;
-        (ao, al)
-    } else {
-        (0, 0)
-    };
-
-    Ok((color_offset, color_len, alpha_offset, alpha_len))
-}
-
-/// Walk the top-level box list to find a box by type.
-fn find_top_level_box(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
-    let mut pos = 0usize;
-    while pos + 8 <= data.len() {
-        let size = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
-        if size < 8 {
-            break;
-        }
-        if &data[pos + 4..pos + 8] == box_type {
-            return Some(pos);
-        }
-        pos += size;
-    }
-    None
-}
+// Container parsing (signature check, `meta`/`iloc` extraction) lives in
+// `container.rs`; see the `mod container;` + `use container::{...};`
+// declarations near the top of this file.
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Internal helpers – validation
@@ -1290,6 +1030,104 @@ impl BitWriter {
 mod tests {
     use super::*;
 
+    // ── Real-fixture decode tests ───────────────────────────────────────
+    //
+    // `testdata/*.avif` are real ffmpeg + libaom-av1 output (NOT authored
+    // by `AvifEncoder`, which only emits a structurally valid container
+    // with a minimal placeholder AV1 payload — see `testdata/README.md`
+    // for exact regeneration commands and why each fixture behaves as it
+    // does).
+
+    /// The one fixture the real AV1-backed decode path is expected to
+    /// fully decode: 8-bit 4:2:0, no alpha. Verifies bit-exact agreement
+    /// with ffmpeg's own (libdav1d) decode of the same file.
+    #[cfg(feature = "av1")]
+    #[test]
+    fn decode_real_avif_fixture_bit_exact_vs_ffmpeg() {
+        let bytes: &[u8] = include_bytes!("testdata/color_only.avif");
+        let reference: &[u8] = include_bytes!("testdata/color_only_ref.yuv");
+
+        let image = AvifDecoder::decode(bytes).expect("real AVIF fixture must decode");
+        assert_eq!(image.width, 32);
+        assert_eq!(image.height, 32);
+        assert_eq!(image.depth, 8);
+        assert_eq!(image.yuv_format, YuvFormat::Yuv420);
+        assert!(image.alpha_plane.is_none(), "fixture has no alpha item");
+
+        let (ry, ru, rv) = (
+            &reference[..32 * 32],
+            &reference[32 * 32..32 * 32 + 16 * 16],
+            &reference[32 * 32 + 16 * 16..],
+        );
+        assert_eq!(
+            image.y_plane.as_slice(),
+            ry,
+            "Y plane must match ffmpeg/dav1d reference bit-exactly"
+        );
+        assert_eq!(
+            image.u_plane.as_slice(),
+            ru,
+            "U plane must match ffmpeg/dav1d reference bit-exactly"
+        );
+        assert_eq!(
+            image.v_plane.as_slice(),
+            rv,
+            "V plane must match ffmpeg/dav1d reference bit-exactly"
+        );
+    }
+
+    /// Real-world AVIF alpha auxiliary images are routinely encoded as
+    /// monochrome AV1 (libaom's alpha output has no chroma planes), which
+    /// this crate's keyframe decoder does not implement. `decode()` must
+    /// fail honestly — naming the alpha image specifically — rather than
+    /// silently returning the colour image as if it had no alpha.
+    #[cfg(feature = "av1")]
+    #[test]
+    fn decode_real_avif_fixture_with_alpha_honest_err() {
+        let bytes: &[u8] = include_bytes!("testdata/with_alpha.avif");
+
+        // The container itself is well-formed and reports alpha.
+        let probe = AvifDecoder::probe(bytes).expect("probe must succeed");
+        assert!(probe.has_alpha, "fixture must be probed as having alpha");
+
+        let err = AvifDecoder::decode(bytes)
+            .expect_err("alpha image is monochrome AV1, which is not implemented");
+        match err {
+            CodecError::UnsupportedFeature(msg) => {
+                assert!(
+                    msg.contains("alpha"),
+                    "error should name the alpha image, got: {msg}"
+                );
+            }
+            other => panic!("expected honest UnsupportedFeature, got {other:?}"),
+        }
+
+        // The raw AV1 bitstreams (both items) remain available honestly.
+        let payload = AvifDecoder::extract_av1_payload(bytes).expect("payload extraction");
+        assert!(!payload.color_obu.is_empty());
+        assert!(payload.alpha_obu.is_some_and(|a| !a.is_empty()));
+    }
+
+    /// 10-bit AV1 is unsupported by the keyframe decoder's reconstruction
+    /// stage (8-bit only). This proves the *colour*-path propagates the
+    /// AV1 decoder's honest error too (not just the alpha path), while the
+    /// container-level probe (which doesn't touch AV1 pixel decode) still
+    /// reports the real 10-bit depth.
+    #[cfg(feature = "av1")]
+    #[test]
+    fn decode_real_avif_10bit_honest_err() {
+        let bytes: &[u8] = include_bytes!("testdata/color_10bit.avif");
+
+        let probe = AvifDecoder::probe(bytes).expect("probe must succeed");
+        assert_eq!(probe.bit_depth, 10, "container must probe as 10-bit");
+
+        let err = AvifDecoder::decode(bytes).expect_err("10-bit AV1 decode is not implemented");
+        assert!(
+            matches!(err, CodecError::UnsupportedFeature(_)),
+            "expected honest UnsupportedFeature, got {err:?}"
+        );
+    }
+
     fn make_test_image(width: u32, height: u32, depth: u8, fmt: YuvFormat) -> AvifImage {
         let luma = width as usize * height as usize * if depth > 8 { 2 } else { 1 };
         let chroma = match fmt {
@@ -1382,20 +1220,49 @@ mod tests {
         assert_eq!(probe.bit_depth, 12);
     }
 
+    /// `AvifEncoder::encode()` writes a structurally valid container but
+    /// only a placeholder AV1 payload (sequence header + a zero-size
+    /// temporal delimiter — no coded frame at all; see the module docs).
+    /// `decode()` must not fabricate pixels from that: with the `av1`
+    /// feature enabled it reaches the real decoder, which honestly reports
+    /// that the payload produced no frame.
+    #[cfg(feature = "av1")]
     #[test]
-    fn test_decode_returns_honest_unsupported_error() {
+    fn test_decode_of_encoder_placeholder_errors_honestly() {
         let image = make_test_image(64, 48, 8, YuvFormat::Yuv420);
         let encoder = AvifEncoder::new(AvifConfig::default());
         let bytes = encoder.encode(&image).expect("encode failed");
 
-        // decode() must not pass raw AV1 bytes off as pixels — it reports
-        // the missing AV1 pixel-reconstruction stage honestly.
+        let result = AvifDecoder::decode(&bytes);
+        match result {
+            Err(CodecError::InvalidBitstream(msg)) => {
+                assert!(
+                    msg.contains("no frame"),
+                    "error must state the limitation clearly, got: {msg}"
+                );
+            }
+            other => panic!("expected honest InvalidBitstream error, got {other:?}"),
+        }
+    }
+
+    /// Same placeholder-decode scenario as
+    /// [`test_decode_of_encoder_placeholder_errors_honestly`], but built
+    /// without the `av1` cargo feature: `decode()` must still fail
+    /// honestly, naming the disabled feature rather than silently
+    /// succeeding or panicking.
+    #[cfg(not(feature = "av1"))]
+    #[test]
+    fn test_decode_without_av1_feature_errors_honestly() {
+        let image = make_test_image(64, 48, 8, YuvFormat::Yuv420);
+        let encoder = AvifEncoder::new(AvifConfig::default());
+        let bytes = encoder.encode(&image).expect("encode failed");
+
         let result = AvifDecoder::decode(&bytes);
         match result {
             Err(CodecError::UnsupportedFeature(msg)) => {
                 assert!(
-                    msg.contains("not yet implemented"),
-                    "error must state the limitation clearly, got: {msg}"
+                    msg.contains("av1"),
+                    "error must name the missing av1 feature, got: {msg}"
                 );
             }
             other => panic!("expected honest UnsupportedFeature error, got {other:?}"),
@@ -1447,13 +1314,14 @@ mod tests {
         let encoder = AvifEncoder::new(config);
         let bytes = encoder.encode(&image).expect("encode failed");
 
-        // decode() reports the pixel-reconstruction gap honestly …
+        // decode() must not fabricate pixels: AvifEncoder's own output has
+        // no real coded frame in either item (placeholder payload — see
+        // the module docs), so decode() fails honestly regardless of
+        // whether the `av1` feature is enabled (real decoder: "no frame
+        // produced"; feature disabled: "av1 feature is disabled").
         assert!(
-            matches!(
-                AvifDecoder::decode(&bytes),
-                Err(CodecError::UnsupportedFeature(_))
-            ),
-            "decode must be an honest UnsupportedFeature error"
+            AvifDecoder::decode(&bytes).is_err(),
+            "decode of a placeholder-only AVIF must be an honest error"
         );
 
         // … while the raw alpha AV1 OBU stays available via extraction.
@@ -1614,5 +1482,33 @@ mod tests {
         }
         // The full buffer still probes correctly (no false rejection).
         assert!(AvifDecoder::probe(&bytes).is_ok());
+    }
+
+    /// Same invariant as [`truncated_avif_never_panics_probe_or_decode`],
+    /// but over a *real* ffmpeg/libaom fixture rather than `AvifEncoder`'s
+    /// own output.
+    ///
+    /// This matters because `AvifEncoder`'s own placeholder payload makes
+    /// `color_offset + color_len == bytes.len()` exactly, so every `len in
+    /// 0..bytes.len()` prefix in the test above fails inside
+    /// `extract_av1_payload` and never reaches `decode_still_image` /
+    /// `Av1Decoder` at all -- the real AV1 keyframe decode path (and the
+    /// `iloc` version-0 item-extent loop in `container.rs`, which walks a
+    /// bitstream-declared `item_count` with variable `offset_size`/
+    /// `length_size`) gets zero truncation coverage from it. This fixture's
+    /// real `iloc` v0 box and real OBU bitstream close that gap: long
+    /// enough prefixes pass container validation and hand truncated OBU
+    /// bytes to `Av1Decoder` itself.
+    #[cfg(feature = "av1")]
+    #[test]
+    fn truncated_real_avif_fixture_never_panics() {
+        let bytes: &[u8] = include_bytes!("testdata/color_only.avif");
+        for len in 0..bytes.len() {
+            let prefix = &bytes[..len];
+            let _ = AvifDecoder::probe(prefix);
+            let _ = AvifDecoder::decode(prefix);
+        }
+        assert!(AvifDecoder::probe(bytes).is_ok());
+        assert!(AvifDecoder::decode(bytes).is_ok());
     }
 }

@@ -334,7 +334,7 @@ async fn run_ingest(
         });
         let s = serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Archive Pro Ingest".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Archive:", archive.display());
@@ -475,6 +475,76 @@ async fn run_verify(
 // Migrate
 // ---------------------------------------------------------------------------
 
+/// Which real re-encode path (if any) a [`oximedia_archive_pro::PreservationFormat`]
+/// migration target is wired to.
+enum RealMigration {
+    /// Real decode -> re-encode via the `oximedia_transcode` frame-level
+    /// pipeline, keyed by the `TranscodePipelineBuilder::audio_codec` name.
+    Audio(&'static str),
+    /// Real decode -> re-encode via `oximedia_image`, keyed by the target
+    /// raster format.
+    Image(oximedia_image::format_detect::ImageFormat),
+}
+
+/// Resolve which real conversion (if any) backs a preservation target.
+///
+/// Real re-encode is wired up for the audio preservation formats (genuinely
+/// decodes WAV/FLAC and re-encodes to FLAC or PCM/WAV via the same pipeline
+/// that backs `oximedia transcode` — see
+/// `oximedia-cli/tests/transcode_reencode.rs::flagship_wav_to_flac_round_trips`
+/// for an end-to-end, sample-exact proof) and for the raster image
+/// preservation formats (genuinely decodes any `oximedia_image`-supported
+/// input and re-encodes to PNG or uncompressed TIFF via the same codec path
+/// `oximedia image convert` uses).
+///
+/// Every other preservation target is refused outright — including for
+/// `--dry-run` — rather than ever emitting a copy+rename mislabeled as a
+/// converted preservation master: for a digital-preservation tool, that is a
+/// data-integrity lie (e.g. a WAV renamed `.mxf` reads back as a
+/// "successfully migrated" MXF file that is actually still a WAV). This
+/// specifically includes `VideoFfv1Mkv`: `oximedia_transcode`'s FFV1 encoder
+/// is real, but no container in this workspace can yet mux `V_FFV1` +
+/// `CodecPrivate` into Matroska (see `frame_level.rs::execute_video_job`'s
+/// `VideoTarget::Ffv1` arm) — writing raw FFV1 framing under the `.mkv`
+/// preservation-master label this format promises would be exactly the same
+/// mislabeling this function refuses to do for every other unimplemented
+/// target, so `VideoFfv1Mkv` stays an honest error rather than a
+/// silently-wrong container.
+///
+/// TODO(0.2.x): wire `VideoFfv1Mkv` once a Matroska muxer can carry FFV1,
+/// `VideoUtVideo` once a UT Video encoder exists, `ImageJpeg2000` once a
+/// JPEG 2000 encoder exists, and the document formats (PDF/A, plain text)
+/// once real document pipelines exist for those domains.
+fn resolve_real_migration(pf: oximedia_archive_pro::PreservationFormat) -> Option<RealMigration> {
+    use oximedia_archive_pro::PreservationFormat;
+    match pf {
+        PreservationFormat::AudioFlac => Some(RealMigration::Audio("flac")),
+        PreservationFormat::AudioWav => Some(RealMigration::Audio("pcm")),
+        PreservationFormat::ImagePng => Some(RealMigration::Image(
+            oximedia_image::format_detect::ImageFormat::Png,
+        )),
+        PreservationFormat::ImageTiff => Some(RealMigration::Image(
+            oximedia_image::format_detect::ImageFormat::Tiff,
+        )),
+        _ => None,
+    }
+}
+
+/// Detect an input image's format from its magic bytes, mirroring
+/// `image_cmd.rs::convert_image`'s detection step.
+fn detect_image_format(
+    input: &std::path::Path,
+) -> Result<oximedia_image::format_detect::ImageFormat> {
+    let file_size = std::fs::metadata(input)
+        .with_context(|| format!("Failed to read metadata: {}", input.display()))?
+        .len();
+    let mut buf = vec![0u8; 2048.min(file_size as usize)];
+    let mut f = std::fs::File::open(input)
+        .with_context(|| format!("Failed to open input file: {}", input.display()))?;
+    std::io::Read::read(&mut f, &mut buf).context("Failed to read file header")?;
+    Ok(oximedia_image::format_detect::FormatDetector::detect(&buf))
+}
+
 async fn run_migrate(
     input: &PathBuf,
     output: &PathBuf,
@@ -490,36 +560,15 @@ async fn run_migrate(
 
     let pf = parse_preservation_format(target)?;
 
-    // Real re-encode is wired up only for the audio preservation formats
-    // today, via the same `oximedia_transcode` frame-level pipeline that
-    // backs `oximedia transcode` (it genuinely decodes WAV/FLAC and
-    // re-encodes to FLAC or PCM/WAV — see
-    // `oximedia-cli/tests/transcode_reencode.rs::flagship_wav_to_flac_round_trips`
-    // for an end-to-end, sample-exact proof). Every other preservation
-    // target (lossless video, image, document) would require real
-    // codec/container/format work this crate does not yet have wired
-    // end-to-end. Refuse outright — including for `--dry-run` — rather than
-    // ever emit a copy+rename mislabeled as a converted preservation
-    // master: for a digital-preservation tool, that is a data-integrity lie
-    // (e.g. a WAV renamed `.mxf` reads back as a "successfully migrated"
-    // MXF file that is actually still a WAV).
-    //
-    // TODO(0.2.x): wire real video (FFV1/UT Video), image (TIFF/PNG/JP2),
-    // and document (PDF/A, plain text) preservation migration once real
-    // codec/container/format pipelines exist for those domains.
-    let audio_codec_name = match pf {
-        oximedia_archive_pro::PreservationFormat::AudioFlac => "flac",
-        oximedia_archive_pro::PreservationFormat::AudioWav => "pcm",
-        _ => {
-            return Err(anyhow::anyhow!(
-                "archive-pro migrate: real format conversion for '{}' -> {target} ({}) is not \
-                 yet implemented; refusing to emit a mislabeled copy. Real conversion is \
-                 currently available only for: flac, wav.",
-                input.display(),
-                pf.description(),
-            ));
-        }
-    };
+    let real_migration = resolve_real_migration(pf).ok_or_else(|| {
+        anyhow::anyhow!(
+            "archive-pro migrate: real format conversion for '{}' -> {target} ({}) is not \
+             yet implemented; refusing to emit a mislabeled copy. Real conversion is \
+             currently available only for: flac, wav, png, tiff.",
+            input.display(),
+            pf.description(),
+        )
+    })?;
 
     let filename = input.file_name().unwrap_or_default().to_string_lossy();
     let new_name = format!(
@@ -545,7 +594,7 @@ async fn run_migrate(
             });
             let s = serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
             println!("{s}");
-        } else {
+        } else if !crate::progress::is_quiet() {
             println!("{}", "Archive Pro Migrate".green().bold());
             println!("{}", "=".repeat(60));
             println!("{:20} {}", "Input:", input.display());
@@ -566,26 +615,54 @@ async fn run_migrate(
     }
     let dest = output.join(&new_name);
 
-    let mut pipeline = TranscodePipeline::builder()
-        .input(input.clone())
-        .output(dest.clone())
-        .audio_codec(audio_codec_name)
-        .build()
-        .map_err(|e| {
-            anyhow::anyhow!("archive-pro migrate: failed to configure conversion pipeline: {e}")
-        })?;
+    let output_size_bytes: u64 = match real_migration {
+        RealMigration::Audio(audio_codec_name) => {
+            let mut pipeline = TranscodePipeline::builder()
+                .input(input.clone())
+                .output(dest.clone())
+                .audio_codec(audio_codec_name)
+                .build()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "archive-pro migrate: failed to configure conversion pipeline: {e}"
+                    )
+                })?;
 
-    let transcode_output = match pipeline.execute().await {
-        Ok(out) => out,
-        Err(e) => {
-            // Never leave a partially-written / fabricated output file
-            // behind after a failed real conversion.
-            std::fs::remove_file(&dest).ok();
-            return Err(anyhow::anyhow!(
-                "archive-pro migrate: real conversion of '{}' to {} failed: {e}",
-                input.display(),
-                pf.description()
-            ));
+            match pipeline.execute().await {
+                Ok(out) => out.file_size,
+                Err(e) => {
+                    // Never leave a partially-written / fabricated output
+                    // file behind after a failed real conversion.
+                    std::fs::remove_file(&dest).ok();
+                    return Err(anyhow::anyhow!(
+                        "archive-pro migrate: real conversion of '{}' to {} failed: {e}",
+                        input.display(),
+                        pf.description()
+                    ));
+                }
+            }
+        }
+        RealMigration::Image(out_fmt) => {
+            let in_fmt = detect_image_format(input)?;
+            let frame = crate::image_cmd::read_input_frame(input, &in_fmt).map_err(|e| {
+                anyhow::anyhow!(
+                    "archive-pro migrate: real conversion of '{}' to {} failed: could not \
+                     decode input as an image: {e}",
+                    input.display(),
+                    pf.description()
+                )
+            })?;
+            match crate::image_cmd::write_output_frame(&dest, &frame, &out_fmt, None, 100) {
+                Ok(()) => std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0),
+                Err(e) => {
+                    std::fs::remove_file(&dest).ok();
+                    return Err(anyhow::anyhow!(
+                        "archive-pro migrate: real conversion of '{}' to {} failed: {e}",
+                        input.display(),
+                        pf.description()
+                    ));
+                }
+            }
         }
     };
 
@@ -600,11 +677,11 @@ async fn run_migrate(
             "dry_run": false,
             "new_filename": new_name,
             "real_conversion": true,
-            "output_size_bytes": transcode_output.file_size,
+            "output_size_bytes": output_size_bytes,
         });
         let s = serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Archive Pro Migrate".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Input:", input.display());
@@ -614,7 +691,7 @@ async fn run_migrate(
         println!(
             "{:20} {:.2} MB",
             "Output size:",
-            transcode_output.file_size as f64 / (1024.0 * 1024.0)
+            output_size_bytes as f64 / (1024.0 * 1024.0)
         );
         println!();
         println!(
@@ -682,7 +759,7 @@ async fn run_report(
     if json_output {
         let s = serde_json::to_string_pretty(&report_data).context("JSON serialization failed")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Archive Pro Report".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Archive:", archive.display());
@@ -752,7 +829,7 @@ async fn run_policy(
             let s = serde_json::to_string_pretty(&policy).context("Serialization failed")?;
             std::fs::write(policy_path, s)
                 .with_context(|| format!("Failed to write policy: {}", policy_path.display()))?;
-            if !json_output {
+            if !json_output && !crate::progress::is_quiet() {
                 println!(
                     "{} Policy saved to {}",
                     "OK:".green(),
@@ -943,12 +1020,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_migrate_unsupported_target_is_honest_err_no_output() {
+        // "jp2" (JPEG 2000) has no real encoder wired anywhere in the
+        // workspace, so it must stay an honest error. ("tiff"/"png" moved to
+        // the real-conversion tests below once the image path was wired.)
         let input = archivepro_temp_path("mig_unsupported_in.wav");
         let out_dir = archivepro_temp_path("mig_unsupported_out_dir");
         std::fs::write(&input, make_sine_wav(440.0, 48_000, 1, 0.1)).expect("write wav fixture");
         std::fs::remove_dir_all(&out_dir).ok();
 
-        let err = run_migrate(&input, &out_dir, "tiff", false, false, false, true)
+        let err = run_migrate(&input, &out_dir, "jp2", false, false, false, true)
             .await
             .expect_err("unimplemented preservation target must be an honest error");
         let msg = err.to_string();
@@ -970,11 +1050,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_migrate_dry_run_does_not_bypass_honesty_check() {
+        // "pdf-a" has no real document pipeline wired, so even a dry-run
+        // plan must be refused (dry-run must not bypass the honesty check).
         let input = archivepro_temp_path("mig_dryrun_unsupported_in.wav");
         std::fs::write(&input, make_sine_wav(440.0, 48_000, 1, 0.1)).expect("write wav fixture");
         let out_dir = archivepro_temp_path("mig_dryrun_unsupported_out_dir");
 
-        let result = run_migrate(&input, &out_dir, "png", true, false, false, true).await;
+        let result = run_migrate(&input, &out_dir, "pdf-a", true, false, false, true).await;
         assert!(
             result.is_err(),
             "dry-run must not report a fake successful plan for an unimplemented target"
@@ -996,6 +1078,120 @@ mod tests {
         assert!(!out_dir.exists(), "dry-run must not touch the filesystem");
 
         std::fs::remove_file(&input).ok();
+    }
+
+    /// Build a minimal, genuinely valid PNG file (4x4 RGB) via the real
+    /// `oximedia_image` encoder, so image-migration tests exercise the REAL
+    /// decode -> re-encode pipeline rather than a byte stub.
+    fn make_tiny_png(path: &std::path::Path) {
+        let width = 4u32;
+        let height = 4u32;
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.push((x * 60) as u8);
+                pixels.push((y * 60) as u8);
+                pixels.push(128u8);
+            }
+        }
+        let png = oximedia_image::png::PngImage {
+            width,
+            height,
+            bit_depth: 8,
+            color_type: oximedia_image::png::PngColorType::Rgb,
+            pixels,
+            metadata: std::collections::HashMap::new(),
+        };
+        oximedia_image::png::write_png(path, &png).expect("write png fixture");
+    }
+
+    #[tokio::test]
+    async fn test_run_migrate_real_png_to_tiff_is_genuine_reencode() {
+        let input = archivepro_temp_path("mig_png_to_tiff_in.png");
+        let out_dir = archivepro_temp_path("mig_png_to_tiff_out_dir");
+        make_tiny_png(&input);
+        std::fs::remove_dir_all(&out_dir).ok();
+
+        run_migrate(&input, &out_dir, "tiff", false, false, false, true)
+            .await
+            .expect("real PNG -> TIFF migration must succeed");
+
+        let dest = expected_migrate_dest(&out_dir, &input, "tiff");
+        let tiff_bytes = std::fs::read(&dest).expect("output tiff must exist");
+        assert!(
+            tiff_bytes.starts_with(b"II*\0") || tiff_bytes.starts_with(b"MM\0*"),
+            "output must be a real TIFF stream (little- or big-endian magic), not a renamed copy"
+        );
+        let input_bytes = std::fs::read(&input).expect("read input");
+        assert_ne!(
+            tiff_bytes[..tiff_bytes.len().min(256)],
+            input_bytes[..input_bytes.len().min(256)],
+            "output must not be a byte copy of the input"
+        );
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_run_migrate_real_png_to_png_is_genuine_reencode() {
+        let input = archivepro_temp_path("mig_png_to_png_in.png");
+        let out_dir = archivepro_temp_path("mig_png_to_png_out_dir");
+        make_tiny_png(&input);
+        std::fs::remove_dir_all(&out_dir).ok();
+
+        run_migrate(&input, &out_dir, "png", false, false, false, true)
+            .await
+            .expect("real PNG -> PNG (preservation re-encode) migration must succeed");
+
+        let dest = expected_migrate_dest(&out_dir, &input, "png");
+        let png_bytes = std::fs::read(&dest).expect("output png must exist");
+        assert!(
+            png_bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']),
+            "output must be a real PNG stream"
+        );
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_run_migrate_dry_run_image_target_writes_nothing() {
+        let input = archivepro_temp_path("mig_dryrun_png_in.png");
+        make_tiny_png(&input);
+        let out_dir = archivepro_temp_path("mig_dryrun_png_out_dir");
+        std::fs::remove_dir_all(&out_dir).ok();
+
+        run_migrate(&input, &out_dir, "tiff", true, false, false, true)
+            .await
+            .expect("dry-run on the now-real-conversion-capable tiff target must succeed");
+        assert!(!out_dir.exists(), "dry-run must not touch the filesystem");
+
+        std::fs::remove_file(&input).ok();
+    }
+
+    #[tokio::test]
+    async fn test_run_migrate_non_image_input_honest_err_no_fabricated_output() {
+        let input = archivepro_temp_path("mig_garbage_in.png");
+        std::fs::write(&input, b"not a real png file at all, just some bytes")
+            .expect("write garbage");
+        let out_dir = archivepro_temp_path("mig_garbage_png_out_dir");
+        std::fs::remove_dir_all(&out_dir).ok();
+
+        let result = run_migrate(&input, &out_dir, "tiff", false, false, false, true).await;
+        assert!(
+            result.is_err(),
+            "a non-image input must not silently 'convert' to TIFF"
+        );
+
+        let dest = expected_migrate_dest(&out_dir, &input, "tiff");
+        assert!(
+            !dest.exists(),
+            "no fabricated TIFF output may remain after a failed real conversion"
+        );
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 
     #[tokio::test]

@@ -51,6 +51,14 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+/// `esds` (MPEG-4 `ES_Descriptor`) construction, re-exported here so an
+/// `mp4a` track can be described in one `use`.
+///
+/// See [`crate::mux::mp4::esds`] for the descriptor layout.
+pub use super::esds::{
+    build_audio_specific_config, build_esds_box, build_esds_payload, EsdsParams,
+};
+
 // ─── Error ───────────────────────────────────────────────────────────────────
 
 /// Errors produced by [`SimpleMp4Muxer`].
@@ -398,74 +406,164 @@ impl SimpleMp4Muxer {
         writer: &mut dyn Write,
         ftyp_size: u64,
     ) -> Result<(), SimpleMp4Error> {
-        // Collect all sample data (interleaved by track, then by sample order)
-        // For simplicity we write all samples of track 0, then track 1, etc.
-        let (mdat_payload, per_track_chunk_offsets_relative) = self.collect_mdat_data();
+        // Collect all sample data, interleaved across tracks in DTS order.
+        let (mdat_payload, layouts) = self.collect_mdat_data();
+
+        // The mdat header is 8 bytes normally, 16 bytes when the box needs the
+        // 64-bit `largesize` form. This does not depend on the moov size, so it
+        // can be settled before the offset fixup passes.
+        let mdat_header = build_mdat_header(mdat_payload.len() as u64);
+        let mdat_header_len = mdat_header.len() as u64;
+
+        let use_co64 = self.resolve_co64(ftyp_size, mdat_header_len, &layouts);
 
         // First pass: build moov with placeholder offsets to measure its size.
-        let placeholder_moov =
-            self.build_moov_progressive(&per_track_chunk_offsets_relative, ftyp_size, 0);
+        let placeholder_moov = self.build_moov_progressive(&layouts, 0, use_co64);
         let moov_size = placeholder_moov.len() as u64;
 
-        // The mdat box starts at: ftyp_size + moov_size.
-        // The actual sample data starts 8 bytes later (mdat box header).
-        let mdat_box_start = ftyp_size + moov_size;
-        let mdat_data_start = mdat_box_start + 8; // 4-byte size + 4-byte "mdat"
+        // Sample data begins right after the mdat box header.
+        let mdat_data_start = ftyp_size + moov_size + mdat_header_len;
 
         // Second pass: build moov with correct absolute offsets.
-        let final_moov = self.build_moov_progressive(
-            &per_track_chunk_offsets_relative,
-            ftyp_size,
-            mdat_data_start,
+        let final_moov = self.build_moov_progressive(&layouts, mdat_data_start, use_co64);
+        debug_assert_eq!(
+            final_moov.len() as u64,
+            moov_size,
+            "moov size must not change between offset passes"
         );
 
         writer.write_all(&final_moov)?;
-
-        // mdat box
-        let mdat_size = 8u32.saturating_add(u32::try_from(mdat_payload.len()).unwrap_or(u32::MAX));
-        writer.write_all(&mdat_size.to_be_bytes())?;
-        writer.write_all(b"mdat")?;
+        writer.write_all(&mdat_header)?;
         writer.write_all(&mdat_payload)?;
 
         Ok(())
     }
 
-    /// Returns `(mdat_payload, per_track_relative_chunk_offsets)`.
+    /// Decides whether chunk offsets must be written as 64-bit `co64` entries.
     ///
-    /// All offsets are relative to the start of the mdat payload (i.e. the byte
-    /// immediately after the 8-byte mdat header).  Callers add the absolute
-    /// position of the mdat payload to obtain file-level chunk offsets.
-    fn collect_mdat_data(&self) -> (Vec<u8>, Vec<Vec<u64>>) {
-        let mut payload = Vec::new();
-        let mut all_offsets: Vec<Vec<u64>> = Vec::new();
+    /// This has to be settled *before* the moov is measured: switching
+    /// `stco` → `co64` grows every entry from 4 to 8 bytes, so a placeholder
+    /// built with `stco` would give a smaller moov than the file finally has
+    /// and every chunk offset would point too early. Widening only ever pushes
+    /// offsets further out, so the fixed point is reached in at most two
+    /// iterations; the loop bound is a belt-and-braces guard.
+    fn resolve_co64(&self, ftyp_size: u64, mdat_header_len: u64, layouts: &[TrackLayout]) -> bool {
+        let max_relative_offset = layouts
+            .iter()
+            .filter_map(|l| l.chunk_offsets.last().copied())
+            .max()
+            .unwrap_or(0);
 
-        for track in &self.tracks {
-            let mut offsets: Vec<u64> = Vec::new();
-            // Each sample is its own chunk (simplest valid layout).
-            for sample in &track.samples {
-                offsets.push(payload.len() as u64);
-                payload.extend_from_slice(&sample.data);
+        let mut use_co64 = false;
+        for _ in 0..4 {
+            let moov_size = self.build_moov_progressive(layouts, 0, use_co64).len() as u64;
+            let data_start = ftyp_size
+                .saturating_add(moov_size)
+                .saturating_add(mdat_header_len);
+            let needs_co64 = data_start.saturating_add(max_relative_offset) > u64::from(u32::MAX);
+            if needs_co64 == use_co64 {
+                break;
             }
-            all_offsets.push(offsets);
+            use_co64 = needs_co64;
+        }
+        use_co64
+    }
+
+    /// Returns `(mdat_payload, per_track_layout)`.
+    ///
+    /// Samples from all tracks are **interleaved by decode timestamp** so a
+    /// player only has to seek forward through `mdat`; consecutive samples that
+    /// belong to the same track are grouped into one chunk, which is what the
+    /// emitted `stsc`/`stco` tables describe.
+    ///
+    /// Tracks may use different timescales, so DTS values are compared as exact
+    /// rationals (`dts_a / ts_a` vs `dts_b / ts_b`) via cross-multiplication in
+    /// `i128` — never by comparing raw ticks. Ties keep the lower track index
+    /// first, so the ordering is deterministic.
+    ///
+    /// All offsets are relative to the start of the mdat payload (the byte
+    /// immediately after the mdat box header). Callers add the absolute position
+    /// of that payload to obtain file-level chunk offsets.
+    fn collect_mdat_data(&self) -> (Vec<u8>, Vec<TrackLayout>) {
+        let mut layouts: Vec<TrackLayout> =
+            self.tracks.iter().map(|_| TrackLayout::default()).collect();
+        let mut payload = Vec::new();
+
+        // k-way merge over the per-track sample lists.
+        let mut cursors = vec![0usize; self.tracks.len()];
+        let mut order: Vec<(usize, usize)> = Vec::new();
+        let total: usize = self.tracks.iter().map(|t| t.samples.len()).sum();
+        order.reserve(total);
+
+        loop {
+            let mut best: Option<(usize, i128, i128)> = None;
+            for (track_idx, track) in self.tracks.iter().enumerate() {
+                let Some(sample) = track.samples.get(cursors[track_idx]) else {
+                    continue;
+                };
+                let timescale = i128::from(track.codec.timescale().max(1));
+                let dts = i128::from(sample.dts);
+                match best {
+                    None => best = Some((track_idx, dts, timescale)),
+                    Some((_, best_dts, best_ts)) => {
+                        if dts * best_ts < best_dts * timescale {
+                            best = Some((track_idx, dts, timescale));
+                        }
+                    }
+                }
+            }
+            let Some((track_idx, _, _)) = best else {
+                break;
+            };
+            order.push((track_idx, cursors[track_idx]));
+            cursors[track_idx] += 1;
         }
 
-        (payload, all_offsets)
+        // Group consecutive same-track runs into chunks.
+        let mut i = 0usize;
+        while i < order.len() {
+            let track_idx = order[i].0;
+            let chunk_offset = payload.len() as u64;
+            let mut samples_in_chunk = 0u32;
+            while i < order.len() && order[i].0 == track_idx {
+                let sample_idx = order[i].1;
+                if let Some(sample) = self.tracks[track_idx].samples.get(sample_idx) {
+                    payload.extend_from_slice(&sample.data);
+                }
+                samples_in_chunk += 1;
+                i += 1;
+            }
+            layouts[track_idx].chunk_offsets.push(chunk_offset);
+            layouts[track_idx]
+                .chunk_sample_counts
+                .push(samples_in_chunk);
+        }
+
+        (payload, layouts)
     }
 
     fn build_moov_progressive(
         &self,
-        relative_offsets: &[Vec<u64>],
-        _ftyp_size: u64,
+        layouts: &[TrackLayout],
         mdat_data_start: u64,
+        force_co64: bool,
     ) -> Vec<u8> {
         let mut content = Vec::new();
         content.extend(build_mvhd(self.max_duration_ms()));
 
+        let empty = TrackLayout::default();
         for (i, track) in self.tracks.iter().enumerate() {
-            let rel_offsets = relative_offsets.get(i).map_or(&[][..], |v| v.as_slice());
+            let layout = layouts.get(i).unwrap_or(&empty);
             // Absolute offsets = relative + mdat_data_start
-            let abs_offsets: Vec<u64> = rel_offsets.iter().map(|&o| o + mdat_data_start).collect();
-            content.extend(build_trak(track, &abs_offsets));
+            let absolute = TrackLayout {
+                chunk_offsets: layout
+                    .chunk_offsets
+                    .iter()
+                    .map(|&o| o.saturating_add(mdat_data_start))
+                    .collect(),
+                chunk_sample_counts: layout.chunk_sample_counts.clone(),
+            };
+            content.extend(build_trak(track, &absolute, force_co64));
         }
 
         encode_box(b"moov", &content)
@@ -522,22 +620,70 @@ impl SimpleMp4Muxer {
         }
         content.extend(encode_box(b"mvex", &mvex_content));
 
+        // Init-segment traks: ISO/IEC 14496-12 §8.8.1 requires the sample
+        // tables in a fragmented file's `moov` to be empty — the samples are
+        // described by the `trun` boxes in each fragment. Emitting the full
+        // tables here would make every sample appear twice to a reader that
+        // understands both.
         for track in &self.tracks {
-            content.extend(build_trak(track, &[]));
+            content.extend(build_trak_fragmented(track));
         }
 
         encode_box(b"moov", &content)
     }
 }
 
+// ─── Track chunk layout ──────────────────────────────────────────────────────
+
+/// Where one track's samples ended up inside `mdat`.
+///
+/// `chunk_offsets[i]` is the byte offset of chunk `i` and
+/// `chunk_sample_counts[i]` how many of this track's samples it holds; together
+/// they drive the `stco`/`co64` and `stsc` tables.
+#[derive(Debug, Default, Clone)]
+struct TrackLayout {
+    chunk_offsets: Vec<u64>,
+    chunk_sample_counts: Vec<u32>,
+}
+
 // ─── Box encoding helpers ────────────────────────────────────────────────────
 
-/// Encode a regular ISOBMFF box: 4-byte size + 4-byte type + payload.
-fn encode_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-    let total: u32 = 8u32.saturating_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
-    let mut out = Vec::with_capacity(total as usize);
-    out.extend_from_slice(&total.to_be_bytes());
-    out.extend_from_slice(box_type);
+/// Builds an ISOBMFF box header for a payload of `payload_len` bytes.
+///
+/// Emits the compact 8-byte form (`size` + `type`) whenever the total box size
+/// fits in 32 bits, and the 16-byte `largesize` form (`size == 1`, `type`,
+/// 64-bit `largesize`) when it does not. Silently truncating a >4 GiB box to a
+/// `u32` produces a file whose `mdat` claims a wrong length and whose sample
+/// offsets all point past the end.
+fn build_box_header(box_type: &[u8; 4], payload_len: u64) -> Vec<u8> {
+    let compact_total = payload_len.saturating_add(8);
+    let mut out = Vec::with_capacity(16);
+    if let Ok(total) = u32::try_from(compact_total) {
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(box_type);
+    } else {
+        out.extend_from_slice(&1u32.to_be_bytes()); // size == 1 → largesize follows
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(&payload_len.saturating_add(16).to_be_bytes());
+    }
+    out
+}
+
+/// Builds the header for the `mdat` box holding `payload_len` bytes.
+///
+/// Returns 8 bytes for the normal form and 16 bytes for the 64-bit
+/// `largesize` form.
+fn build_mdat_header(payload_len: u64) -> Vec<u8> {
+    build_box_header(b"mdat", payload_len)
+}
+
+/// Encode a regular ISOBMFF box: header + payload.
+///
+/// Uses the 64-bit `largesize` header form when the box exceeds `u32::MAX`.
+pub(super) fn encode_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let header = build_box_header(box_type, payload.len() as u64);
+    let mut out = Vec::with_capacity(header.len() + payload.len());
+    out.extend_from_slice(&header);
     out.extend_from_slice(payload);
     out
 }
@@ -593,10 +739,19 @@ fn build_mvhd(duration_ms: u32) -> Vec<u8> {
 
 // ─── trak ───────────────────────────────────────────────────────────────────
 
-fn build_trak(track: &Mp4TrackWriter, chunk_offsets: &[u64]) -> Vec<u8> {
+fn build_trak(track: &Mp4TrackWriter, layout: &TrackLayout, force_co64: bool) -> Vec<u8> {
     let mut content = Vec::new();
     content.extend(build_tkhd(track));
-    content.extend(build_mdia(track, chunk_offsets));
+    content.extend(build_mdia(track, layout, force_co64, false));
+    encode_box(b"trak", &content)
+}
+
+/// Builds a `trak` for a fragmented init segment: same headers, but with empty
+/// sample tables.
+fn build_trak_fragmented(track: &Mp4TrackWriter) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.extend(build_tkhd(track));
+    content.extend(build_mdia(track, &TrackLayout::default(), false, true));
     encode_box(b"trak", &content)
 }
 
@@ -647,11 +802,16 @@ fn build_tkhd(track: &Mp4TrackWriter) -> Vec<u8> {
 
 // ─── mdia ───────────────────────────────────────────────────────────────────
 
-fn build_mdia(track: &Mp4TrackWriter, chunk_offsets: &[u64]) -> Vec<u8> {
+fn build_mdia(
+    track: &Mp4TrackWriter,
+    layout: &TrackLayout,
+    force_co64: bool,
+    empty_tables: bool,
+) -> Vec<u8> {
     let mut content = Vec::new();
     content.extend(build_mdhd(track));
     content.extend(build_hdlr(track));
-    content.extend(build_minf(track, chunk_offsets));
+    content.extend(build_minf(track, layout, force_co64, empty_tables));
     encode_box(b"mdia", &content)
 }
 
@@ -686,7 +846,12 @@ fn build_hdlr(track: &Mp4TrackWriter) -> Vec<u8> {
 
 // ─── minf ───────────────────────────────────────────────────────────────────
 
-fn build_minf(track: &Mp4TrackWriter, chunk_offsets: &[u64]) -> Vec<u8> {
+fn build_minf(
+    track: &Mp4TrackWriter,
+    layout: &TrackLayout,
+    force_co64: bool,
+    empty_tables: bool,
+) -> Vec<u8> {
     let mut content = Vec::new();
 
     match &track.codec {
@@ -703,7 +868,7 @@ fn build_minf(track: &Mp4TrackWriter, chunk_offsets: &[u64]) -> Vec<u8> {
     }
 
     content.extend(build_dinf());
-    content.extend(build_stbl(track, chunk_offsets));
+    content.extend(build_stbl(track, layout, force_co64, empty_tables));
     encode_box(b"minf", &content)
 }
 
@@ -720,10 +885,27 @@ fn build_dinf() -> Vec<u8> {
 
 // ─── stbl ───────────────────────────────────────────────────────────────────
 
-fn build_stbl(track: &Mp4TrackWriter, chunk_offsets: &[u64]) -> Vec<u8> {
+fn build_stbl(
+    track: &Mp4TrackWriter,
+    layout: &TrackLayout,
+    force_co64: bool,
+    empty_tables: bool,
+) -> Vec<u8> {
     let mut content = Vec::new();
 
     content.extend(build_stsd(track));
+
+    if empty_tables {
+        content.extend(encode_full_box(b"stts", 0, 0, &0u32.to_be_bytes()));
+        content.extend(encode_full_box(b"stsc", 0, 0, &0u32.to_be_bytes()));
+        let mut stsz = Vec::new();
+        stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_size
+        stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_count
+        content.extend(encode_full_box(b"stsz", 0, 0, &stsz));
+        content.extend(encode_full_box(b"stco", 0, 0, &0u32.to_be_bytes()));
+        return encode_box(b"stbl", &content);
+    }
+
     content.extend(build_stts(track));
 
     // ctts: only if any PTS ≠ DTS
@@ -731,9 +913,9 @@ fn build_stbl(track: &Mp4TrackWriter, chunk_offsets: &[u64]) -> Vec<u8> {
         content.extend(build_ctts(track));
     }
 
-    content.extend(build_stsc(track));
+    content.extend(build_stsc(&layout.chunk_sample_counts));
     content.extend(build_stsz(track));
-    content.extend(build_stco(chunk_offsets));
+    content.extend(build_stco(&layout.chunk_offsets, force_co64));
 
     // stss: sync sample table (only if not all samples are sync)
     if matches!(&track.codec, TrackCodec::Video(_)) && track.samples.iter().any(|s| !s.is_sync) {
@@ -849,16 +1031,25 @@ fn build_ctts(track: &Mp4TrackWriter) -> Vec<u8> {
 
 // ─── stsc (sample-to-chunk) ─────────────────────────────────────────────────
 
-fn build_stsc(track: &Mp4TrackWriter) -> Vec<u8> {
-    // With one sample per chunk the table has a single entry:
-    // first_chunk=1, samples_per_chunk=1, sample_description_index=1
+/// Builds the `stsc` (sample-to-chunk) table from the per-chunk sample counts
+/// produced by the interleaver.
+///
+/// Runs of chunks holding the same number of samples are collapsed into a
+/// single entry, exactly as ISO/IEC 14496-12 §8.7.4 prescribes.
+fn build_stsc(chunk_sample_counts: &[u32]) -> Vec<u8> {
+    // (first_chunk 1-based, samples_per_chunk, sample_description_index)
+    let mut entries: Vec<(u32, u32)> = Vec::new();
+    for (index, &count) in chunk_sample_counts.iter().enumerate() {
+        if entries.last().map(|e| e.1) != Some(count) {
+            entries.push(((index + 1) as u32, count));
+        }
+    }
+
     let mut c = Vec::new();
-    if track.samples.is_empty() {
-        c.extend_from_slice(&0u32.to_be_bytes()); // entry_count = 0
-    } else {
-        c.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-        c.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
-        c.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk
+    c.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (first_chunk, samples_per_chunk) in &entries {
+        c.extend_from_slice(&first_chunk.to_be_bytes());
+        c.extend_from_slice(&samples_per_chunk.to_be_bytes());
         c.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index
     }
     encode_full_box(b"stsc", 0, 0, &c)
@@ -889,8 +1080,8 @@ fn build_stsz(track: &Mp4TrackWriter) -> Vec<u8> {
 
 // ─── stco (chunk offsets) ───────────────────────────────────────────────────
 
-fn build_stco(chunk_offsets: &[u64]) -> Vec<u8> {
-    let use_64 = chunk_offsets.iter().any(|&o| o > u64::from(u32::MAX));
+fn build_stco(chunk_offsets: &[u64], force_co64: bool) -> Vec<u8> {
+    let use_64 = force_co64 || chunk_offsets.iter().any(|&o| o > u64::from(u32::MAX));
 
     let mut c = Vec::new();
     c.extend_from_slice(&(chunk_offsets.len() as u32).to_be_bytes());
@@ -946,56 +1137,70 @@ fn build_fragment(track: &Mp4TrackWriter, sequence_number: u32) -> Vec<u8> {
     mfhd_c.extend_from_slice(&sequence_number.to_be_bytes());
     let mfhd = encode_full_box(b"mfhd", 0, 0, &mfhd_c);
 
-    // trun flags: data_offset_present(0x001) | duration_present(0x100) | size_present(0x200)
-    let trun_flags: u32 = 0x0301;
-    let mut trun_c = Vec::new();
-    trun_c.extend_from_slice(&(track.samples.len() as u32).to_be_bytes()); // sample_count
-    trun_c.extend_from_slice(&0i32.to_be_bytes()); // data_offset placeholder
-
-    for sample in &track.samples {
-        trun_c.extend_from_slice(&sample.duration.to_be_bytes());
-        trun_c.extend_from_slice(&(sample.data.len() as u32).to_be_bytes());
-    }
-    let trun = encode_full_box(b"trun", 0, trun_flags, &trun_c);
-
-    // tfhd
+    // tfhd — default-base-is-moof: trun.data_offset is relative to the first
+    // byte of the enclosing moof box.
     let mut tfhd_c = Vec::new();
     tfhd_c.extend_from_slice(&track.track_id.to_be_bytes());
-    let tfhd = encode_full_box(b"tfhd", 0, 0x020000, &tfhd_c); // default-base-is-moof flag
+    let tfhd = encode_full_box(b"tfhd", 0, 0x0002_0000, &tfhd_c);
 
     // tfdt (base_media_decode_time = first sample DTS)
-    let base_dts = track.samples.first().map_or(0i64, |s| s.dts);
+    let base_dts = track.samples.first().map_or(0i64, |s| s.dts).max(0);
     let mut tfdt_c = Vec::new();
     tfdt_c.extend_from_slice(&(base_dts as u64).to_be_bytes());
     let tfdt = encode_full_box(b"tfdt", 1, 0, &tfdt_c);
 
-    // traf
-    let mut traf_content = Vec::new();
-    traf_content.extend(tfhd);
-    traf_content.extend(tfdt);
-    traf_content.extend(trun);
-    let traf = encode_box(b"traf", &traf_content);
+    // trun flags: data-offset(0x001) | sample-flags(0x400)
+    //           | duration(0x100) | size(0x200) | composition-offset(0x800)
+    let trun_flags: u32 = 0x0000_0F01;
+    let build_trun = |data_offset: i32| -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(&(track.samples.len() as u32).to_be_bytes()); // sample_count
+        c.extend_from_slice(&data_offset.to_be_bytes());
+        for sample in &track.samples {
+            c.extend_from_slice(&sample.duration.to_be_bytes());
+            c.extend_from_slice(&(sample.data.len() as u32).to_be_bytes());
+            // sample_flags: bit 16 is `sample_is_non_sync_sample`; sync samples
+            // additionally advertise sample_depends_on = 2 (independent).
+            let flags: u32 = if sample.is_sync {
+                0x0200_0000
+            } else {
+                0x0101_0000
+            };
+            c.extend_from_slice(&flags.to_be_bytes());
+            c.extend_from_slice(&((sample.pts - sample.dts) as i32).to_be_bytes());
+        }
+        // version=1 → signed composition offsets
+        encode_full_box(b"trun", 1, trun_flags, &c)
+    };
 
-    // moof
-    let mut moof_content = Vec::new();
-    moof_content.extend(mfhd);
-    moof_content.extend(traf);
-    let moof = encode_box(b"moof", &moof_content);
+    let build_moof = |data_offset: i32| -> Vec<u8> {
+        let mut traf_content = Vec::new();
+        traf_content.extend_from_slice(&tfhd);
+        traf_content.extend_from_slice(&tfdt);
+        traf_content.extend(build_trun(data_offset));
+        let traf = encode_box(b"traf", &traf_content);
 
-    // mdat
-    let mut mdat_payload = Vec::new();
-    for sample in &track.samples {
-        mdat_payload.extend_from_slice(&sample.data);
-    }
-    let mdat_size: u32 = 8u32.saturating_add(u32::try_from(mdat_payload.len()).unwrap_or(u32::MAX));
-    let mut mdat = Vec::with_capacity(mdat_size as usize);
-    mdat.extend_from_slice(&mdat_size.to_be_bytes());
-    mdat.extend_from_slice(b"mdat");
-    mdat.extend(mdat_payload);
+        let mut moof_content = Vec::new();
+        moof_content.extend_from_slice(&mfhd);
+        moof_content.extend(traf);
+        encode_box(b"moof", &moof_content)
+    };
 
-    let mut result = Vec::with_capacity(moof.len() + mdat.len());
+    // Two-pass: the trun data_offset counts from the start of the moof, so the
+    // moof has to be sized before the value can be written. Writing a 0
+    // placeholder and never patching it (as this builder used to) makes every
+    // reader fetch sample bytes from inside the moof header.
+    let moof_size = build_moof(0).len() as i32;
+    let mdat_payload_len: u64 = track.samples.iter().map(|s| s.data.len() as u64).sum();
+    let mdat_header = build_mdat_header(mdat_payload_len);
+    let moof = build_moof(moof_size + mdat_header.len() as i32);
+
+    let mut result = Vec::new();
     result.extend(moof);
-    result.extend(mdat);
+    result.extend_from_slice(&mdat_header);
+    for sample in &track.samples {
+        result.extend_from_slice(&sample.data);
+    }
     result
 }
 
@@ -1322,5 +1527,184 @@ mod tests {
         let a = TrackCodec::Audio(AudioCodecInfo::new(*b"Opus", 48000, 2));
         assert_eq!(v.handler_type(), b"vide");
         assert_eq!(a.handler_type(), b"soun");
+    }
+
+    // ── 64-bit box headers ────────────────────────────────────────────────
+
+    #[test]
+    fn mdat_header_uses_the_compact_form_when_it_fits() {
+        let header = build_mdat_header(100);
+        assert_eq!(header.len(), 8);
+        assert_eq!(read_u32_be(&header, 0), 108);
+        assert_eq!(&header[4..8], b"mdat");
+    }
+
+    #[test]
+    fn mdat_header_switches_to_largesize_past_u32() {
+        // 8 + payload must exceed u32::MAX for the compact form to be invalid.
+        let payload_len = u64::from(u32::MAX);
+        let header = build_mdat_header(payload_len);
+        assert_eq!(header.len(), 16, "largesize header is 16 bytes");
+        assert_eq!(read_u32_be(&header, 0), 1, "size == 1 signals largesize");
+        assert_eq!(&header[4..8], b"mdat");
+        let largesize = u64::from_be_bytes([
+            header[8], header[9], header[10], header[11], header[12], header[13], header[14],
+            header[15],
+        ]);
+        assert_eq!(largesize, payload_len + 16);
+    }
+
+    #[test]
+    fn mdat_header_boundary_is_exact() {
+        // Largest payload that still fits the 8-byte header.
+        let fits = u64::from(u32::MAX) - 8;
+        assert_eq!(build_mdat_header(fits).len(), 8);
+        assert_eq!(build_mdat_header(fits + 1).len(), 16);
+    }
+
+    // ── co64 selection ────────────────────────────────────────────────────
+
+    #[test]
+    fn build_stco_emits_co64_when_forced() {
+        let out = build_stco(&[0, 1024], true);
+        assert_eq!(&out[4..8], b"co64");
+        // FullBox header (12) + entry_count already consumed → 2 * 8 bytes
+        assert_eq!(out.len(), 12 + 4 + 16);
+    }
+
+    #[test]
+    fn build_stco_emits_co64_for_large_offsets() {
+        let out = build_stco(&[u64::from(u32::MAX) + 1], false);
+        assert_eq!(&out[4..8], b"co64");
+    }
+
+    #[test]
+    fn build_stco_emits_stco_for_small_offsets() {
+        let out = build_stco(&[0, 512], false);
+        assert_eq!(&out[4..8], b"stco");
+        assert_eq!(out.len(), 12 + 4 + 8);
+    }
+
+    #[test]
+    fn resolve_co64_triggers_past_four_gib() {
+        let mut muxer = SimpleMp4Muxer::new(SimpleMp4Config::new());
+        let id = muxer.add_track(default_video_codec());
+        muxer.write_sample(id, video_sample(0, true)).expect("ok");
+
+        let small = vec![TrackLayout {
+            chunk_offsets: vec![0, 4096],
+            chunk_sample_counts: vec![1, 1],
+        }];
+        assert!(!muxer.resolve_co64(32, 8, &small));
+
+        let huge = vec![TrackLayout {
+            chunk_offsets: vec![0, 5 * 1024 * 1024 * 1024],
+            chunk_sample_counts: vec![1, 1],
+        }];
+        assert!(
+            muxer.resolve_co64(32, 16, &huge),
+            "a 5 GiB mdat must select co64"
+        );
+    }
+
+    // ── stsc run-length encoding ──────────────────────────────────────────
+
+    #[test]
+    fn build_stsc_collapses_equal_runs() {
+        // 4 chunks: 3, 3, 1, 1 samples → two entries.
+        let out = build_stsc(&[3, 3, 1, 1]);
+        assert_eq!(&out[4..8], b"stsc");
+        let entry_count = read_u32_be(&out, 12);
+        assert_eq!(entry_count, 2);
+        assert_eq!(read_u32_be(&out, 16), 1, "first_chunk of entry 0");
+        assert_eq!(read_u32_be(&out, 20), 3, "samples_per_chunk of entry 0");
+        assert_eq!(read_u32_be(&out, 24), 1, "sample_description_index");
+        assert_eq!(read_u32_be(&out, 28), 3, "first_chunk of entry 1");
+        assert_eq!(read_u32_be(&out, 32), 1, "samples_per_chunk of entry 1");
+    }
+
+    #[test]
+    fn build_stsc_empty_track_has_no_entries() {
+        let out = build_stsc(&[]);
+        assert_eq!(read_u32_be(&out, 12), 0);
+    }
+
+    // ── DTS interleaving ──────────────────────────────────────────────────
+
+    #[test]
+    fn collect_mdat_data_interleaves_by_dts() {
+        let mut muxer = SimpleMp4Muxer::new(SimpleMp4Config::new());
+        let video = muxer.add_track(TrackCodec::Video(VideoCodecInfo::new(
+            *b"av01", 320, 240, 90_000,
+        )));
+        let audio = muxer.add_track(TrackCodec::Audio(AudioCodecInfo::new(*b"Opus", 48_000, 2)));
+
+        // Two 33 ms video frames and four 20 ms audio frames, i.e. video at
+        // 0 ms / 33 ms and audio at 0 / 20 / 40 / 60 ms.
+        for i in 0i64..2 {
+            muxer
+                .write_sample(
+                    video,
+                    Mp4Sample {
+                        pts: i * 3000,
+                        dts: i * 3000,
+                        duration: 3000,
+                        is_sync: true,
+                        data: vec![0x11; 4],
+                    },
+                )
+                .expect("ok");
+        }
+        for i in 0i64..4 {
+            muxer
+                .write_sample(
+                    audio,
+                    Mp4Sample {
+                        pts: i * 960,
+                        dts: i * 960,
+                        duration: 960,
+                        is_sync: true,
+                        data: vec![0x22; 2],
+                    },
+                )
+                .expect("ok");
+        }
+
+        let (payload, layouts) = muxer.collect_mdat_data();
+        assert_eq!(payload.len(), 2 * 4 + 4 * 2);
+
+        // Expected merge order (ms): V0(0) A0(0) A1(20) V1(33) A2(40) A3(60).
+        // Ties go to the lower track index, so V0 precedes A0.
+        // Chunks: [V0] [A0,A1] [V1] [A2,A3]
+        assert_eq!(layouts[0].chunk_sample_counts, vec![1, 1]);
+        assert_eq!(layouts[1].chunk_sample_counts, vec![2, 2]);
+        // Video samples are 4 bytes, audio samples 2 bytes.
+        assert_eq!(layouts[0].chunk_offsets, vec![0, 8]);
+        assert_eq!(layouts[1].chunk_offsets, vec![4, 12]);
+
+        // And the bytes must be laid out in that same order.
+        assert_eq!(
+            payload,
+            vec![
+                0x11, 0x11, 0x11, 0x11, // V0
+                0x22, 0x22, 0x22, 0x22, // A0, A1
+                0x11, 0x11, 0x11, 0x11, // V1
+                0x22, 0x22, 0x22, 0x22, // A2, A3
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_mdat_data_single_track_is_one_chunk() {
+        let mut muxer = SimpleMp4Muxer::new(SimpleMp4Config::new());
+        let id = muxer.add_track(default_video_codec());
+        for i in 0i64..3 {
+            muxer
+                .write_sample(id, video_sample(i * 3000, i == 0))
+                .expect("ok");
+        }
+        let (_, layouts) = muxer.collect_mdat_data();
+        assert_eq!(layouts[0].chunk_offsets, vec![0]);
+        assert_eq!(layouts[0].chunk_sample_counts, vec![3]);
     }
 }

@@ -14,19 +14,29 @@ fn test_aac_object_type_id() {
     assert_eq!(AacObjectType::HeAacV2.object_type_id(), 29);
 }
 
+/// AAC decoding is not implemented: every decode entry point must fail closed
+/// rather than hand back fabricated PCM.
 #[test]
-fn test_aac_decoder_new_and_empty_packet() {
+fn test_aac_decoder_decode_paths_error() {
     use oximedia_audio::aac::AacDecoder;
-    use oximedia_audio::traits::AudioDecoder;
+    use oximedia_audio::AudioError;
+
     let mut dec = AacDecoder::new();
-    // Feeding an empty packet is valid; no frame should be produced.
-    dec.send_packet(&[], 0)
-        .expect("empty packet must be accepted");
+    assert_eq!(AacDecoder::codec_name(), "aac");
+
+    let err = dec
+        .send_packet(&[], 0)
+        .expect_err("AAC decoding must not succeed");
     assert!(
-        dec.receive_frame().expect("no error on receive").is_none(),
-        "no frame expected from empty input"
+        matches!(err, AudioError::UnsupportedFormat(_)),
+        "expected UnsupportedFormat, got {err:?}"
     );
-    assert_eq!(dec.decode_errors(), 0);
+
+    assert!(
+        dec.receive_frame().is_err(),
+        "no frame may ever be produced by the AAC stub"
+    );
+    assert_eq!(dec.decode_errors(), 1);
 }
 
 // ─── alac ────────────────────────────────────────────────────────────────────

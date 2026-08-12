@@ -1,7 +1,10 @@
 //! Worker implementation for task execution
 
 mod executor;
+mod media;
 mod metrics;
+mod task_thumbnail;
+mod task_transcode;
 
 use crate::coordinator::worker_registry::WorkerCapabilities;
 use crate::pb::farm_coordinator_client::FarmCoordinatorClient;

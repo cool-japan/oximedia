@@ -7,7 +7,7 @@
 High-performance caching infrastructure for [OxiMedia](https://github.com/cool-japan/oximedia) --
 the Sovereign Media Framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 `oximedia-cache` provides seven complementary caching primitives designed for
 multimedia workloads: from single-node O(1) LRU caches to distributed

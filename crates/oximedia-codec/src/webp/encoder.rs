@@ -1,21 +1,24 @@
 //! VP8 lossy encoder for WebP.
 //!
-//! This module provides a simplified VP8 encoder that produces valid VP8 keyframe
-//! bitstreams suitable for embedding in a WebP container. The encoder implements:
+//! Produces conforming VP8 key frames suitable for embedding in a WebP
+//! container: RGB to YUV 4:2:0 (BT.601), 16x16 macroblocks with whole-block
+//! DC intra prediction, the forward 4x4 DCT/WHT, quality-mapped
+//! quantisation, and boolean arithmetic (range) coding.
 //!
-//! - RGB to YUV 4:2:0 color space conversion (BT.601)
-//! - 16x16 macroblock processing with DC intra prediction
-//! - Forward 4x4 DCT transform
-//! - Coefficient quantization with quality-based QP mapping
-//! - Boolean arithmetic coding (VP8 range coder)
-//! - VP8 keyframe bitstream assembly per RFC 6386
+//! Every entropy-coded field is written as the exact dual of what the
+//! in-crate decoder (`crate::vp8::dec`) reads — the boolean coder itself
+//! (RFC 6386 §7.3), the frame header field order (§19.2), the prediction
+//! mode trees (§11), and the DCT token trees, bands and contexts (§13). A
+//! range coder has no resynchronisation point, so a single field written
+//! with the wrong probability, in the wrong order, or omitted makes the
+//! entire remainder of the frame unparseable rather than merely degraded.
 //!
 //! # Limitations
 //!
-//! - Only generates keyframes (no inter prediction / P-frames)
-//! - Uses DC prediction mode exclusively (simplest intra prediction)
-//! - Single DCT partition (no multi-partition)
-//! - No rate-distortion optimization
+//! - Key frames only (no inter prediction / P-frames)
+//! - Whole-block DC prediction exclusively (no B_PRED, V, H or TM modes)
+//! - Single DCT token partition
+//! - No rate-distortion optimisation, and the loop filter is disabled
 //!
 //! # References
 //!
@@ -28,129 +31,152 @@
 use crate::error::{CodecError, CodecResult};
 
 // ---------------------------------------------------------------------------
-// VP8 default token probability tables (RFC 6386 Section 13.4)
+// VP8 DCT-token probability tables (RFC 6386 §13.4, §13.5)
 // ---------------------------------------------------------------------------
+//
+// Both tables are stored flat rather than as `[[[[u8; 11]; 3]; 8]; 4]`: the
+// nested form costs ~2x the source lines for no gain, and every access goes
+// through `coeff_prob_offset` anyway.
 
-/// Default coefficient probabilities for VP8 token decoding.
+/// Byte offset of the 11 tree-node probabilities for one
+/// `(block_type, coeff_band, prev_token_context)` triple.
 ///
-/// Layout: `[block_type][coeff_band][prev_coeff_ctx][token_node]`
-/// - block_type: 0..4 (DC-Y-after-Y2, AC-Y, DC/AC-UV, Y2)
-/// - coeff_band: 0..8
-/// - prev_coeff_ctx: 0..3 (0=zero, 1=one, 2=>=2)
-/// - token_node: 0..11 (tree probabilities)
+/// `block_type`: 0 = luma after Y2, 1 = Y2 (WHT), 2 = chroma, 3 = luma
+/// without Y2 (RFC 6386 §13.3).
+const fn coeff_prob_offset(block_type: usize, band: usize, ctx: usize) -> usize {
+    ((block_type * 8 + band) * 3 + ctx) * 11
+}
+
+/// Default DCT-token probabilities (RFC 6386 §13.5 `default_coeff_probs`,
+/// rfc6386.txt lines 3509+), flattened to
+/// `[block_type][coeff_band][prev_token_context][tree_node]` — index with
+/// [`coeff_prob_offset`].
 ///
-/// These are the "factory default" probabilities shipped with every VP8
-/// keyframe when no explicit updates are signaled.
-#[rustfmt::skip]
-static DEFAULT_COEFF_PROBS: [[[[u8; 11]; 3]; 8]; 4] = [
-    // Block type 0: DC component of Y after Y2
-    [
-        [[128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
-         [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
-         [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128]],
-        [[253, 136, 254, 255, 228, 219, 128, 128, 128, 128, 128],
-         [189, 129, 242, 255, 227, 213, 255, 219, 128, 128, 128],
-         [106, 126, 227, 252, 214, 209, 255, 255, 128, 128, 128]],
-        [[  1,  98, 248, 255, 236, 226, 255, 255, 128, 128, 128],
-         [181, 133, 238, 254, 211, 236, 255, 255, 128, 128, 128],
-         [ 78, 134, 202, 247, 198, 180, 255, 219, 128, 128, 128]],
-        [[  1, 185, 249, 255, 243, 255, 128, 128, 128, 128, 128],
-         [184, 150, 247, 255, 236, 224, 128, 128, 128, 128, 128],
-         [ 77, 110, 216, 255, 236, 230, 128, 128, 128, 128, 128]],
-        [[  1, 101, 251, 255, 241, 255, 128, 128, 128, 128, 128],
-         [170, 139, 241, 252, 236, 209, 255, 255, 128, 128, 128],
-         [ 37, 116, 196, 243, 228, 255, 255, 255, 128, 128, 128]],
-        [[  1, 204, 254, 255, 245, 255, 128, 128, 128, 128, 128],
-         [207, 160, 250, 255, 238, 128, 128, 128, 128, 128, 128],
-         [102, 103, 231, 255, 211, 171, 128, 128, 128, 128, 128]],
-        [[  1, 152, 252, 255, 240, 255, 128, 128, 128, 128, 128],
-         [177, 135, 243, 255, 234, 225, 128, 128, 128, 128, 128],
-         [ 80, 129, 211, 255, 194, 224, 128, 128, 128, 128, 128]],
-        [[  1,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [246,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128]],
-    ],
-    // Block type 1: AC coefficients of Y
-    [
-        [[198,  35, 237, 223, 193, 187, 162, 160, 145, 155,  62],
-         [131,  45, 198, 221, 172, 176, 220, 157, 252, 221,   1],
-         [ 68,  47, 146, 208, 149, 167, 221, 162, 255, 223, 128]],
-        [[  1, 149, 241, 255, 221, 224, 255, 255, 128, 128, 128],
-         [184, 141, 234, 253, 222, 220, 255, 199, 128, 128, 128],
-         [ 81, 99,  181, 242, 195, 203, 255, 219, 128, 128, 128]],
-        [[  1, 129, 232, 253, 214, 197, 242, 196, 255, 255, 128],
-         [132, 109, 223, 253, 214, 175, 255, 236, 128, 128, 128],
-         [ 68, 104, 184, 246, 171, 175, 255, 236, 128, 128, 128]],
-        [[  1, 200, 246, 255, 234, 255, 128, 128, 128, 128, 128],
-         [195, 148, 244, 255, 236, 203, 128, 128, 128, 128, 128],
-         [ 39, 130, 228, 255, 223, 255, 128, 128, 128, 128, 128]],
-        [[  1, 107, 238, 254, 198, 218, 255, 191, 128, 128, 128],
-         [188, 133, 238, 253, 233, 181, 128, 128, 128, 128, 128],
-         [ 36, 142, 199, 247, 175, 230, 255, 255, 128, 128, 128]],
-        [[  1, 238, 251, 255, 210, 128, 128, 128, 128, 128, 128],
-         [190, 171, 253, 255, 249, 128, 128, 128, 128, 128, 128],
-         [ 61, 104, 231, 255, 235, 128, 128, 128, 128, 128, 128]],
-        [[  1, 210, 247, 255, 255, 128, 128, 128, 128, 128, 128],
-         [164, 154, 246, 255, 249, 128, 128, 128, 128, 128, 128],
-         [ 29, 145, 228, 255, 220, 128, 128, 128, 128, 128, 128]],
-        [[  1,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [218,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128]],
-    ],
-    // Block type 2: DC/AC of UV
-    [
-        [[  1, 108, 226, 255, 227, 187, 128, 128, 128, 128, 128],
-         [117, 109, 203, 246, 197, 174, 255, 255, 128, 128, 128],
-         [ 15,  66, 128, 224, 149, 147, 255, 255, 128, 128, 128]],
-        [[  1,  59, 220, 255, 205, 206, 128, 128, 128, 128, 128],
-         [138,  40, 218, 255, 237, 219, 255, 255, 128, 128, 128],
-         [ 31,  27, 156, 248, 188, 175, 255, 255, 128, 128, 128]],
-        [[  1, 112, 230, 250, 199, 191, 255, 255, 128, 128, 128],
-         [116, 109, 225, 252, 198, 190, 255, 255, 128, 128, 128],
-         [ 41,  82, 163, 237, 156, 172, 255, 255, 128, 128, 128]],
-        [[  1,  74, 254, 255, 227, 128, 128, 128, 128, 128, 128],
-         [150, 101, 247, 255, 222, 128, 128, 128, 128, 128, 128],
-         [ 57,  56, 231, 255, 243, 128, 128, 128, 128, 128, 128]],
-        [[  1, 179, 255, 255, 128, 128, 128, 128, 128, 128, 128],
-         [176, 134, 243, 255, 228, 128, 128, 128, 128, 128, 128],
-         [ 80,  84, 234, 255, 210, 128, 128, 128, 128, 128, 128]],
-        [[  1, 253, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [185, 205, 255, 255, 128, 128, 128, 128, 128, 128, 128],
-         [141, 124, 248, 255, 128, 128, 128, 128, 128, 128, 128]],
-        [[  1, 254, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [187, 252, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [175, 138, 254, 254, 128, 128, 128, 128, 128, 128, 128]],
-        [[  1,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [239,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128]],
-    ],
-    // Block type 3: Y2 (DC of 16x16 luma)
-    [
-        [[  1, 202, 254, 255, 245, 255, 128, 128, 128, 128, 128],
-         [248, 136, 248, 254, 227, 128, 128, 128, 128, 128, 128],
-         [255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128]],
-        [[  1, 185, 249, 255, 243, 255, 128, 128, 128, 128, 128],
-         [184, 150, 247, 255, 236, 224, 128, 128, 128, 128, 128],
-         [ 77, 110, 216, 255, 236, 230, 128, 128, 128, 128, 128]],
-        [[  1, 101, 251, 255, 241, 255, 128, 128, 128, 128, 128],
-         [170, 139, 241, 252, 236, 209, 255, 255, 128, 128, 128],
-         [ 37, 116, 196, 243, 228, 255, 255, 255, 128, 128, 128]],
-        [[  1, 204, 254, 255, 245, 255, 128, 128, 128, 128, 128],
-         [207, 160, 250, 255, 238, 128, 128, 128, 128, 128, 128],
-         [102, 103, 231, 255, 211, 171, 128, 128, 128, 128, 128]],
-        [[  1, 152, 252, 255, 240, 255, 128, 128, 128, 128, 128],
-         [177, 135, 243, 255, 234, 225, 128, 128, 128, 128, 128],
-         [ 80, 129, 211, 255, 194, 224, 128, 128, 128, 128, 128]],
-        [[  1,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [246,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128]],
-        [[  1,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [246,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128]],
-        [[  1,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [246,   1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
-         [255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128]],
-    ],
+/// Transcribed from RFC 6386 and verified byte-for-byte against the
+/// bit-exact in-crate decoder's `vp8::dec::tables::DEFAULT_COEFF_PROBS`.
+static DEFAULT_COEFF_PROBS: [u8; 1056] = [
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 253, 136, 254, 255, 228,
+    219, 128, 128, 128, 128, 128, 189, 129, 242, 255, 227, 213, 255, 219, 128, 128, 128, 106, 126,
+    227, 252, 214, 209, 255, 255, 128, 128, 128, 1, 98, 248, 255, 236, 226, 255, 255, 128, 128,
+    128, 181, 133, 238, 254, 221, 234, 255, 154, 128, 128, 128, 78, 134, 202, 247, 198, 180, 255,
+    219, 128, 128, 128, 1, 185, 249, 255, 243, 255, 128, 128, 128, 128, 128, 184, 150, 247, 255,
+    236, 224, 128, 128, 128, 128, 128, 77, 110, 216, 255, 236, 230, 128, 128, 128, 128, 128, 1,
+    101, 251, 255, 241, 255, 128, 128, 128, 128, 128, 170, 139, 241, 252, 236, 209, 255, 255, 128,
+    128, 128, 37, 116, 196, 243, 228, 255, 255, 255, 128, 128, 128, 1, 204, 254, 255, 245, 255,
+    128, 128, 128, 128, 128, 207, 160, 250, 255, 238, 128, 128, 128, 128, 128, 128, 102, 103, 231,
+    255, 211, 171, 128, 128, 128, 128, 128, 1, 152, 252, 255, 240, 255, 128, 128, 128, 128, 128,
+    177, 135, 243, 255, 234, 225, 128, 128, 128, 128, 128, 80, 129, 211, 255, 194, 224, 128, 128,
+    128, 128, 128, 1, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128, 246, 1, 255, 128, 128, 128,
+    128, 128, 128, 128, 128, 255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 198, 35, 237,
+    223, 193, 187, 162, 160, 145, 155, 62, 131, 45, 198, 221, 172, 176, 220, 157, 252, 221, 1, 68,
+    47, 146, 208, 149, 167, 221, 162, 255, 223, 128, 1, 149, 241, 255, 221, 224, 255, 255, 128,
+    128, 128, 184, 141, 234, 253, 222, 220, 255, 199, 128, 128, 128, 81, 99, 181, 242, 176, 190,
+    249, 202, 255, 255, 128, 1, 129, 232, 253, 214, 197, 242, 196, 255, 255, 128, 99, 121, 210,
+    250, 201, 198, 255, 202, 128, 128, 128, 23, 91, 163, 242, 170, 187, 247, 210, 255, 255, 128, 1,
+    200, 246, 255, 234, 255, 128, 128, 128, 128, 128, 109, 178, 241, 255, 231, 245, 255, 255, 128,
+    128, 128, 44, 130, 201, 253, 205, 192, 255, 255, 128, 128, 128, 1, 132, 239, 251, 219, 209,
+    255, 165, 128, 128, 128, 94, 136, 225, 251, 218, 190, 255, 255, 128, 128, 128, 22, 100, 174,
+    245, 186, 161, 255, 199, 128, 128, 128, 1, 182, 249, 255, 232, 235, 128, 128, 128, 128, 128,
+    124, 143, 241, 255, 227, 234, 128, 128, 128, 128, 128, 35, 77, 181, 251, 193, 211, 255, 205,
+    128, 128, 128, 1, 157, 247, 255, 236, 231, 255, 255, 128, 128, 128, 121, 141, 235, 255, 225,
+    227, 255, 255, 128, 128, 128, 45, 99, 188, 251, 195, 217, 255, 224, 128, 128, 128, 1, 1, 251,
+    255, 213, 255, 128, 128, 128, 128, 128, 203, 1, 248, 255, 255, 128, 128, 128, 128, 128, 128,
+    137, 1, 177, 255, 224, 255, 128, 128, 128, 128, 128, 253, 9, 248, 251, 207, 208, 255, 192, 128,
+    128, 128, 175, 13, 224, 243, 193, 185, 249, 198, 255, 255, 128, 73, 17, 171, 221, 161, 179,
+    236, 167, 255, 234, 128, 1, 95, 247, 253, 212, 183, 255, 255, 128, 128, 128, 239, 90, 244, 250,
+    211, 209, 255, 255, 128, 128, 128, 155, 77, 195, 248, 188, 195, 255, 255, 128, 128, 128, 1, 24,
+    239, 251, 218, 219, 255, 205, 128, 128, 128, 201, 51, 219, 255, 196, 186, 128, 128, 128, 128,
+    128, 69, 46, 190, 239, 201, 218, 255, 228, 128, 128, 128, 1, 191, 251, 255, 255, 128, 128, 128,
+    128, 128, 128, 223, 165, 249, 255, 213, 255, 128, 128, 128, 128, 128, 141, 124, 248, 255, 255,
+    128, 128, 128, 128, 128, 128, 1, 16, 248, 255, 255, 128, 128, 128, 128, 128, 128, 190, 36, 230,
+    255, 236, 255, 128, 128, 128, 128, 128, 149, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128, 1,
+    226, 255, 128, 128, 128, 128, 128, 128, 128, 128, 247, 192, 255, 128, 128, 128, 128, 128, 128,
+    128, 128, 240, 128, 255, 128, 128, 128, 128, 128, 128, 128, 128, 1, 134, 252, 255, 255, 128,
+    128, 128, 128, 128, 128, 213, 62, 250, 255, 255, 128, 128, 128, 128, 128, 128, 55, 93, 255,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 202, 24, 213, 235, 186, 191, 220, 160, 240, 175, 255, 126, 38, 182, 232, 169,
+    184, 228, 174, 255, 187, 128, 61, 46, 138, 219, 151, 178, 240, 170, 255, 216, 128, 1, 112, 230,
+    250, 199, 191, 247, 159, 255, 255, 128, 166, 109, 228, 252, 211, 215, 255, 174, 128, 128, 128,
+    39, 77, 162, 232, 172, 180, 245, 178, 255, 255, 128, 1, 52, 220, 246, 198, 199, 249, 220, 255,
+    255, 128, 124, 74, 191, 243, 183, 193, 250, 221, 255, 255, 128, 24, 71, 130, 219, 154, 170,
+    243, 182, 255, 255, 128, 1, 182, 225, 249, 219, 240, 255, 224, 128, 128, 128, 149, 150, 226,
+    252, 216, 205, 255, 171, 128, 128, 128, 28, 108, 170, 242, 183, 194, 254, 223, 255, 255, 128,
+    1, 81, 230, 252, 204, 203, 255, 192, 128, 128, 128, 123, 102, 209, 247, 188, 196, 255, 233,
+    128, 128, 128, 20, 95, 153, 243, 164, 173, 255, 203, 128, 128, 128, 1, 222, 248, 255, 216, 213,
+    128, 128, 128, 128, 128, 168, 175, 246, 252, 235, 205, 255, 255, 128, 128, 128, 47, 116, 215,
+    255, 211, 212, 255, 255, 128, 128, 128, 1, 121, 236, 253, 212, 214, 255, 255, 128, 128, 128,
+    141, 84, 213, 252, 201, 202, 255, 219, 128, 128, 128, 42, 80, 160, 240, 162, 185, 255, 205,
+    128, 128, 128, 1, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128, 244, 1, 255, 128, 128, 128,
+    128, 128, 128, 128, 128, 238, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128,
+];
+
+/// Per-probability "is this probability updated?" gates (RFC 6386 §13.4
+/// `coeff_update_probs`, rfc6386.txt line 3759), same flattening as
+/// [`DEFAULT_COEFF_PROBS`].
+///
+/// The decoder reads all 1056 update flags with *these* probabilities, so an
+/// encoder that signals "no update" must write them with these probabilities
+/// too — writing them as plain 1/2-probability bits desynchronises the range
+/// coder for the whole rest of the frame.
+static COEFF_UPDATE_PROBS: [u8; 1056] = [
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 176, 246, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 223, 241, 252, 255, 255, 255, 255, 255, 255, 255, 255, 249, 253,
+    253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 244, 252, 255, 255, 255, 255, 255, 255, 255,
+    255, 234, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 253, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 246, 254, 255, 255, 255, 255, 255, 255, 255, 255, 239, 253, 254, 255,
+    255, 255, 255, 255, 255, 255, 255, 254, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    248, 254, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 254, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 254, 255, 255, 255,
+    255, 255, 255, 255, 255, 251, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 254,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 253, 255, 254, 255, 255, 255, 255, 255, 255,
+    250, 255, 254, 255, 254, 255, 255, 255, 255, 255, 255, 254, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 217, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 225, 252, 241, 253, 255, 255, 254, 255, 255, 255,
+    255, 234, 250, 241, 250, 253, 255, 253, 254, 255, 255, 255, 255, 254, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 223, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 238, 253, 254, 254,
+    255, 255, 255, 255, 255, 255, 255, 255, 248, 254, 255, 255, 255, 255, 255, 255, 255, 255, 249,
+    254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 247, 254, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 254,
+    255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 254, 255, 255, 255, 255, 255,
+    255, 255, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 254, 253, 255, 255, 255, 255, 255, 255, 255, 255, 250, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 186, 251, 250, 255,
+    255, 255, 255, 255, 255, 255, 255, 234, 251, 244, 254, 255, 255, 255, 255, 255, 255, 255, 251,
+    251, 243, 253, 254, 255, 254, 255, 255, 255, 255, 255, 253, 254, 255, 255, 255, 255, 255, 255,
+    255, 255, 236, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255, 251, 253, 253, 254, 254, 255,
+    255, 255, 255, 255, 255, 255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 254, 254, 254,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 254, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 248, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 250, 254, 252, 254, 255, 255, 255, 255, 255, 255, 255, 248, 254, 249,
+    253, 255, 255, 255, 255, 255, 255, 255, 255, 253, 253, 255, 255, 255, 255, 255, 255, 255, 255,
+    246, 253, 253, 255, 255, 255, 255, 255, 255, 255, 255, 252, 254, 251, 254, 254, 255, 255, 255,
+    255, 255, 255, 255, 254, 252, 255, 255, 255, 255, 255, 255, 255, 255, 248, 254, 253, 255, 255,
+    255, 255, 255, 255, 255, 255, 253, 255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 251,
+    254, 255, 255, 255, 255, 255, 255, 255, 255, 245, 251, 254, 255, 255, 255, 255, 255, 255, 255,
+    255, 253, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 253, 255, 255, 255, 255,
+    255, 255, 255, 255, 252, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 249,
+    255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 250, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
 ];
 
 /// VP8 DC quantizer lookup table (RFC 6386 Section 9.6).
@@ -197,14 +223,37 @@ static COEFF_BANDS: [usize; 16] = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 
 
 /// Boolean arithmetic encoder for VP8 bitstream writing.
 ///
-/// This is the encoding counterpart of `BoolDecoder`. VP8 encodes all
-/// header flags and DCT tokens through a range coder that maintains
-/// a `range` / `bottom` pair and emits bytes as the range narrows.
+/// Exact dual of the in-crate `vp8::dec::bool_decoder::BoolDecoder`: a
+/// transcription of the reference `write_bool` / `flush_bool_encoder` of
+/// RFC 6386 §7.3 (rfc6386.txt lines 1141-1228).
+///
+/// The renormalisation loop below must stay byte-for-byte faithful to the
+/// RFC. Two properties in particular are load-bearing and were previously
+/// absent, which made every frame this module produced undecodable:
+///
+/// 1. **Byte emission timing.** A byte leaves the encoder only when
+///    `bit_count` counts down to exactly zero *inside* the shift loop; the
+///    retained value is then masked to 24 bits and `bit_count` reset to 8,
+///    with no extra shift. Batching the shifts and emitting afterwards (the
+///    previous implementation) advances `bottom` eight bits too far after
+///    the first byte, so the emitted stream is the correct one with a byte
+///    deleted — the decoder then primes its value register from the wrong
+///    bytes and mis-parses the very first header fields.
+/// 2. **Carry propagation.** `bottom += split` can carry out of bit 31 and
+///    that carry belongs to bytes *already written*; `add_one_to_output`
+///    propagates it backwards through any trailing `0xFF`s. Widening
+///    `bottom` to `u64` (as the previous implementation did) does not help:
+///    the carry still has to reach the emitted bytes, and simply dropping it
+///    corrupts the stream.
 struct BoolEncoder {
+    /// Bytes emitted so far.
     output: Vec<u8>,
+    /// Current coding range, kept in `[128, 255]` after normalisation.
     range: u32,
-    bottom: u64,
-    bits_left: i32,
+    /// Minimum value of the remaining output (RFC 6386 `bottom`).
+    bottom: u32,
+    /// Number of shifts before the next output byte is available.
+    bit_count: i32,
 }
 
 impl BoolEncoder {
@@ -214,36 +263,55 @@ impl BoolEncoder {
             output: Vec::new(),
             range: 255,
             bottom: 0,
-            bits_left: 24,
+            bit_count: 24,
         }
+    }
+
+    /// RFC 6386 §7.3 `add_one_to_output`: propagates a carry backwards
+    /// through any already-written trailing `0xFF` bytes.
+    fn add_one_to_output(&mut self) {
+        for byte in self.output.iter_mut().rev() {
+            if *byte == 0xFF {
+                *byte = 0;
+            } else {
+                *byte += 1;
+                return;
+            }
+        }
+        // RFC 6386 lines 1149-1153: the arithmetic guarantees the
+        // propagation never runs past the start of the partition, because
+        // those leading bits are the value's own high end.
     }
 
     /// Encodes a single boolean symbol with the given probability.
     ///
     /// `prob` is the probability that the symbol is **false** (0),
-    /// in the range 1..=255.
+    /// in the range 1..=255. RFC 6386 §7.3 `write_bool`.
     fn encode_bool(&mut self, value: bool, prob: u8) {
         let split = 1 + (((self.range - 1) * u32::from(prob)) >> 8);
 
         if value {
-            self.bottom += u64::from(split);
+            // Wrapping matches the C `uint32`'s mod-2^32 semantics; the
+            // carry-out it produces is exactly what the bit-31 test below
+            // hands to `add_one_to_output`.
+            self.bottom = self.bottom.wrapping_add(split);
             self.range -= split;
         } else {
             self.range = split;
         }
 
-        // Renormalize
-        let mut shift = 0u32;
         while self.range < 128 {
             self.range <<= 1;
-            shift += 1;
-        }
-
-        self.bottom <<= shift;
-        self.bits_left -= shift as i32;
-
-        if self.bits_left <= 0 {
-            self.flush_bits();
+            if self.bottom & (1u32 << 31) != 0 {
+                self.add_one_to_output();
+            }
+            self.bottom <<= 1;
+            self.bit_count -= 1;
+            if self.bit_count == 0 {
+                self.output.push((self.bottom >> 24) as u8);
+                self.bottom &= (1u32 << 24) - 1;
+                self.bit_count = 8;
+            }
         }
     }
 
@@ -252,7 +320,7 @@ impl BoolEncoder {
         self.encode_bool(value, 128);
     }
 
-    /// Encodes an unsigned integer of `n` bits, MSB first.
+    /// Encodes an unsigned integer of `n` bits, MSB first (RFC 6386 `L(n)`).
     fn encode_literal(&mut self, value: u32, n: u8) {
         for i in (0..n).rev() {
             let bit = (value >> i) & 1 != 0;
@@ -260,128 +328,274 @@ impl BoolEncoder {
         }
     }
 
-    /// Encodes a value using a fixed probability for each bit, MSB first.
-    fn encode_literal_with_prob(&mut self, value: u32, n: u8, prob: u8) {
-        for i in (0..n).rev() {
-            let bit = (value >> i) & 1 != 0;
-            self.encode_bool(bit, prob);
-        }
-    }
-
-    /// Flushes accumulated bits into output bytes.
-    fn flush_bits(&mut self) {
-        while self.bits_left <= 0 {
-            let byte = (self.bottom >> 24) as u8;
-            self.output.push(byte);
-            self.bottom = (self.bottom & 0x00FF_FFFF) << 8;
-            self.bits_left += 8;
-        }
-    }
-
     /// Finalizes the encoder and returns the encoded byte stream.
+    ///
+    /// RFC 6386 §7.3 `flush_bool_encoder` (rfc6386.txt lines 1212-1228):
+    /// propagate a final carry, shift the residual value up to the top of
+    /// the register, then write four padding bytes.
     fn flush(mut self) -> Vec<u8> {
-        // Push remaining bits
+        let c0 = self.bit_count; // always in 1..=24, see `encode_bool`
+        let v0 = self.bottom;
+        if v0 & (1u32 << ((32 - c0) as u32)) != 0 {
+            self.add_one_to_output();
+        }
+        let mut v = v0 << ((c0 & 7) as u32);
+        let mut c = c0 >> 3;
+        while c > 0 {
+            v <<= 8;
+            c -= 1;
+        }
         for _ in 0..4 {
-            let byte = (self.bottom >> 24) as u8;
-            self.output.push(byte);
-            self.bottom <<= 8;
+            self.output.push((v >> 24) as u8);
+            v <<= 8;
         }
         self.output
     }
 }
 
-// ---------------------------------------------------------------------------
-// Forward DCT (4x4)
-// ---------------------------------------------------------------------------
-
-/// Performs a 1D forward DCT on 4 samples.
+/// Writes the boolean path a `read_tree(tree, probs)` walk would take to
+/// return `value`, entering the tree at node `start`.
 ///
-/// This is the VP8 forward transform from RFC 6386 Section 14.4.
-fn fdct4_1d(input: &[i32; 4], output: &mut [i32; 4]) {
-    let a0 = input[0] + input[3];
-    let a1 = input[1] + input[2];
-    let a2 = input[1] - input[2];
-    let a3 = input[0] - input[3];
+/// Exact dual of the decoder's `BoolDecoder::read_tree_from` (RFC 6386 §8
+/// `treed_read`): a depth-first search for the leaf `-value`, recording the
+/// branch taken at each internal node, then emitting those branches
+/// root-first. Deriving the path from the tree table itself — rather than
+/// hand-unrolling one `encode_bool` chain per symbol — is what makes the two
+/// sides provably agree.
+fn write_tree(enc: &mut BoolEncoder, tree: &[i8], probs: &[u8], value: i32, start: usize) {
+    /// Depth-first search recording `(probability index, branch)` pairs into
+    /// `path`, returning the path length. Bounded and allocation-free: this
+    /// runs once per coefficient token, so a heap allocation per call would
+    /// be the encoder's hottest cost.
+    fn find(
+        tree: &[i8],
+        value: i32,
+        node: usize,
+        path: &mut [(usize, bool); MAX_TREE_DEPTH],
+        depth: usize,
+    ) -> Option<usize> {
+        if depth >= MAX_TREE_DEPTH {
+            return None;
+        }
+        for branch in 0..2usize {
+            let next = tree[node + branch];
+            path[depth] = (node >> 1, branch == 1);
+            if next <= 0 {
+                if i32::from(-next) == value {
+                    return Some(depth + 1);
+                }
+            } else if let Some(len) = find(tree, value, next as usize, path, depth + 1) {
+                return Some(len);
+            }
+        }
+        None
+    }
 
-    output[0] = a0 + a1;
-    output[2] = a0 - a1;
-
-    // These use integer approximations of cos/sin
-    // output[1] = a3 * 2217/4096 + a2 * 5352/4096
-    // output[3] = a3 * 5352/4096 - a2 * 2217/4096
-    output[1] = (a2 * 5352 + a3 * 2217 + 14500) >> 12;
-    output[3] = (a3 * 5352 - a2 * 2217 + 7500) >> 12;
+    let mut path = [(0usize, false); MAX_TREE_DEPTH];
+    if let Some(len) = find(tree, value, start, &mut path, 0) {
+        for &(prob_index, branch) in &path[..len] {
+            enc.encode_bool(branch, probs[prob_index]);
+        }
+    }
 }
 
-/// Performs a 2D forward 4x4 DCT on a residual block.
+/// Deepest path any tree written here has: RFC 6386's `coeff_tree` reaches
+/// its category-5 and category-6 leaves in seven decisions, and the
+/// prediction-mode trees are shallower.
+const MAX_TREE_DEPTH: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Forward and inverse 4x4 transforms
+// ---------------------------------------------------------------------------
+//
+// RFC 6386 normatively specifies only the *inverse* transforms (§14.3 WHT,
+// §14.4 DCT); the forward transforms below are their exact duals, i.e. the
+// unique integer approximations that the specified inverse undoes.
+//
+// Writing them as duals is not cosmetic. The inverse DCT of §14.4 applies
+// `x1 * sqrt(2)cos(pi/8) + x3 * sqrt(2)sin(pi/8)`, so the forward transform
+// must pair the *transposed* multipliers: 2217/4096 with the `x1 - x2`
+// butterfly and 5352/4096 with `x0 - x3`. The previous implementation had
+// these two constants exchanged, which is a different (non-invertible-by-
+// §14.4) transform, and its Walsh-Hadamard pass omitted the factor-of-two
+// normalisation the §14.3 inverse expects — so even a perfectly assembled
+// bitstream would have decoded to the wrong picture.
+
+/// Fixed-point `sqrt(2) * cos(pi/8)`, scaled by 2^12 (dual of §14.4's 20091
+/// at 2^16).
+const FDCT_COS_PI8_SQRT2: i32 = 5352;
+/// Fixed-point `sqrt(2) * sin(pi/8)`, scaled by 2^12 (dual of §14.4's 35468).
+const FDCT_SIN_PI8_SQRT2: i32 = 2217;
+/// Fixed-point `sqrt(2) * cos(pi/8) - 1`, scaled by 2^16 (RFC 6386 §14.4).
+const COS_PI8_SQRT2_MINUS1: i64 = 20091;
+/// Fixed-point `sqrt(2) * sin(pi/8)`, scaled by 2^16 (RFC 6386 §14.4).
+const SIN_PI8_SQRT2: i64 = 35468;
+
+/// Performs the forward 4x4 DCT, the dual of [`idct4x4`].
 ///
-/// Takes 16 residual values (in raster order) and produces 16 DCT
-/// coefficients (in raster order).
+/// Takes 16 residual values in raster order and produces 16 DCT
+/// coefficients in raster order. Rows are scaled up by 8 so the odd
+/// (rotation) outputs keep their precision through the `>> 12` fixed-point
+/// multiply; the column pass takes that factor back out again, leaving the
+/// overall `1/2` normalisation §14.4's `+4 >> 3` inverse expects.
 fn fdct4x4(residual: &[i32; 16], coeffs: &mut [i32; 16]) {
-    let mut temp = [0i32; 16];
+    let mut tmp = [0i32; 16];
 
-    // Row transform
+    // Row pass.
     for row in 0..4 {
         let base = row * 4;
-        let input = [
-            residual[base],
-            residual[base + 1],
-            residual[base + 2],
-            residual[base + 3],
-        ];
-        let mut out = [0i32; 4];
-        fdct4_1d(&input, &mut out);
-        temp[base] = out[0];
-        temp[base + 1] = out[1];
-        temp[base + 2] = out[2];
-        temp[base + 3] = out[3];
+        let a1 = (residual[base] + residual[base + 3]) * 8;
+        let b1 = (residual[base + 1] + residual[base + 2]) * 8;
+        let c1 = (residual[base + 1] - residual[base + 2]) * 8;
+        let d1 = (residual[base] - residual[base + 3]) * 8;
+
+        tmp[base] = a1 + b1;
+        tmp[base + 2] = a1 - b1;
+        tmp[base + 1] = (c1 * FDCT_SIN_PI8_SQRT2 + d1 * FDCT_COS_PI8_SQRT2 + 14500) >> 12;
+        tmp[base + 3] = (d1 * FDCT_SIN_PI8_SQRT2 - c1 * FDCT_COS_PI8_SQRT2 + 7500) >> 12;
     }
 
-    // Column transform
+    // Column pass.
     for col in 0..4 {
-        let input = [temp[col], temp[col + 4], temp[col + 8], temp[col + 12]];
-        let mut out = [0i32; 4];
-        fdct4_1d(&input, &mut out);
-        coeffs[col] = (out[0] + 1) >> 1;
-        coeffs[col + 4] = (out[1] + 1) >> 1;
-        coeffs[col + 8] = (out[2] + 1) >> 1;
-        coeffs[col + 12] = (out[3] + 1) >> 1;
+        let a1 = tmp[col] + tmp[col + 12];
+        let b1 = tmp[col + 4] + tmp[col + 8];
+        let c1 = tmp[col + 4] - tmp[col + 8];
+        let d1 = tmp[col] - tmp[col + 12];
+
+        coeffs[col] = (a1 + b1 + 7) >> 4;
+        coeffs[col + 8] = (a1 - b1 + 7) >> 4;
+        coeffs[col + 4] = ((c1 * FDCT_SIN_PI8_SQRT2 + d1 * FDCT_COS_PI8_SQRT2 + 12000) >> 16)
+            + i32::from(d1 != 0);
+        coeffs[col + 12] = (d1 * FDCT_SIN_PI8_SQRT2 - c1 * FDCT_COS_PI8_SQRT2 + 12000) >> 16;
     }
 }
 
-/// Forward 4x4 Walsh-Hadamard Transform for DC coefficients.
+/// Performs the forward 4x4 Walsh-Hadamard transform, the dual of
+/// [`iwht4x4`].
 ///
-/// Takes 16 DC values from the 4x4 grid of sub-blocks and produces
-/// 16 WHT coefficients.
+/// Takes the 16 luma DC coefficients of a macroblock's sub-blocks and
+/// produces the Y2 block. The Hadamard butterfly is self-inverse up to a
+/// factor of 16, and §14.3's inverse already divides by 8, so this pass
+/// carries the remaining factor of `1/2` (expressed as `* 4` then
+/// `+3 >> 3`, matching the inverse's rounding).
 fn fwht4x4(dc_values: &[i32; 16], coeffs: &mut [i32; 16]) {
-    let mut temp = [0i32; 16];
+    let mut tmp = [0i32; 16];
 
-    // Row transform
+    // Row pass.
     for row in 0..4 {
         let base = row * 4;
-        let a = dc_values[base] + dc_values[base + 3];
-        let b = dc_values[base + 1] + dc_values[base + 2];
-        let c = dc_values[base + 1] - dc_values[base + 2];
-        let d = dc_values[base] - dc_values[base + 3];
+        let a1 = (dc_values[base] + dc_values[base + 3]) * 4;
+        let b1 = (dc_values[base + 1] + dc_values[base + 2]) * 4;
+        let c1 = (dc_values[base + 1] - dc_values[base + 2]) * 4;
+        let d1 = (dc_values[base] - dc_values[base + 3]) * 4;
 
-        temp[base] = a + b;
-        temp[base + 1] = d + c;
-        temp[base + 2] = a - b;
-        temp[base + 3] = d - c;
+        tmp[base] = a1 + b1;
+        tmp[base + 1] = d1 + c1;
+        tmp[base + 2] = a1 - b1;
+        tmp[base + 3] = d1 - c1;
     }
 
-    // Column transform
+    // Column pass, with the inverse's `+3 >> 3` rounding.
     for col in 0..4 {
-        let a = temp[col] + temp[col + 12];
-        let b = temp[col + 4] + temp[col + 8];
-        let c = temp[col + 4] - temp[col + 8];
-        let d = temp[col] - temp[col + 12];
+        let a1 = tmp[col] + tmp[col + 12];
+        let b1 = tmp[col + 4] + tmp[col + 8];
+        let c1 = tmp[col + 4] - tmp[col + 8];
+        let d1 = tmp[col] - tmp[col + 12];
 
-        coeffs[col] = a + b;
-        coeffs[col + 4] = d + c;
-        coeffs[col + 8] = a - b;
-        coeffs[col + 12] = d - c;
+        coeffs[col] = (a1 + b1 + 3) >> 3;
+        coeffs[col + 4] = (d1 + c1 + 3) >> 3;
+        coeffs[col + 8] = (a1 - b1 + 3) >> 3;
+        coeffs[col + 12] = (d1 - c1 + 3) >> 3;
     }
+}
+
+/// Inverse 4x4 DCT, transcribed from RFC 6386 §14.4 (`idct4x4llm`).
+///
+/// The encoder needs the *decoder's* exact inverse, not an approximation of
+/// it: intra prediction is fed from the reconstruction, so any difference
+/// here is a prediction mismatch that accumulates across macroblocks.
+fn idct4x4(coeffs: &[i32; 16]) -> [i32; 16] {
+    let mut tmp = [0i32; 16];
+    let mut out = [0i32; 16];
+
+    // Vertical pass.
+    for i in 0..4 {
+        let (c0, c1, c2, c3) = (coeffs[i], coeffs[i + 4], coeffs[i + 8], coeffs[i + 12]);
+        let a1 = c0 + c2;
+        let b1 = c0 - c2;
+
+        let t1 = (i64::from(c1) * SIN_PI8_SQRT2) >> 16;
+        let t2 = i64::from(c3) + ((i64::from(c3) * COS_PI8_SQRT2_MINUS1) >> 16);
+        let c1_t = (t1 - t2) as i32;
+
+        let t1 = i64::from(c1) + ((i64::from(c1) * COS_PI8_SQRT2_MINUS1) >> 16);
+        let t2 = (i64::from(c3) * SIN_PI8_SQRT2) >> 16;
+        let d1 = (t1 + t2) as i32;
+
+        tmp[i] = a1 + d1;
+        tmp[i + 12] = a1 - d1;
+        tmp[i + 4] = b1 + c1_t;
+        tmp[i + 8] = b1 - c1_t;
+    }
+
+    // Horizontal pass, with the specified `+4 >> 3` rounding.
+    for i in 0..4 {
+        let base = i * 4;
+        let (c0, c1, c2, c3) = (tmp[base], tmp[base + 1], tmp[base + 2], tmp[base + 3]);
+        let a1 = c0 + c2;
+        let b1 = c0 - c2;
+
+        let t1 = (i64::from(c1) * SIN_PI8_SQRT2) >> 16;
+        let t2 = i64::from(c3) + ((i64::from(c3) * COS_PI8_SQRT2_MINUS1) >> 16);
+        let c1_t = (t1 - t2) as i32;
+
+        let t1 = i64::from(c1) + ((i64::from(c1) * COS_PI8_SQRT2_MINUS1) >> 16);
+        let t2 = (i64::from(c3) * SIN_PI8_SQRT2) >> 16;
+        let d1 = (t1 + t2) as i32;
+
+        out[base] = (a1 + d1 + 4) >> 3;
+        out[base + 3] = (a1 - d1 + 4) >> 3;
+        out[base + 1] = (b1 + c1_t + 4) >> 3;
+        out[base + 2] = (b1 - c1_t + 4) >> 3;
+    }
+
+    out
+}
+
+/// Inverse 4x4 Walsh-Hadamard transform, transcribed from RFC 6386 §14.3
+/// (`iwalsh4x4`). Recovers the 16 luma DC coefficients from a Y2 block.
+fn iwht4x4(coeffs: &[i32; 16]) -> [i32; 16] {
+    let mut tmp = [0i32; 16];
+    let mut out = [0i32; 16];
+
+    // Vertical pass.
+    for i in 0..4 {
+        let a1 = coeffs[i] + coeffs[i + 12];
+        let b1 = coeffs[i + 4] + coeffs[i + 8];
+        let c1 = coeffs[i + 4] - coeffs[i + 8];
+        let d1 = coeffs[i] - coeffs[i + 12];
+
+        tmp[i] = a1 + b1;
+        tmp[i + 4] = d1 + c1;
+        tmp[i + 8] = a1 - b1;
+        tmp[i + 12] = d1 - c1;
+    }
+
+    // Horizontal pass, with `+3 >> 3` rounding.
+    for i in 0..4 {
+        let base = i * 4;
+        let a1 = tmp[base] + tmp[base + 3];
+        let b1 = tmp[base + 1] + tmp[base + 2];
+        let c1 = tmp[base + 1] - tmp[base + 2];
+        let d1 = tmp[base] - tmp[base + 3];
+
+        out[base] = (a1 + b1 + 3) >> 3;
+        out[base + 1] = (d1 + c1 + 3) >> 3;
+        out[base + 2] = (a1 - b1 + 3) >> 3;
+        out[base + 3] = (d1 - c1 + 3) >> 3;
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -513,29 +727,46 @@ fn rgb_to_yuv420(data: &[u8], width: u32, height: u32) -> CodecResult<YuvPlanes>
 }
 
 // ---------------------------------------------------------------------------
-// Token encoding helpers
+// DCT token coding (RFC 6386 §13)
 // ---------------------------------------------------------------------------
 
-/// VP8 token categories and their encoding.
+// DCT token values (RFC 6386 §13.2 `dct_token`): literal magnitudes 0-4,
+// then six categories whose extra bits widen the magnitude (5..=6, 7..=10,
+// 11..=18, 19..=34, 35..=66, 67..=2048), then end-of-block.
+const DCT_0: i32 = 0;
+const DCT_1: i32 = 1;
+const DCT_2: i32 = 2;
+const DCT_3: i32 = 3;
+const DCT_4: i32 = 4;
+const DCT_CAT1: i32 = 5;
+const DCT_CAT2: i32 = 6;
+const DCT_CAT3: i32 = 7;
+const DCT_CAT4: i32 = 8;
+const DCT_CAT5: i32 = 9;
+const DCT_CAT6: i32 = 10;
+const DCT_EOB: i32 = 11;
+
+/// DCT coefficient token tree (RFC 6386 §13.2 `coeff_tree`).
 ///
-/// DCT coefficients are entropy-coded as a sequence of "tokens":
-///   DCT_0  = 0 (run of zero)
-///   DCT_1  = +/-1
-///   DCT_2  = +/-2
-///   DCT_3  = +/-3
-///   DCT_4  = +/-4
-///   DCT_CAT1 = 5..6
-///   DCT_CAT2 = 7..10
-///   DCT_CAT3 = 11..18
-///   DCT_CAT4 = 19..34
-///   DCT_CAT5 = 35..66
-///   DCT_CAT6 = 67..2047
-///   DCT_EOB  = end of block
-///
-/// Each token is encoded as a binary tree walk using the 11 probability
-/// slots in `DEFAULT_COEFF_PROBS[type][band][ctx]`.
-///
-/// Extra-bits probabilities for each DCT category.
+/// Note that end-of-block hangs off the *root* only: once a literal zero has
+/// been coded the tree is re-entered at node 2, which is why
+/// [`encode_block`] tracks `skip_eob`.
+#[rustfmt::skip]
+static COEFF_TREE: [i8; 22] = [
+    -(DCT_EOB as i8), 2,
+    -(DCT_0 as i8), 4,
+    -(DCT_1 as i8), 6,
+    8, 12,
+    -(DCT_2 as i8), 10,
+    -(DCT_3 as i8), -(DCT_4 as i8),
+    14, 16,
+    -(DCT_CAT1 as i8), -(DCT_CAT2 as i8),
+    18, 20,
+    -(DCT_CAT3 as i8), -(DCT_CAT4 as i8),
+    -(DCT_CAT5 as i8), -(DCT_CAT6 as i8),
+];
+
+// Extra-bit probabilities per DCT category (RFC 6386 §13.2 `Pcat1`..`Pcat6`).
 static CAT1_PROB: [u8; 1] = [159];
 static CAT2_PROB: [u8; 2] = [165, 145];
 static CAT3_PROB: [u8; 3] = [173, 148, 140];
@@ -543,186 +774,112 @@ static CAT4_PROB: [u8; 4] = [176, 155, 140, 135];
 static CAT5_PROB: [u8; 5] = [180, 157, 141, 134, 130];
 static CAT6_PROB: [u8; 11] = [254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129];
 
-/// Encodes a single DCT coefficient token into the boolean encoder.
-///
-/// Returns the new "previous coefficient context" (0 = zero, 1 = one, 2 = >1).
-fn encode_token(
-    enc: &mut BoolEncoder,
-    coeff: i32,
-    block_type: usize,
-    band: usize,
-    ctx: usize,
-    is_first_after_dc: bool,
-) -> usize {
-    let probs = &DEFAULT_COEFF_PROBS[block_type][band][ctx];
-    let abs_val = coeff.unsigned_abs();
+/// Extra-bit probabilities indexed by category (0-based).
+static CAT_PROBS: [&[u8]; 6] = [
+    &CAT1_PROB, &CAT2_PROB, &CAT3_PROB, &CAT4_PROB, &CAT5_PROB, &CAT6_PROB,
+];
 
-    if !is_first_after_dc {
-        // First decision: EOB vs non-EOB
-        // This is handled at a higher level (we don't emit EOB inside this fn)
+/// Smallest magnitude each category token can represent (RFC 6386 §13.2).
+static CAT_BASE: [i32; 6] = [5, 7, 11, 19, 35, 67];
+
+/// Maps a coefficient magnitude to its token and, for category tokens, the
+/// 0-based category index whose extra bits must follow (RFC 6386 §13.2).
+fn token_for(abs_value: i32) -> (i32, Option<usize>) {
+    match abs_value {
+        0 => (DCT_0, None),
+        1 => (DCT_1, None),
+        2 => (DCT_2, None),
+        3 => (DCT_3, None),
+        4 => (DCT_4, None),
+        5..=6 => (DCT_CAT1, Some(0)),
+        7..=10 => (DCT_CAT2, Some(1)),
+        11..=18 => (DCT_CAT3, Some(2)),
+        19..=34 => (DCT_CAT4, Some(3)),
+        35..=66 => (DCT_CAT5, Some(4)),
+        _ => (DCT_CAT6, Some(5)),
     }
-
-    // Token tree walk:
-    // Node 0: prob[0] => 0 = DCT_0 path, 1 = non-zero path
-    if abs_val == 0 {
-        enc.encode_bool(false, probs[0]); // DCT_0
-        return 0;
-    }
-
-    enc.encode_bool(true, probs[0]); // not DCT_0
-
-    // Node 1: prob[1] => 0 = DCT_1, 1 = higher
-    if abs_val == 1 {
-        enc.encode_bool(false, probs[1]);
-        // Sign bit
-        enc.encode_bit(coeff < 0);
-        return 1;
-    }
-
-    enc.encode_bool(true, probs[1]); // not DCT_1
-
-    // Node 2: prob[2] => 0 = DCT_2..DCT_4, 1 = categories
-    if abs_val <= 4 {
-        enc.encode_bool(false, probs[2]);
-        // Node 3: prob[3] => 0 = DCT_2, 1 = DCT_3 or DCT_4
-        if abs_val == 2 {
-            enc.encode_bool(false, probs[3]);
-        } else {
-            enc.encode_bool(true, probs[3]);
-            // Node 4: prob[4] => 0 = DCT_3, 1 = DCT_4
-            enc.encode_bool(abs_val == 4, probs[4]);
-        }
-        // Sign bit
-        enc.encode_bit(coeff < 0);
-        return 2;
-    }
-
-    enc.encode_bool(true, probs[2]); // category token
-
-    // Node 5: prob[5] => 0 = CAT1/CAT2, 1 = CAT3..CAT6
-    if abs_val <= 10 {
-        enc.encode_bool(false, probs[5]);
-        // Node 6: prob[6] => 0 = CAT1, 1 = CAT2
-        if abs_val <= 6 {
-            enc.encode_bool(false, probs[6]);
-            // CAT1: extra = abs_val - 5 (0 or 1)
-            let extra = abs_val - 5;
-            enc.encode_bool(extra != 0, CAT1_PROB[0]);
-        } else {
-            enc.encode_bool(true, probs[6]);
-            // CAT2: extra = abs_val - 7 (0..3)
-            let extra = abs_val - 7;
-            for (i, &p) in CAT2_PROB.iter().enumerate() {
-                let bit = (extra >> (CAT2_PROB.len() - 1 - i)) & 1 != 0;
-                enc.encode_bool(bit, p);
-            }
-        }
-    } else {
-        enc.encode_bool(true, probs[5]);
-        // Node 7: prob[7] => 0 = CAT3/CAT4, 1 = CAT5/CAT6
-        if abs_val <= 34 {
-            enc.encode_bool(false, probs[7]);
-            // Node 8: prob[8] => 0 = CAT3, 1 = CAT4
-            if abs_val <= 18 {
-                enc.encode_bool(false, probs[8]);
-                // CAT3: extra = abs_val - 11 (0..7)
-                let extra = abs_val - 11;
-                for (i, &p) in CAT3_PROB.iter().enumerate() {
-                    let bit = (extra >> (CAT3_PROB.len() - 1 - i)) & 1 != 0;
-                    enc.encode_bool(bit, p);
-                }
-            } else {
-                enc.encode_bool(true, probs[8]);
-                // CAT4: extra = abs_val - 19 (0..15)
-                let extra = abs_val - 19;
-                for (i, &p) in CAT4_PROB.iter().enumerate() {
-                    let bit = (extra >> (CAT4_PROB.len() - 1 - i)) & 1 != 0;
-                    enc.encode_bool(bit, p);
-                }
-            }
-        } else {
-            enc.encode_bool(true, probs[7]);
-            // Node 9: prob[9] => 0 = CAT5, 1 = CAT6
-            if abs_val <= 66 {
-                enc.encode_bool(false, probs[9]);
-                // CAT5: extra = abs_val - 35 (0..31)
-                let extra = abs_val - 35;
-                for (i, &p) in CAT5_PROB.iter().enumerate() {
-                    let bit = (extra >> (CAT5_PROB.len() - 1 - i)) & 1 != 0;
-                    enc.encode_bool(bit, p);
-                }
-            } else {
-                enc.encode_bool(true, probs[9]);
-                // CAT6: extra = abs_val - 67 (0..2047)
-                let extra = abs_val - 67;
-                for (i, &p) in CAT6_PROB.iter().enumerate() {
-                    let bit = (extra >> (CAT6_PROB.len() - 1 - i)) & 1 != 0;
-                    enc.encode_bool(bit, p);
-                }
-            }
-        }
-    }
-
-    // Sign bit
-    enc.encode_bit(coeff < 0);
-    2
 }
 
-/// Encodes a full 4x4 block of quantized DCT coefficients.
+/// Encodes one 4x4 sub-block of quantised coefficients (RFC 6386 §13).
 ///
-/// Emits tokens in zigzag order.  An EOB token is emitted after the
-/// last non-zero coefficient.
+/// Exact dual of the in-crate decoder's `vp8::dec::residual::decode_block`:
 ///
-/// `first_coeff_idx` is 0 for Y2/UV blocks, 1 for Y blocks (where DC
-/// is carried by the Y2 block).
+/// - `ctx` is the *initial* token context, `above_nz + left_nz` in `0..=2`
+///   (RFC 6386 §13.3). The previous implementation always started from 0,
+///   which desynchronises the range coder the moment any neighbouring block
+///   carries a token.
+/// - `first_coeff` is 1 for luma sub-blocks whose DC lives in the Y2 block,
+///   else 0.
+/// - After a literal zero the token tree is re-entered past the
+///   end-of-block branch (`skip_eob`).
+///
+/// Returns the block's non-zero flag *as the decoder defines it*: "the
+/// end-of-block position exceeds `first_coeff`", i.e. at least one token was
+/// coded. That is subtly different from "some coefficient is non-zero" — a
+/// block coded as literal zeros followed by EOB has the flag set — and it is
+/// this value, not the coefficients, that feeds neighbouring blocks'
+/// entropy contexts.
 fn encode_block(
     enc: &mut BoolEncoder,
     quantized: &[i32; 16],
     block_type: usize,
-    first_coeff_idx: usize,
-) {
-    // Find last non-zero coefficient (in zigzag order)
-    let mut last_nonzero: Option<usize> = None;
-    for i in (first_coeff_idx..16).rev() {
-        let zigzag_pos = ZIGZAG_ORDER[i];
-        if quantized[zigzag_pos] != 0 {
-            last_nonzero = Some(i);
+    ctx: usize,
+    first_coeff: usize,
+) -> bool {
+    // End-of-block position: one past the last coefficient that carries a
+    // token. Trailing zeros are never coded, so this is one past the last
+    // non-zero coefficient in zig-zag order.
+    let mut eob = first_coeff;
+    for i in (first_coeff..16).rev() {
+        if quantized[ZIGZAG_ORDER[i]] != 0 {
+            eob = i + 1;
             break;
         }
     }
 
-    let last_nz = match last_nonzero {
-        Some(idx) => idx,
-        None => {
-            // All zero — emit EOB
-            let band = COEFF_BANDS[first_coeff_idx];
-            let probs = &DEFAULT_COEFF_PROBS[block_type][band][0];
-            enc.encode_bool(false, probs[0]); // DCT_0 at first position acts as EOB marker
-            return;
+    let mut prev_ctx = ctx;
+    let mut skip_eob = false;
+    let mut i = first_coeff;
+    while i < 16 {
+        let offset = coeff_prob_offset(block_type, COEFF_BANDS[i], prev_ctx);
+        let probs = &DEFAULT_COEFF_PROBS[offset..offset + 11];
+        let start = if skip_eob { 2 } else { 0 };
+
+        if i == eob {
+            // Reachable only with `skip_eob == false`: the token at `eob - 1`
+            // is non-zero by construction, and the all-zero case stops at
+            // `i == first_coeff` before any token is written.
+            write_tree(enc, &COEFF_TREE, probs, DCT_EOB, start);
+            break;
         }
-    };
 
-    let mut ctx: usize = 0; // previous coefficient context
+        let coeff = quantized[ZIGZAG_ORDER[i]];
+        let abs_value = coeff.abs();
+        let (token, category) = token_for(abs_value);
+        write_tree(enc, &COEFF_TREE, probs, token, start);
 
-    for i in first_coeff_idx..=last_nz {
-        let zigzag_pos = ZIGZAG_ORDER[i];
-        let coeff = quantized[zigzag_pos];
-        let band = COEFF_BANDS[i];
+        if let Some(cat) = category {
+            // Category extra bits, most significant first.
+            let cat_probs = CAT_PROBS[cat];
+            let extra = abs_value - CAT_BASE[cat];
+            for (bit_index, &prob) in cat_probs.iter().enumerate() {
+                let shift = cat_probs.len() - 1 - bit_index;
+                enc.encode_bool((extra >> shift) & 1 != 0, prob);
+            }
+        }
 
-        ctx = encode_token(enc, coeff, block_type, band, ctx, i > first_coeff_idx);
+        if abs_value == 0 {
+            prev_ctx = 0;
+            skip_eob = true;
+        } else {
+            enc.encode_bit(coeff < 0);
+            prev_ctx = if abs_value == 1 { 1 } else { 2 };
+            skip_eob = false;
+        }
+        i += 1;
     }
 
-    // Emit EOB after last non-zero coefficient (if there are remaining positions)
-    if last_nz + 1 < 16 {
-        let eob_band = COEFF_BANDS[(last_nz + 1).min(15)];
-        let eob_probs = &DEFAULT_COEFF_PROBS[block_type][eob_band][ctx];
-        // EOB is encoded as: prob[0] decides "is coefficient zero?"
-        // In VP8, EOB is a separate token that terminates the block.
-        // It's signaled as the first branch being "false" when the
-        // coefficient *would have been* the next one — but we use
-        // a simplified approach: the decoder knows EOB means "rest are zero".
-        enc.encode_bool(false, eob_probs[0]);
-    }
+    eob > first_coeff
 }
 
 // ---------------------------------------------------------------------------
@@ -782,7 +939,7 @@ fn encode_macroblock(
     };
 
     // --- DC prediction for luma 16x16 ---
-    let pred_y = compute_dc_pred_16x16(reconstructed_y, recon_y_stride, mb_x, mb_y);
+    let pred_y = compute_dc_pred(reconstructed_y, recon_y_stride, mb_x, mb_y, 16);
 
     // Process 16 luma 4x4 sub-blocks
     let mut dc_values = [0i32; 16];
@@ -829,64 +986,55 @@ fn encode_macroblock(
     }
 
     // --- Chroma ---
-    let pred_u = compute_dc_pred_8x8(reconstructed_u, recon_uv_stride, mb_x, mb_y);
-    let pred_v = compute_dc_pred_8x8(reconstructed_v, recon_uv_stride, mb_x, mb_y);
+    let pred_u = compute_dc_pred(reconstructed_u, recon_uv_stride, mb_x, mb_y, 8);
+    let pred_v = compute_dc_pred(reconstructed_v, recon_uv_stride, mb_x, mb_y, 8);
 
-    for sb in 0..4 {
-        let sb_row = sb / 2;
-        let sb_col = sb % 2;
+    for (plane, pred, out) in [
+        (&yuv.u, pred_u, &mut mb.u_blocks),
+        (&yuv.v, pred_v, &mut mb.v_blocks),
+    ] {
+        for sb in 0..4 {
+            let sb_row = sb / 2;
+            let sb_col = sb % 2;
 
-        // U block
-        let mut u_residual = [0i32; 16];
-        for r in 0..4 {
-            for c in 0..4 {
-                let py = mb_y * 8 + sb_row * 4 + r;
-                let px = mb_x * 8 + sb_col * 4 + c;
-                let orig = i32::from(yuv.u[py * yuv.uv_stride + px]);
-                u_residual[r * 4 + c] = orig - i32::from(pred_u);
+            let mut residual = [0i32; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let py = mb_y * 8 + sb_row * 4 + r;
+                    let px = mb_x * 8 + sb_col * 4 + c;
+                    let orig = i32::from(plane[py * yuv.uv_stride + px]);
+                    residual[r * 4 + c] = orig - i32::from(pred);
+                }
             }
-        }
-        let mut u_coeffs = [0i32; 16];
-        fdct4x4(&u_residual, &mut u_coeffs);
-        u_coeffs[0] = quantize(u_coeffs[0], uv_dc_quant);
-        for i in 1..16 {
-            u_coeffs[i] = quantize(u_coeffs[i], uv_ac_quant);
-        }
-        mb.u_blocks[sb] = u_coeffs;
-
-        // V block
-        let mut v_residual = [0i32; 16];
-        for r in 0..4 {
-            for c in 0..4 {
-                let py = mb_y * 8 + sb_row * 4 + r;
-                let px = mb_x * 8 + sb_col * 4 + c;
-                let orig = i32::from(yuv.v[py * yuv.uv_stride + px]);
-                v_residual[r * 4 + c] = orig - i32::from(pred_v);
+            let mut coeffs = [0i32; 16];
+            fdct4x4(&residual, &mut coeffs);
+            coeffs[0] = quantize(coeffs[0], uv_dc_quant);
+            for i in 1..16 {
+                coeffs[i] = quantize(coeffs[i], uv_ac_quant);
             }
+            out[sb] = coeffs;
         }
-        let mut v_coeffs = [0i32; 16];
-        fdct4x4(&v_residual, &mut v_coeffs);
-        v_coeffs[0] = quantize(v_coeffs[0], uv_dc_quant);
-        for i in 1..16 {
-            v_coeffs[i] = quantize(v_coeffs[i], uv_ac_quant);
-        }
-        mb.v_blocks[sb] = v_coeffs;
     }
 
     mb
 }
 
-/// Computes DC prediction value for a 16x16 luma block.
+/// Computes the DC prediction for one `size` x `size` block (RFC 6386
+/// §12.2): the rounded average of the reconstructed row above and column to
+/// the left, whichever are available, and 128 when neither is.
 ///
-/// Uses average of top and left reconstructed neighbors when available.
-fn compute_dc_pred_16x16(recon: &[u8], stride: usize, mb_x: usize, mb_y: usize) -> u8 {
+/// `size` is 16 for luma and 8 for chroma. Rounding falls out of
+/// `(sum + count/2) / count`, which for the three reachable counts is
+/// exactly the specification's `(sum + 16) >> 5`, `(sum + 8) >> 4` and
+/// `(sum + 4) >> 3`.
+fn compute_dc_pred(recon: &[u8], stride: usize, mb_x: usize, mb_y: usize, size: usize) -> u8 {
     let mut sum: u32 = 0;
     let mut count: u32 = 0;
 
-    // Top row
+    // Row above.
     if mb_y > 0 {
-        let top_row = (mb_y * 16 - 1) * stride + mb_x * 16;
-        for col in 0..16 {
+        let top_row = (mb_y * size - 1) * stride + mb_x * size;
+        for col in 0..size {
             if top_row + col < recon.len() {
                 sum += u32::from(recon[top_row + col]);
                 count += 1;
@@ -894,40 +1042,11 @@ fn compute_dc_pred_16x16(recon: &[u8], stride: usize, mb_x: usize, mb_y: usize) 
         }
     }
 
-    // Left column
+    // Column to the left.
     if mb_x > 0 {
-        let left_col = mb_x * 16 - 1;
-        for row in 0..16 {
-            let idx = (mb_y * 16 + row) * stride + left_col;
-            if idx < recon.len() {
-                sum += u32::from(recon[idx]);
-                count += 1;
-            }
-        }
-    }
-
-    (sum + count / 2).checked_div(count).unwrap_or(128) as u8
-}
-
-/// Computes DC prediction value for an 8x8 chroma block.
-fn compute_dc_pred_8x8(recon: &[u8], stride: usize, mb_x: usize, mb_y: usize) -> u8 {
-    let mut sum: u32 = 0;
-    let mut count: u32 = 0;
-
-    if mb_y > 0 {
-        let top_row = (mb_y * 8 - 1) * stride + mb_x * 8;
-        for col in 0..8 {
-            if top_row + col < recon.len() {
-                sum += u32::from(recon[top_row + col]);
-                count += 1;
-            }
-        }
-    }
-
-    if mb_x > 0 {
-        let left_col = mb_x * 8 - 1;
-        for row in 0..8 {
-            let idx = (mb_y * 8 + row) * stride + left_col;
+        let left_col = mb_x * size - 1;
+        for row in 0..size {
+            let idx = (mb_y * size + row) * stride + left_col;
             if idx < recon.len() {
                 sum += u32::from(recon[idx]);
                 count += 1;
@@ -959,43 +1078,15 @@ fn reconstruct_macroblock(
     recon_uv_stride: usize,
     recon_v: &mut [u8],
 ) {
-    // Inverse Y2 (WHT) to get dequantized DC values
+    // Inverse Y2 (WHT) to recover each luma sub-block's DC coefficient.
+    // The dequantised Y2 block goes through the *decoder's* §14.3 inverse so
+    // the encoder predicts from exactly what a decoder will see.
     let mut y2_dequant = [0i32; 16];
     y2_dequant[0] = mb.y2_block[0] * y2_dc_quant;
     for i in 1..16 {
         y2_dequant[i] = mb.y2_block[i] * y2_ac_quant;
     }
-
-    // Inverse WHT
-    let mut dc_values = [0i32; 16];
-    {
-        let mut temp = [0i32; 16];
-        // Row inverse WHT
-        for row in 0..4 {
-            let b = row * 4;
-            let a = y2_dequant[b] + y2_dequant[b + 2];
-            let bv = y2_dequant[b + 1] + y2_dequant[b + 3];
-            let c = y2_dequant[b + 1] - y2_dequant[b + 3];
-            let d = y2_dequant[b] - y2_dequant[b + 2];
-
-            temp[b] = a + bv;
-            temp[b + 1] = d + c;
-            temp[b + 2] = a - bv;
-            temp[b + 3] = d - c;
-        }
-        // Column inverse WHT
-        for col in 0..4 {
-            let a = temp[col] + temp[col + 8];
-            let bv = temp[col + 4] + temp[col + 12];
-            let c = temp[col + 4] - temp[col + 12];
-            let d = temp[col] - temp[col + 8];
-
-            dc_values[col] = (a + bv + 1) >> 1;
-            dc_values[col + 4] = (d + c + 1) >> 1;
-            dc_values[col + 8] = (a - bv + 1) >> 1;
-            dc_values[col + 12] = (d - c + 1) >> 1;
-        }
-    }
+    let dc_values = iwht4x4(&y2_dequant);
 
     // Reconstruct each luma 4x4 sub-block
     for sb in 0..16 {
@@ -1010,7 +1101,7 @@ fn reconstruct_macroblock(
         }
 
         // Inverse DCT
-        let reconstructed = idct4x4_simple(&dequant);
+        let reconstructed = idct4x4(&dequant);
 
         // Add prediction and clamp
         for r in 0..4 {
@@ -1023,167 +1114,133 @@ fn reconstruct_macroblock(
         }
     }
 
-    // Reconstruct chroma
-    for sb in 0..4 {
-        let sb_row = sb / 2;
-        let sb_col = sb % 2;
+    // Reconstruct chroma (U then V — identical apart from the plane).
+    for (blocks, pred, plane) in [
+        (&mb.u_blocks, pred_u, &mut *recon_u),
+        (&mb.v_blocks, pred_v, &mut *recon_v),
+    ] {
+        for sb in 0..4 {
+            let sb_row = sb / 2;
+            let sb_col = sb % 2;
 
-        // U
-        let mut u_dequant = [0i32; 16];
-        u_dequant[0] = mb.u_blocks[sb][0] * uv_dc_quant;
-        for i in 1..16 {
-            u_dequant[i] = mb.u_blocks[sb][i] * uv_ac_quant;
-        }
-        let u_recon = idct4x4_simple(&u_dequant);
-        for r in 0..4 {
-            for c in 0..4 {
-                let py = mb_y * 8 + sb_row * 4 + r;
-                let px = mb_x * 8 + sb_col * 4 + c;
-                let val = u_recon[r * 4 + c] + i32::from(pred_u);
-                recon_u[py * recon_uv_stride + px] = val.clamp(0, 255) as u8;
+            let mut dequant = [0i32; 16];
+            dequant[0] = blocks[sb][0] * uv_dc_quant;
+            for i in 1..16 {
+                dequant[i] = blocks[sb][i] * uv_ac_quant;
             }
-        }
-
-        // V
-        let mut v_dequant = [0i32; 16];
-        v_dequant[0] = mb.v_blocks[sb][0] * uv_dc_quant;
-        for i in 1..16 {
-            v_dequant[i] = mb.v_blocks[sb][i] * uv_ac_quant;
-        }
-        let v_recon = idct4x4_simple(&v_dequant);
-        for r in 0..4 {
-            for c in 0..4 {
-                let py = mb_y * 8 + sb_row * 4 + r;
-                let px = mb_x * 8 + sb_col * 4 + c;
-                let val = v_recon[r * 4 + c] + i32::from(pred_v);
-                recon_v[py * recon_uv_stride + px] = val.clamp(0, 255) as u8;
+            let recon = idct4x4(&dequant);
+            for r in 0..4 {
+                for c in 0..4 {
+                    let py = mb_y * 8 + sb_row * 4 + r;
+                    let px = mb_x * 8 + sb_col * 4 + c;
+                    let val = recon[r * 4 + c] + i32::from(pred);
+                    plane[py * recon_uv_stride + px] = val.clamp(0, 255) as u8;
+                }
             }
         }
     }
-}
-
-/// Simplified inverse 4x4 DCT for reconstruction.
-///
-/// Takes dequantized coefficients in raster order and returns
-/// residual pixel values.
-fn idct4x4_simple(coeffs: &[i32; 16]) -> [i32; 16] {
-    let mut temp = [0i32; 16];
-    let mut output = [0i32; 16];
-
-    // Row inverse DCT
-    for row in 0..4 {
-        let b = row * 4;
-        let c0 = coeffs[b];
-        let c1 = coeffs[b + 1];
-        let c2 = coeffs[b + 2];
-        let c3 = coeffs[b + 3];
-
-        let a1 = c0 + c2;
-        let b1 = c0 - c2;
-
-        let t1 = (c1 * 35468 + c3 * 85627 + 32768) >> 16;
-        let t2 = (c1 * 85627 - c3 * 35468 + 32768) >> 16;
-
-        temp[b] = a1 + t2;
-        temp[b + 1] = b1 + t1;
-        temp[b + 2] = b1 - t1;
-        temp[b + 3] = a1 - t2;
-    }
-
-    // Column inverse DCT
-    for col in 0..4 {
-        let c0 = temp[col];
-        let c1 = temp[col + 4];
-        let c2 = temp[col + 8];
-        let c3 = temp[col + 12];
-
-        let a1 = c0 + c2;
-        let b1 = c0 - c2;
-
-        let t1 = (c1 * 35468 + c3 * 85627 + 32768) >> 16;
-        let t2 = (c1 * 85627 - c3 * 35468 + 32768) >> 16;
-
-        output[col] = (a1 + t2 + 4) >> 3;
-        output[col + 4] = (b1 + t1 + 4) >> 3;
-        output[col + 8] = (b1 - t1 + 4) >> 3;
-        output[col + 12] = (a1 - t2 + 4) >> 3;
-    }
-
-    output
 }
 
 // ---------------------------------------------------------------------------
 // VP8 bitstream assembly
 // ---------------------------------------------------------------------------
 
-/// Writes the VP8 frame header using the boolean encoder.
+/// Key-frame luma mode tree (RFC 6386 §11.2 `kf_ymode_tree`) and its fixed
+/// probabilities (§11.3). `DC_PRED` is *not* the "0" branch — it sits three
+/// levels down, behind `B_PRED`.
+#[rustfmt::skip]
+static KF_YMODE_TREE: [i8; 8] = [
+    -(Y_B_PRED as i8), 2,
+    4, 6,
+    -(Y_DC_PRED as i8), -(Y_V_PRED as i8),
+    -(Y_H_PRED as i8), -(Y_TM_PRED as i8),
+];
+
+/// Fixed key-frame luma-mode probabilities (RFC 6386 §11.3).
+static KF_YMODE_PROB: [u8; 4] = [145, 156, 163, 128];
+
+/// Chroma mode tree (RFC 6386 §11.4 `uv_mode_tree`).
+#[rustfmt::skip]
+static UV_MODE_TREE: [i8; 6] = [
+    -(Y_DC_PRED as i8), 2,
+    -(Y_V_PRED as i8), 4,
+    -(Y_H_PRED as i8), -(Y_TM_PRED as i8),
+];
+
+/// Fixed key-frame chroma-mode probabilities (RFC 6386 §11.4).
+static KF_UV_MODE_PROB: [u8; 3] = [142, 114, 183];
+
+// Whole-block prediction modes (RFC 6386 §11.2): DC, vertical, horizontal,
+// "TrueMotion", and the per-4x4-subblock mode (luma only).
+const Y_DC_PRED: i32 = 0;
+const Y_V_PRED: i32 = 1;
+const Y_H_PRED: i32 = 2;
+const Y_TM_PRED: i32 = 3;
+const Y_B_PRED: i32 = 4;
+
+/// Writes the first partition: the frame header (RFC 6386 §9.2-§9.10) and
+/// then every macroblock's prediction modes (§11).
 ///
-/// This encodes Partition 1: the frame header flags, quantizer,
-/// and macroblock prediction modes.
+/// Field order and coding follow the key-frame column of the §19.2 bitstream
+/// syntax table verbatim (rfc6386.txt lines 6812-6854). Two fields here were
+/// previously mis-coded, and either alone makes the rest of the frame
+/// unparseable, because a boolean arithmetic coder has no resynchronisation
+/// point:
+///
+/// - `refresh_entropy_probs` (§9.8, rfc6386.txt line 6822) is coded on key
+///   frames too — `if (key_frame) refresh_entropy_probs L(1)` — and was
+///   simply absent.
+/// - The 1056 `token_prob_update()` gates (§9.9/§13.4) are each coded
+///   against their own entry in `coeff_update_probs`, not at probability
+///   1/2. Writing "no update" with the wrong probability still writes *a*
+///   symbol, but not the one the decoder subtracts.
 fn write_frame_header(enc: &mut BoolEncoder, mb_width: u32, mb_height: u32, quant_index: u8) {
-    // Color space (0 = YUV)
-    enc.encode_bit(false);
+    // --- colour space and clamping (RFC 6386 §9.2) ---
+    enc.encode_bit(false); // colour_space: 0 = YUV
+    enc.encode_bit(false); // clamping_type: 0 = decoder must clamp
 
-    // Clamping type (0 = required)
-    enc.encode_bit(false);
+    // --- segmentation (RFC 6386 §9.3) ---
+    enc.encode_bit(false); // segmentation_enabled
 
-    // Segmentation: disabled
-    enc.encode_bit(false);
+    // --- loop filter (RFC 6386 §9.4) ---
+    enc.encode_bit(false); // filter_type: 0 = normal
+    enc.encode_literal(0, 6); // loop_filter_level: 0 disables the filter
+    enc.encode_literal(0, 3); // sharpness_level
+    enc.encode_bit(false); // loop_filter_adj_enable
 
-    // Loop filter parameters
-    // filter_type (0 = normal)
-    enc.encode_bit(false);
-    // loop_filter_level (6 bits) - use 0 for simplicity
-    enc.encode_literal(0, 6);
-    // sharpness_level (3 bits)
-    enc.encode_literal(0, 3);
-
-    // Mode ref LF delta: disabled
-    enc.encode_bit(false);
-
-    // Number of DCT partitions: log2(1) = 0 (2 bits)
+    // --- token partitions (RFC 6386 §9.5) ---
+    // log2(1) = 0: a single partition, for which §9.5 writes no size table.
     enc.encode_literal(0, 2);
 
-    // Quantizer (7 bits for base index)
+    // --- quantiser indices (RFC 6386 §9.6) ---
     enc.encode_literal(u32::from(quant_index), 7);
-
-    // Y DC delta (1 bit flag + optional value) - no delta
-    enc.encode_bit(false);
-    // Y2 DC delta
-    enc.encode_bit(false);
-    // Y2 AC delta
-    enc.encode_bit(false);
-    // UV DC delta
-    enc.encode_bit(false);
-    // UV AC delta
-    enc.encode_bit(false);
-
-    // Token probability updates: signal "no update" for all
-    // 4 * 8 * 3 * 11 = 1056 probabilities
-    for _block_type in 0..4 {
-        for _band in 0..8 {
-            for _ctx in 0..3 {
-                for _node in 0..11 {
-                    enc.encode_bit(false); // no update
-                }
-            }
-        }
+    for _ in 0..5 {
+        // y_dc / y2_dc / y2_ac / uv_dc / uv_ac deltas: all absent.
+        enc.encode_bit(false);
     }
 
-    // Skip coefficient (mb_no_coeff_skip)
-    enc.encode_bit(false); // disabled
+    // --- refresh_entropy_probs (RFC 6386 §9.8; §19.2 line 6822) ---
+    enc.encode_bit(false);
 
-    // Macroblock prediction modes
-    // All macroblocks use I16 DC prediction
+    // --- DCT-token probability updates (RFC 6386 §9.9, §13.4) ---
+    // "No update" for all 1056 probabilities, each gated by its own
+    // `coeff_update_probs` entry.
+    for &update_prob in COEFF_UPDATE_PROBS.iter() {
+        enc.encode_bool(false, update_prob);
+    }
+
+    // --- mb_no_skip_coeff (RFC 6386 §9.10) ---
+    // Disabled, so no per-macroblock skip flag follows and every macroblock
+    // codes its residual.
+    enc.encode_bit(false);
+
+    // --- per-macroblock prediction modes (RFC 6386 §11.2-§11.4) ---
+    // Every macroblock is whole-block DC-predicted, so no 4x4 submodes
+    // follow (those are coded only for B_PRED).
     let total_mbs = mb_width * mb_height;
     for _ in 0..total_mbs {
-        // I16 mode tree:
-        // prob 145: 0 = DC, 1 = other
-        enc.encode_bool(false, 145); // DC prediction
-
-        // Chroma mode tree:
-        // prob 142: 0 = DC, 1 = other
-        enc.encode_bool(false, 142); // DC prediction
+        write_tree(enc, &KF_YMODE_TREE, &KF_YMODE_PROB, Y_DC_PRED, 0);
+        write_tree(enc, &UV_MODE_TREE, &KF_UV_MODE_PROB, Y_DC_PRED, 0);
     }
 }
 
@@ -1329,14 +1386,20 @@ impl WebPLossyEncoder {
         let mb_width = ((width + 15) / 16) as usize;
         let mb_height = ((height + 15) / 16) as usize;
 
+        // Dequantisation factors, derived exactly as the decoder derives
+        // them (RFC 6386 §14.1): Y2 DC doubles, Y2 AC is 155% with a floor
+        // of 8 applied to the *product*, and chroma DC saturates at 132.
+        // Applying the floor to the table entry instead, and omitting the
+        // chroma cap, made the encoder and decoder disagree about the scale
+        // of every coefficient at low quality settings.
         let qindex = self.quality_to_qindex();
-        let qi = qindex as usize;
-        let dc_quant = DC_QUANT_TABLE[qi.min(127)];
-        let ac_quant = AC_QUANT_TABLE[qi.min(127)];
-        let y2_dc_quant = DC_QUANT_TABLE[qi.min(127)] * 2;
-        let y2_ac_quant = AC_QUANT_TABLE[qi.min(127)].max(8) * 155 / 100;
-        let uv_dc_quant = DC_QUANT_TABLE[qi.min(127)];
-        let uv_ac_quant = AC_QUANT_TABLE[qi.min(127)];
+        let qi = (qindex as usize).min(127);
+        let dc_quant = DC_QUANT_TABLE[qi];
+        let ac_quant = AC_QUANT_TABLE[qi];
+        let y2_dc_quant = DC_QUANT_TABLE[qi] * 2;
+        let y2_ac_quant = (AC_QUANT_TABLE[qi] * 155 / 100).max(8);
+        let uv_dc_quant = DC_QUANT_TABLE[qi].min(132);
+        let uv_ac_quant = AC_QUANT_TABLE[qi];
 
         // Reconstructed planes for prediction reference
         let recon_y_stride = mb_width * 16;
@@ -1352,7 +1415,13 @@ impl WebPLossyEncoder {
         // Encode DCT tokens (Partition 2)
         let mut token_enc = BoolEncoder::new();
 
+        // Non-zero (entropy) contexts, mirroring the decoder: 9 slots per
+        // macroblock column (4 luma + 2 U + 2 V + 1 Y2), with the "left"
+        // context reset at the start of every macroblock row.
+        let mut above_nz = vec![false; mb_width * 9];
+
         for mby in 0..mb_height {
+            let mut left_nz = [false; 9];
             for mbx in 0..mb_width {
                 let mb = encode_macroblock(
                     yuv,
@@ -1371,28 +1440,53 @@ impl WebPLossyEncoder {
                     &recon_v,
                 );
 
-                // Encode Y2 block (block_type = 3)
-                encode_block(&mut token_enc, &mb.y2_block, 3, 0);
+                // --- residual tokens (RFC 6386 §13) ---
+                // Sub-block order, block types and entropy contexts must
+                // match the decoder's `decode_residuals` exactly. `ctx` is
+                // `above_nz + left_nz` for the corresponding slot: 4 luma
+                // columns/rows, 2+2 chroma, and slot 8 for Y2.
 
-                // Encode 16 Y blocks (block_type = 0 for DC-after-Y2, skip DC)
-                for sb in 0..16 {
-                    encode_block(&mut token_enc, &mb.y_blocks[sb], 0, 1);
+                // Y2 block: block type 1 (the previous code said 3, which is
+                // the type reserved for luma *without* a Y2 block).
+                let ctx = usize::from(left_nz[8]) + usize::from(above_nz[mbx * 9 + 8]);
+                let nz = encode_block(&mut token_enc, &mb.y2_block, 1, ctx, 0);
+                left_nz[8] = nz;
+                above_nz[mbx * 9 + 8] = nz;
+
+                // 16 luma sub-blocks in raster order: block type 0 (DC lives
+                // in Y2), so coefficient 0 is skipped.
+                for row in 0..4 {
+                    for col in 0..4 {
+                        let sb = row * 4 + col;
+                        let ctx = usize::from(above_nz[mbx * 9 + col]) + usize::from(left_nz[row]);
+                        let nz = encode_block(&mut token_enc, &mb.y_blocks[sb], 0, ctx, 1);
+                        above_nz[mbx * 9 + col] = nz;
+                        left_nz[row] = nz;
+                    }
                 }
 
-                // Encode 4 U blocks (block_type = 2)
-                for sb in 0..4 {
-                    encode_block(&mut token_enc, &mb.u_blocks[sb], 2, 0);
-                }
-
-                // Encode 4 V blocks (block_type = 2)
-                for sb in 0..4 {
-                    encode_block(&mut token_enc, &mb.v_blocks[sb], 2, 0);
+                // 4 U then 4 V sub-blocks: block type 2. U uses above/left
+                // context slots 4-5, V uses 6-7.
+                for (plane, blocks) in [(0usize, &mb.u_blocks), (1usize, &mb.v_blocks)] {
+                    let ctx_base = 4 + plane * 2;
+                    for row in 0..2 {
+                        for col in 0..2 {
+                            let sb = row * 2 + col;
+                            let above_index = mbx * 9 + ctx_base + col;
+                            let left_index = ctx_base + row;
+                            let ctx = usize::from(above_nz[above_index])
+                                + usize::from(left_nz[left_index]);
+                            let nz = encode_block(&mut token_enc, &blocks[sb], 2, ctx, 0);
+                            above_nz[above_index] = nz;
+                            left_nz[left_index] = nz;
+                        }
+                    }
                 }
 
                 // Reconstruct macroblock for prediction reference
-                let pred_y = compute_dc_pred_16x16(&recon_y, recon_y_stride, mbx, mby);
-                let pred_u = compute_dc_pred_8x8(&recon_u, recon_uv_stride, mbx, mby);
-                let pred_v = compute_dc_pred_8x8(&recon_v, recon_uv_stride, mbx, mby);
+                let pred_y = compute_dc_pred(&recon_y, recon_y_stride, mbx, mby, 16);
+                let pred_u = compute_dc_pred(&recon_u, recon_uv_stride, mbx, mby, 8);
+                let pred_v = compute_dc_pred(&recon_v, recon_uv_stride, mbx, mby, 8);
 
                 reconstruct_macroblock(
                     &mb,
@@ -1517,17 +1611,45 @@ mod tests {
     }
 
     #[test]
-    fn test_fdct4_1d() {
-        let input = [100, 100, 100, 100]; // DC-only signal
-        let mut output = [0i32; 4];
-        fdct4_1d(&input, &mut output);
+    fn test_fdct4x4_and_idct4x4_are_duals() {
+        // The forward DCT must be undone by RFC 6386 §14.4's inverse to
+        // within integer rounding. This is the property the old
+        // implementation violated: it had the 2217/5352 rotation constants
+        // exchanged, so `idct4x4(fdct4x4(x))` was not `x` at all.
+        let residual = [
+            12i32, -30, 7, 41, -5, 60, -22, 3, 18, -9, 55, -40, 2, 33, -17, 26,
+        ];
+        let mut coeffs = [0i32; 16];
+        fdct4x4(&residual, &mut coeffs);
+        let restored = idct4x4(&coeffs);
 
-        // For a flat signal, DC should be large and dominant
-        assert!(output[0] > 0);
-        // AC may have small rounding artifacts from integer approximation
-        assert!(output[0].abs() > output[1].abs());
-        assert!(output[0].abs() > output[2].abs());
-        assert!(output[0].abs() > output[3].abs());
+        for (i, (&want, &got)) in residual.iter().zip(restored.iter()).enumerate() {
+            assert!(
+                (want - got).abs() <= 2,
+                "sample {i}: forward/inverse DCT round trip drifted: want {want}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fwht4x4_and_iwht4x4_are_duals() {
+        // Same duality requirement for the Y2 (Walsh-Hadamard) transform:
+        // the §14.3 inverse divides by 8, so the forward transform must
+        // carry the remaining factor of 1/2. Omitting it (as the previous
+        // implementation did) scaled every luma DC by two.
+        let dc_values = [
+            300i32, -120, 44, 900, -640, 15, 208, -77, 1024, 5, -333, 66, 12, -900, 450, 81,
+        ];
+        let mut y2 = [0i32; 16];
+        fwht4x4(&dc_values, &mut y2);
+        let restored = iwht4x4(&y2);
+
+        for (i, (&want, &got)) in dc_values.iter().zip(restored.iter()).enumerate() {
+            assert!(
+                (want - got).abs() <= 2,
+                "DC {i}: forward/inverse WHT round trip drifted: want {want}, got {got}"
+            );
+        }
     }
 
     #[test]
@@ -1556,8 +1678,10 @@ mod tests {
         let mut coeffs = [0i32; 16];
         fwht4x4(&dc_values, &mut coeffs);
 
-        // DC should be 16 * 100 = 1600
-        assert_eq!(coeffs[0], 1600);
+        // DC = sum / 2 = 16 * 100 / 2. The `/2` is the normalisation RFC
+        // 6386 §14.3's inverse (which divides by 8, against the Hadamard
+        // butterfly's own factor of 16) expects the forward pass to carry.
+        assert_eq!(coeffs[0], 800);
         // AC should be 0
         for i in 1..16 {
             assert_eq!(coeffs[i], 0);
@@ -1721,12 +1845,12 @@ mod tests {
     }
 
     #[test]
-    fn test_idct4x4_simple_dc() {
+    fn test_idct4x4_dc_only_is_uniform() {
         // DC-only input
         let mut coeffs = [0i32; 16];
         coeffs[0] = 400;
 
-        let output = idct4x4_simple(&coeffs);
+        let output = idct4x4(&coeffs);
         // All outputs should be roughly equal (DC distributed)
         let avg = output.iter().sum::<i32>() / 16;
         for &v in &output {
@@ -1822,7 +1946,7 @@ mod tests {
     #[test]
     fn test_compute_dc_pred_16x16_no_neighbors() {
         let recon = vec![0u8; 16 * 16];
-        let pred = compute_dc_pred_16x16(&recon, 16, 0, 0);
+        let pred = compute_dc_pred(&recon, 16, 0, 0, 16);
         assert_eq!(pred, 128); // Default when no neighbors available
     }
 
@@ -1834,7 +1958,7 @@ mod tests {
         for col in 0..16 {
             recon[15 * stride + col] = 200;
         }
-        let pred = compute_dc_pred_16x16(&recon, stride, 0, 1);
+        let pred = compute_dc_pred(&recon, stride, 0, 1, 16);
         assert_eq!(pred, 200);
     }
 
@@ -1846,8 +1970,8 @@ mod tests {
         let mut wht_coeffs = [0i32; 16];
         fwht4x4(&uniform, &mut wht_coeffs);
 
-        // DC = sum of all = 50*16 = 800
-        assert_eq!(wht_coeffs[0], 800);
+        // DC = sum of all / 2 = 50 * 16 / 2 (see `test_fwht4x4_dc_only`).
+        assert_eq!(wht_coeffs[0], 400);
         // All AC should be zero for uniform input
         for i in 1..16 {
             assert_eq!(wht_coeffs[i], 0, "AC coeff at index {i} should be 0");
@@ -1859,9 +1983,9 @@ mod tests {
         ];
         fwht4x4(&varied, &mut wht_coeffs);
 
-        // DC should equal sum of all values
+        // DC should equal half the sum of all values.
         let total: i32 = varied.iter().sum();
-        assert_eq!(wht_coeffs[0], total);
+        assert_eq!(wht_coeffs[0], total / 2);
 
         // At least some AC coefficients should be non-zero
         let nonzero_ac = wht_coeffs[1..].iter().filter(|&&c| c != 0).count();

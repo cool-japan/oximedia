@@ -65,9 +65,13 @@ pub struct TranscodeOptions {
 
 /// Video codec targets accepted by `-c:v`.
 ///
-/// MJPEG/APV/MPEG-2/rawvideo have real encode pipelines; AV1/VP9/VP8 and
-/// FFV1/ProRes parse here so the pipeline can return a precise
-/// unsupported-codec error instead of a generic "unknown codec".
+/// MJPEG/APV/MPEG-2/FFV1/ProRes/rawvideo all have real encode pipelines --
+/// verified against `oximedia_transcode::codec_dispatch::make_video_encoder`,
+/// whose module doc is the authoritative list (each behind its own
+/// `oximedia-codec` feature, all enabled by default in this workspace). AV1/
+/// VP9/VP8 parse here so the pipeline can return a precise unsupported-codec
+/// error instead of a generic "unknown codec" -- their encoders do not yet
+/// produce a valid bitstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
     Mjpeg,
@@ -381,15 +385,24 @@ pub async fn transcode(mut options: TranscodeOptions) -> Result<()> {
     let audio_codec = parse_audio_codec(&options)?;
     let preset = EncoderPreset::from_str(&options.preset)?;
 
-    // None of the wired encoders (MPEG-2/FFV1/ProRes/raw video; lossless
-    // audio) expose a speed/quality preset knob, so a non-default preset
-    // cannot take real effect; warn instead of silently dropping it. The
-    // value is still validated above so typos fail loudly.
-    // TODO(0.2.x): map EncoderPreset onto real encoder speed knobs when a
-    // codec with a genuine speed/quality tradeoff (AV1/VP9 encode) lands.
+    // `EncoderPreset` genuinely has nowhere real to go: traced through
+    // `TranscodePipelineBuilder::quality` -> `TranscodeConfig::quality` ->
+    // `frame_level::execute_video_job`, which derives its `u8` quality
+    // parameter *only* from `QualityConfig::rate_control`'s `Crf(v)` case
+    // (falling back to a codec default otherwise) and never reads
+    // `QualityConfig::preset` at all -- setting it would be plumbing a value
+    // the encoder never consults, not a real effect. That is a property of
+    // *this pipeline's encoder set*, not a missing wire: MJPEG/APV are
+    // intra-frame with only a quality/QP knob, MPEG-2 only a qscale knob,
+    // and FFV1/rawvideo are lossless -- none has the search-effort-vs-time
+    // tradeoff a "preset" describes (that concept applies to inter-frame
+    // GOP encoders like AV1/VP9, whose encode does not produce real output
+    // yet). Validate the value above so typos fail loudly, then warn
+    // instead of silently dropping an explicit non-default request.
     if options.preset != "medium" {
         eprintln!(
-            "{} --preset '{}' has no effect in this pipeline; ignored",
+            "{} --preset '{}' has no effect in this pipeline; ignored (none of MJPEG/APV/\
+             MPEG-2/FFV1/ProRes/rawvideo expose a speed/quality preset knob)",
             "Warning:".yellow().bold(),
             options.preset
         );
@@ -409,19 +422,62 @@ pub async fn transcode(mut options: TranscodeOptions) -> Result<()> {
         None
     };
 
-    // The wired audio encoders are lossless (FLAC/ALAC/PCM) and the Opus
-    // path exposes no bitrate knob yet, so `-b:a` cannot take real effect.
-    // Validate the value's syntax, then warn instead of silently dropping
-    // an explicit request.
-    // TODO(0.2.x): wire --audio-bitrate through to the Opus encoder once
-    // oximedia-transcode's audio adapters expose a bitrate parameter.
+    // `-b:a` cannot take real effect on any currently-wired audio target,
+    // but *why* differs by codec, so the response does too. Validate the
+    // value's syntax first either way, so typos fail loudly regardless of
+    // codec.
     if let Some(ref br) = options.audio_bitrate {
         parse_bitrate(br)?;
-        eprintln!(
-            "{} --audio-bitrate is not implemented yet and is ignored (the wired audio \
-             encoders are lossless; no bitrate knob exists)",
-            "Warning:".yellow().bold()
-        );
+        match audio_codec {
+            // Opus is untrustworthy in this build (see
+            // `oximedia_transcode::frame_level::parse_audio_target`: the
+            // encoder's output has not passed reference-decoder
+            // verification, and the decoder fails to reconstruct real CELT
+            // packets, decoding them to silence). A silent "ignored"
+            // warning here would let the user believe `-c:a opus -b:a ...`
+            // is a coherent, honored request; it is not usable at all --
+            // refuse instead.
+            Some(AudioCodec::Opus) => {
+                return Err(anyhow!(
+                    "--audio-bitrate was given with --audio-codec opus, but Opus is not \
+                     supported for transcode in this build (the encoder is unverified against \
+                     any reference decoder, and the decoder fails to reconstruct real CELT \
+                     packets). Use flac, pcm, or alac, which this pipeline actually wires."
+                ));
+            }
+            // FLAC/PCM/ALAC are the wired, real, lossless audio encoders:
+            // "bitrate" is not a meaningful knob for lossless output at all,
+            // not merely an unwired one.
+            Some(lossless @ (AudioCodec::Flac | AudioCodec::Pcm | AudioCodec::Alac)) => {
+                eprintln!(
+                    "{} --audio-bitrate is not implemented yet and is ignored ({} is \
+                     lossless; bitrate does not apply)",
+                    "Warning:".yellow().bold(),
+                    lossless.name()
+                );
+            }
+            // Vorbis/AAC/MP3 parse as codec names but have no real encoder
+            // in this pipeline at all (see `AudioCodec::from_str`'s doc);
+            // --audio-bitrate is inert for the same underlying reason the
+            // codec choice itself will fail later, not a distinct gap.
+            Some(other) => {
+                eprintln!(
+                    "{} --audio-bitrate is not implemented yet and is ignored ({} has no \
+                     real encoder in this build)",
+                    "Warning:".yellow().bold(),
+                    other.name()
+                );
+            }
+            // No --audio-codec given means stream-copy: there is no
+            // re-encode step for a bitrate to apply to.
+            None => {
+                eprintln!(
+                    "{} --audio-bitrate is not implemented yet and is ignored (no \
+                     --audio-codec was given, so the audio stream is copied, not re-encoded)",
+                    "Warning:".yellow().bold()
+                );
+            }
+        }
     }
 
     // Parse scale if specified

@@ -3,7 +3,7 @@
 
 //! Output sinks for codecs the container crate has no (correct) muxer for.
 //!
-//! All three types implement the async [`Muxer`] trait so they can drive a
+//! All types here implement the async [`Muxer`] trait so they can drive a
 //! [`crate::multi_track::MultiTrackExecutor`] like any container muxer:
 //!
 //! - [`RawEsFileMuxer`] — concatenates encoded packets into a raw
@@ -15,6 +15,12 @@
 //!   constant-frames/variable-bytes formats) + `data`.
 //! - [`Y4mFileMuxer`] — wraps the container crate's `Y4mMuxer` for raw
 //!   (uncompressed) YUV 4:2:0 output.
+//! - [`Ffv1RawFileMuxer`] — writes FFV1 packets into a small
+//!   length-prefixed private framing (**not** a standard bitstream: FFV1
+//!   packets carry no self-delimiting boundary of their own, unlike
+//!   intra-only MPEG-2, and no container crate here can yet carry `V_FFV1`
+//!   + `CodecPrivate`). Round-trips with [`crate::frame_adapters::Ffv1FrameDecoder`]
+//!   but is not readable by ffmpeg/mkvtoolnix/any other tool.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -441,6 +447,119 @@ impl Muxer for Y4mFileMuxer {
             let mut writer = muxer.into_writer()?;
             writer.flush()?;
         }
+        Ok(())
+    }
+
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn config(&self) -> &MuxerConfig {
+        &self.config
+    }
+}
+
+// ─── Ffv1RawFileMuxer ─────────────────────────────────────────────────────────
+
+/// Magic bytes identifying this crate's private raw-FFV1 framing.
+pub const FFV1_RAW_MAGIC: &[u8; 8] = b"OXIFFV1\0";
+
+/// Writes FFV1 packets into a small length-prefixed private file:
+///
+/// ```text
+/// [8B magic "OXIFFV1\0"] [1B format version = 1]
+/// [4B width LE] [4B height LE] [4B fps_num LE] [4B fps_den LE]
+/// [4B extradata_len LE] [extradata_len B extradata]
+/// repeated: [4B frame_len LE] [frame_len B frame payload]
+/// ```
+///
+/// `extradata` must be the encoder's
+/// [`Ffv1Encoder::extradata`](oximedia_codec::Ffv1Encoder::extradata)
+/// output — [`crate::frame_adapters::Ffv1FrameDecoder`] passes it straight
+/// to `Ffv1Decoder::with_extradata`. Every FFV1 packet here is a complete,
+/// independently-decodable intra frame (the frame-level encoder always
+/// configures `keyint = 1`), so frames need no inter-frame ordering
+/// guarantee beyond append order.
+pub struct Ffv1RawFileMuxer {
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    fps: (u32, u32),
+    extradata: Vec<u8>,
+    frames: Vec<Vec<u8>>,
+    streams: Vec<StreamInfo>,
+    config: MuxerConfig,
+}
+
+impl Ffv1RawFileMuxer {
+    /// Creates a raw-FFV1 sink writing to `path`.
+    #[must_use]
+    pub fn new(
+        path: PathBuf,
+        width: u32,
+        height: u32,
+        fps: (u32, u32),
+        extradata: Vec<u8>,
+    ) -> Self {
+        Self {
+            path,
+            width,
+            height,
+            fps,
+            extradata,
+            frames: Vec::new(),
+            streams: Vec::new(),
+            config: MuxerConfig::new(),
+        }
+    }
+
+    fn assemble(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(FFV1_RAW_MAGIC);
+        out.push(1); // format version
+        out.extend_from_slice(&self.width.to_le_bytes());
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(&self.fps.0.to_le_bytes());
+        out.extend_from_slice(&self.fps.1.to_le_bytes());
+        out.extend_from_slice(&(self.extradata.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.extradata);
+        for frame in &self.frames {
+            out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            out.extend_from_slice(frame);
+        }
+        out
+    }
+}
+
+#[async_trait]
+impl Muxer for Ffv1RawFileMuxer {
+    fn add_stream(&mut self, info: StreamInfo) -> OxiResult<usize> {
+        if !self.streams.is_empty() {
+            return Err(OxiError::Unsupported(
+                "raw FFV1 output supports exactly one video stream".into(),
+            ));
+        }
+        self.streams.push(info);
+        Ok(0)
+    }
+
+    async fn write_header(&mut self) -> OxiResult<()> {
+        if self.streams.is_empty() {
+            return Err(OxiError::Unsupported(
+                "add_stream must be called before write_header".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn write_packet(&mut self, packet: &Packet) -> OxiResult<()> {
+        self.frames.push(packet.data.to_vec());
+        Ok(())
+    }
+
+    async fn write_trailer(&mut self) -> OxiResult<()> {
+        let bytes = self.assemble();
+        tokio::fs::write(&self.path, &bytes).await?;
         Ok(())
     }
 

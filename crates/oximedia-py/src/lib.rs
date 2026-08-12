@@ -187,10 +187,26 @@ pub mod mp4;
 pub mod multicam_py;
 /// NDI source discovery and streaming bindings.
 pub mod ndi_py;
+/// `oximedia.neural` — multi-head attention and standalone attention/positional-encoding functions.
+pub mod neural_attention_py;
+/// `oximedia.neural` — object detection, face detection, and optical flow media pipelines.
+pub mod neural_detect_py;
+/// `oximedia.neural` — declarative `Sequential` / `ModelGraph` model builders with Python-callable layers.
+pub mod neural_graph_py;
+/// `oximedia.neural` — individual neural network layers (Linear, Conv2d, BatchNorm, pooling).
+pub mod neural_layers_py;
+/// `oximedia.neural` — ONNX model introspection and graph execution (`onnx` feature adds the full oxionnx backend).
+pub mod neural_onnx_py;
 /// `oximedia.neural` submodule — Tensor + media-model inference (scene
 /// classifier, thumbnail ranker, super-resolution upscaler, feature
 /// extractor; real delegation to `oximedia-neural`).
 pub mod neural_py;
+/// `oximedia.neural` — INT8 symmetric quantization for linear layers.
+pub mod neural_quant_py;
+/// `oximedia.neural` — GRU / LSTM recurrent sequence layers.
+pub mod neural_recurrent_py;
+/// `oximedia.neural` — pre-configured architecture catalogue (`MediaModelZoo`).
+pub mod neural_zoo_py;
 /// Codec optimization bindings (complexity analysis, CRF sweep, quality ladder).
 pub mod optimize_py;
 /// `oximedia.io` submodule — file open, probe, transcode operations.

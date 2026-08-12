@@ -14,8 +14,16 @@
 //!    >= 30 dB bound proves real, faithful pixels rather than noise or a
 //!    constant fill.
 //!
-//! A REAL libvpx inter frame (frame 2 of the IVF stream) must produce the
-//! honest `UnsupportedFeature` error — never a blank frame.
+//! A REAL libvpx inter frame (frame 2 of the IVF stream) decodes through
+//! the same public seam; its *bit-exactness* is gated by the five-stream
+//! conformance suite in `src/vp8/dec/inter_fixture_tests.rs`, which has
+//! libvpx reference YUV for every shown frame of every stream. What this
+//! file adds for inter frames is the public-API contract: the frame comes
+//! out labelled `Inter`, carries its pts, and — with no key frame decoded,
+//! or after `reset()` drops the reference surfaces — is rejected honestly
+//! instead of predicted from an invented buffer.
+
+#![cfg(feature = "vp8")]
 
 mod vp8_fixtures;
 
@@ -173,45 +181,116 @@ fn test_decode_libvpx_keyframe_48x48_multi_partition_bit_exact() {
 }
 
 #[test]
-fn test_real_libvpx_inter_frame_returns_honest_unsupported_error() {
+fn test_real_libvpx_inter_frame_decodes_through_the_public_api() {
+    // The bit-exactness of inter decoding is gated by the five-stream
+    // conformance suite in `src/vp8/dec/inter_fixture_tests.rs` (which has
+    // libvpx reference YUV for every shown frame). This test covers the
+    // other half: that a REAL libvpx inter frame reaches that pipeline
+    // through the public `VideoDecoder` seam and comes back out as a frame.
     let mut decoder = Vp8Decoder::new(DecoderConfig::default()).expect("decoder construction");
 
-    // Frame 1 of the IVF stream: the key frame decodes normally.
+    // Frame 1 of the IVF stream: the key frame.
     decoder
         .send_packet(&fx::VPX_KEYFRAME_VP8, 0)
         .expect("key frame must decode");
+    let key = decoder
+        .receive_frame()
+        .expect("receive_frame must not error")
+        .expect("key frame must be emitted");
+    assert!(key.is_keyframe(), "frame 1 is a key frame");
+
+    // Frame 2: a REAL libvpx inter frame — motion vectors and reference
+    // buffers, decoded against the key frame just published to the DPB.
+    decoder
+        .send_packet(&fx::VPX_INTER_FRAME_VP8, 1)
+        .expect("a real inter frame must decode");
+    let inter = decoder
+        .receive_frame()
+        .expect("receive_frame must not error")
+        .expect("the inter frame must be emitted");
+
+    assert_eq!(inter.width, 48);
+    assert_eq!(inter.height, 48);
+    assert_eq!(inter.format, PixelFormat::Yuv420p);
     assert!(
-        decoder
-            .receive_frame()
-            .expect("receive_frame must not error")
-            .is_some(),
-        "key frame must be emitted"
+        !inter.is_keyframe(),
+        "an inter frame must not be labelled a key frame"
+    );
+    assert_eq!(inter.timestamp.pts, 1, "pts must be carried through");
+    assert_eq!(inter.planes.len(), 3);
+    assert_eq!(inter.plane(0).data().len(), 48 * 48);
+    assert_eq!(inter.plane(1).data().len(), 24 * 24);
+    assert_eq!(inter.plane(2).data().len(), 24 * 24);
+
+    // Real reconstructed pixels, not a constant fill.
+    let luma = inter.plane(0).data();
+    let (min, max) = (
+        luma.iter().copied().min().unwrap_or(0),
+        luma.iter().copied().max().unwrap_or(0),
+    );
+    assert!(
+        max - min > 8,
+        "inter luma looks like a constant fill (min {min}, max {max})"
     );
 
-    // Frame 2: a REAL libvpx inter frame. Inter decoding (motion vectors,
-    // golden/altref references) is not implemented -> honest error.
-    let err = match decoder.send_packet(&fx::VPX_INTER_FRAME_VP8, 1) {
-        Err(e) => e,
-        Ok(()) => panic!("a real inter frame must not decode yet"),
-    };
-    assert!(
-        matches!(err, CodecError::UnsupportedFeature(_)),
-        "expected UnsupportedFeature for an inter frame, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .contains("inter-frame decode not yet implemented"),
-        "error must name the gap, got: {err}"
-    );
-
-    // And crucially: no blank frame may be fabricated for the inter frame.
+    // Nothing else is queued: two packets in, two frames out.
     assert!(
         decoder
             .receive_frame()
             .expect("receive_frame must not error")
             .is_none(),
-        "no blank frame may be emitted for an unsupported inter frame"
+        "no extra frame may be fabricated"
     );
+}
+
+#[test]
+fn test_inter_frame_without_a_key_frame_is_rejected_not_fabricated() {
+    // The honesty guard that survives inter-frame support: with no key
+    // frame decoded, there are no reference surfaces, so the inter frame
+    // must error rather than predict from an invented buffer.
+    let mut decoder = Vp8Decoder::new(DecoderConfig::default()).expect("decoder construction");
+    let err = match decoder.send_packet(&fx::VPX_INTER_FRAME_VP8, 0) {
+        Err(e) => e,
+        Ok(()) => panic!("an inter frame without references must not decode"),
+    };
+    assert!(
+        matches!(err, CodecError::InvalidBitstream(_)),
+        "expected InvalidBitstream, got {err:?}"
+    );
+    assert!(
+        decoder
+            .receive_frame()
+            .expect("receive_frame must not error")
+            .is_none(),
+        "no blank frame may be emitted"
+    );
+}
+
+#[test]
+fn test_reset_drops_reference_frames_so_inter_frames_are_rejected() {
+    // After a seek the pre-seek reference surfaces are invalid; predicting
+    // from them would silently produce wrong pixels, so `reset` drops them
+    // and the next inter frame is rejected until a key frame arrives.
+    let mut decoder = Vp8Decoder::new(DecoderConfig::default()).expect("decoder construction");
+    decoder
+        .send_packet(&fx::VPX_KEYFRAME_VP8, 0)
+        .expect("key frame must decode");
+    let _ = decoder.receive_frame();
+
+    decoder.reset();
+
+    assert!(
+        decoder.send_packet(&fx::VPX_INTER_FRAME_VP8, 1).is_err(),
+        "an inter frame must not decode against dropped references"
+    );
+    // A key frame re-establishes the sequence, and the inter frame that
+    // follows it decodes again.
+    decoder
+        .send_packet(&fx::VPX_KEYFRAME_VP8, 2)
+        .expect("key frame must decode after reset");
+    decoder
+        .send_packet(&fx::VPX_INTER_FRAME_VP8, 3)
+        .expect("inter frame must decode after a fresh key frame");
 }
 
 #[test]

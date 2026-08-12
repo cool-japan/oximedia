@@ -67,6 +67,11 @@ for target in $TARGETS; do
                 DICT_ARG="-- -dict=dictionaries/av1.dict"
             fi
             ;;
+        vp8_decoder)
+            if [ -f "dictionaries/vp8_decoder.dict" ]; then
+                DICT_ARG="-- -dict=dictionaries/vp8_decoder.dict"
+            fi
+            ;;
         hls_parser)
             if [ -f "dictionaries/hls.dict" ]; then
                 DICT_ARG="-- -dict=dictionaries/hls.dict"

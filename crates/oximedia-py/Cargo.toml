@@ -98,3 +98,9 @@ vp8 = []
 opus = []
 cv2 = []
 ml = ["dep:oximedia-ml"]
+# Full-graph ONNX inference in `oximedia.neural.OnnxBackend` via the oxionnx
+# pure-Rust engine. Off by default: without it, `OnnxBackend` methods raise a
+# `RuntimeError` naming this flag instead of returning a fabricated result.
+# `oximedia.neural.inspect_onnx()` / `OnnxRuntime` (this crate's own
+# hand-written ONNX parser + node executor) work unconditionally.
+onnx = ["oximedia-neural/onnx"]

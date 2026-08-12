@@ -472,8 +472,8 @@ pub async fn concat_videos(options: ConcatOptions) -> Result<()> {
         validate_stream_compatibility(&file_infos)?;
     }
 
-    // Print concatenation plan
-    if !options.json_output {
+    // Print concatenation plan (status output; suppressed by --quiet)
+    if !options.json_output && !crate::progress::is_quiet() {
         print_concat_plan(&options, &file_infos);
     }
 
@@ -493,7 +493,7 @@ pub async fn concat_videos(options: ConcatOptions) -> Result<()> {
         )
         .await?;
         println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         print_concat_summary(&options.output, duration, &context).await?;
     }
 
@@ -1111,6 +1111,8 @@ fn stream_compat_to_stream_info(compat: &StreamCompatInfo, index: usize) -> Stre
         duration: None,
         codec_params,
         metadata: Metadata::default(),
+        rotation: None,
+        display_matrix: None,
     }
 }
 

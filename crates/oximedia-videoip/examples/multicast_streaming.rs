@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use oximedia_videoip::codec::{AudioSamples, VideoFrame};
+use oximedia_videoip::types::{AudioCodec, VideoCodec};
 use oximedia_videoip::{AudioConfig, VideoConfig, VideoIpSource};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -9,8 +10,12 @@ use tokio::time::interval;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let video_config = VideoConfig::new(1920, 1080, 60.0)?;
-    let audio_config = AudioConfig::new(48000, 2)?;
+    // UYVY and PCM are the formats this crate can genuinely put on the
+    // wire: it has no working VP8/VP9/AV1 or Opus encoder, and
+    // VideoIpSource::new refuses those rather than shipping raw
+    // frames labelled as a compressed bitstream.
+    let video_config = VideoConfig::new(1920, 1080, 60.0)?.with_codec(VideoCodec::Uyvy);
+    let audio_config = AudioConfig::new(48000, 2)?.with_codec(AudioCodec::Pcm16)?;
 
     let mut source = VideoIpSource::new("Multicast Source", video_config, audio_config).await?;
 

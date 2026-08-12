@@ -52,7 +52,7 @@ pub fn temporal_average(
 
             temporal_average_plane(
                 &planes,
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,
@@ -146,7 +146,7 @@ pub fn exponential_temporal_average(
             exponential_average_plane(
                 current_plane.data.as_ref(),
                 prev_plane.data.as_ref(),
-                &mut plane.data.clone(),
+                plane.data.as_mut(),
                 width as usize,
                 height as usize,
                 plane.stride,

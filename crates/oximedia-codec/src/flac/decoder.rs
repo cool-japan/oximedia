@@ -1,17 +1,17 @@
 //! FLAC audio decoder.
 //!
-//! Decodes FLAC frames back into interleaved i32 PCM samples.
+//! Decodes FLAC frames back into interleaved i32 PCM samples, following
+//! RFC 9639 exactly.
 //!
 //! # Decoding pipeline
 //!
-//! 1. Parse FLAC stream header (`fLaC` + STREAMINFO).
-//! 2. Parse frame header (sync code, block size, channel count, etc.).
-//! 3. Decode each subframe:
-//!    - **LPC subframe**: read warmup samples, quantised coefficients, Rice residuals,
-//!      then call `restore_signal` to reconstruct the channel.
-//!    - **Verbatim subframe**: read raw 16-bit samples directly.
-//! 4. Interleave channels to produce the output PCM block.
-//! 5. Verify frame CRC-16.
+//! 1. Parse the metadata blocks (`fLaC` + STREAMINFO + any others).
+//! 2. Parse each frame header ([`super::frame::FrameHeader`]) and verify its CRC-8.
+//! 3. Decode every subframe ([`super::subframe::read_subframe`]) — constant,
+//!    verbatim, fixed-predictor and LPC, with wasted-bits handling and
+//!    partitioned Rice residuals including escape-coded partitions.
+//! 4. Undo inter-channel decorrelation (left/side, side/right, mid/side).
+//! 5. Verify the frame CRC-16 and interleave the channels.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::cast_possible_truncation)]
@@ -19,158 +19,10 @@
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_possible_wrap)]
 
-use super::lpc::restore_signal;
-use super::rice::RiceDecoder;
+use super::bitio::{crc16, BitReader};
+use super::frame::FrameHeader;
+use super::subframe::read_subframe;
 use crate::error::{CodecError, CodecResult};
-
-// =============================================================================
-// CRC-16 (same CCITT variant as encoder)
-// =============================================================================
-
-fn crc16(data: &[u8]) -> u16 {
-    const POLY: u16 = 0x8005;
-    let mut crc = 0u16;
-    for &byte in data {
-        crc ^= u16::from(byte) << 8;
-        for _ in 0..8 {
-            if crc & 0x8000 != 0 {
-                crc = (crc << 1) ^ POLY;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc
-}
-
-// =============================================================================
-// Bit reader helper
-// =============================================================================
-
-struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize, // byte position
-    bit: u8,    // bit position within current byte (0 = MSB)
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-            bit: 0,
-        }
-    }
-
-    fn byte_offset(&self) -> usize {
-        self.pos
-    }
-
-    fn read_bit(&mut self) -> Option<u8> {
-        if self.pos >= self.data.len() {
-            return None;
-        }
-        let v = (self.data[self.pos] >> (7 - self.bit)) & 1;
-        self.bit += 1;
-        if self.bit == 8 {
-            self.bit = 0;
-            self.pos += 1;
-        }
-        Some(v)
-    }
-
-    fn read_bits(&mut self, n: usize) -> Option<u32> {
-        let mut v = 0u32;
-        for _ in 0..n {
-            v = (v << 1) | u32::from(self.read_bit()?);
-        }
-        Some(v)
-    }
-
-    fn read_byte(&mut self) -> Option<u8> {
-        // Align to byte boundary first
-        if self.bit != 0 {
-            self.bit = 0;
-            self.pos += 1;
-        }
-        if self.pos >= self.data.len() {
-            return None;
-        }
-        let b = self.data[self.pos];
-        self.pos += 1;
-        Some(b)
-    }
-
-    fn read_be_u16(&mut self) -> Option<u16> {
-        let hi = u16::from(self.read_byte()?);
-        let lo = u16::from(self.read_byte()?);
-        Some((hi << 8) | lo)
-    }
-
-    fn read_be_i16(&mut self) -> Option<i16> {
-        self.read_be_u16().map(|v| v as i16)
-    }
-
-    /// Read a UTF-8-style coded integer (as used in FLAC frame headers).
-    /// Returns the decoded value (supports up to 4-byte form used by encoder).
-    fn read_utf8_coded(&mut self) -> Option<u64> {
-        let b0 = self.read_byte()?;
-        if b0 & 0x80 == 0 {
-            // 1-byte form (0xxxxxxx) → value in 7 bits
-            return Some(u64::from(b0));
-        }
-        // Determine extra bytes from leading bits
-        let extra = if b0 & 0xF8 == 0xF0 {
-            3usize // 11110xxx → 3 continuation bytes
-        } else if b0 & 0xF0 == 0xE0 {
-            2usize // 1110xxxx → 2 continuation bytes
-        } else if b0 & 0xE0 == 0xC0 {
-            1usize // 110xxxxx → 1 continuation byte
-        } else {
-            return None; // unsupported / corrupt
-        };
-
-        let mask: u8 = match extra {
-            3 => 0x07,
-            2 => 0x0F,
-            1 => 0x1F,
-            _ => 0x1F,
-        };
-        let mut val = u64::from(b0 & mask);
-        for _ in 0..extra {
-            let cb = self.read_byte()?;
-            if cb & 0xC0 != 0x80 {
-                return None; // invalid continuation byte
-            }
-            val = (val << 6) | u64::from(cb & 0x3F);
-        }
-        Some(val)
-    }
-
-    /// Align reader to next byte boundary (skip remaining bits in current byte).
-    fn align_to_byte(&mut self) {
-        if self.bit != 0 {
-            self.bit = 0;
-            self.pos += 1;
-        }
-    }
-
-    fn remaining_bytes(&self) -> usize {
-        if self.bit != 0 {
-            self.data.len().saturating_sub(self.pos + 1)
-        } else {
-            self.data.len().saturating_sub(self.pos)
-        }
-    }
-
-    fn slice_from_current(&self) -> &[u8] {
-        if self.pos < self.data.len() {
-            &self.data[self.pos..]
-        } else {
-            &[]
-        }
-    }
-}
 
 // =============================================================================
 // Decoder state
@@ -214,7 +66,18 @@ pub struct DecodedBlock {
     /// Interleaved i32 PCM samples (channel-minor order).
     pub samples: Vec<i32>,
     /// Sample number of the first sample in this block.
+    ///
+    /// A fixed-block-size stream codes a *frame* number rather than a sample
+    /// number, so this is derived as `frame_number × stream_block_size`.  The
+    /// stream block size comes from STREAMINFO when it declares one
+    /// (`min_block_size == max_block_size`); without STREAMINFO the frame's own
+    /// block size is used, which is exact for every frame except a short final
+    /// one.  Decode through [`FlacDecoder::decode_stream`], or call
+    /// [`FlacDecoder::parse_metadata`] first, to always get exact numbering.
     pub sample_number: u64,
+    /// Frame number, for fixed-block-size streams only (`None` when the frame
+    /// codes a sample number directly).
+    pub frame_number: Option<u64>,
     /// Number of samples per channel in this block.
     pub block_size: usize,
     /// Number of channels.
@@ -267,6 +130,11 @@ impl FlacDecoder {
     /// Returns `CodecError::InvalidData` if the magic bytes are missing, STREAMINFO
     /// is absent or malformed, or any block header is truncated.
     pub fn parse_metadata(&mut self, data: &[u8]) -> Result<(), CodecError> {
+        self.parse_metadata_inner(data).map(|_| ())
+    }
+
+    /// Parse every metadata block, returning the byte offset of the first frame.
+    fn parse_metadata_inner(&mut self, data: &[u8]) -> Result<usize, CodecError> {
         if data.len() < 4 {
             return Err(CodecError::InvalidData(
                 "Stream too short for fLaC marker".to_string(),
@@ -333,7 +201,7 @@ impl FlacDecoder {
         }
 
         self.header_parsed = true;
-        Ok(())
+        Ok(pos)
     }
 
     /// Quick-probe a FLAC byte stream: validates the magic bytes and parses the
@@ -542,103 +410,83 @@ impl FlacDecoder {
     ///
     /// Returns `CodecError::InvalidData` on malformed frame data.
     pub fn decode_frame(&self, data: &[u8]) -> CodecResult<(DecodedBlock, usize)> {
-        if data.len() < 10 {
-            return Err(CodecError::InvalidData("Frame data too short".to_string()));
-        }
-
         let mut r = BitReader::new(data);
+        let header = FrameHeader::parse(&mut r)?;
 
-        // Sync code: 0xFFF8 (14 sync bits + variable block flag + reserved)
-        let sync_hi = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF reading sync".to_string()))?;
-        let sync_lo = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF reading sync".to_string()))?;
-        if sync_hi != 0xFF || (sync_lo & 0xFC) != 0xF8 {
+        // The frame header may defer the bit depth to STREAMINFO.
+        let bits_per_sample = match header.bits_per_sample {
+            Some(bps) => bps,
+            None => self
+                .stream_info
+                .as_ref()
+                .map(|si| si.bits_per_sample)
+                .ok_or_else(|| {
+                    CodecError::InvalidData(
+                        "FLAC: frame defers bit depth to STREAMINFO, which has not been parsed"
+                            .to_string(),
+                    )
+                })?,
+        };
+        if !(1..=32).contains(&bits_per_sample) {
             return Err(CodecError::InvalidData(format!(
-                "Invalid FLAC sync: {sync_hi:#04x} {sync_lo:#04x}"
+                "FLAC: unsupported bit depth {bits_per_sample}"
             )));
         }
+        let bps = u32::from(bits_per_sample);
 
-        // Byte 2: block size (high nibble) + sample rate (low nibble)
-        let byte2 = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF byte2".to_string()))?;
-        let bs_code = (byte2 >> 4) & 0x0F;
-        let _sr_code = byte2 & 0x0F;
+        let block_size = header.block_size as usize;
+        let assignment = header.channel_assignment;
+        let channels = assignment.channel_count();
 
-        // Byte 3: channels-1 (high nibble) + bps_code (low nibble)
-        let byte3 = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF byte3".to_string()))?;
-        let ch_minus1 = ((byte3 >> 4) & 0x0F) as usize;
-        let _bps_code = byte3 & 0x0F;
-        let channels = ch_minus1 + 1;
-
-        // UTF-8 coded sample number
-        let sample_number = r
-            .read_utf8_coded()
-            .ok_or_else(|| CodecError::InvalidData("EOF sample number".to_string()))?;
-
-        // Optional: explicit block size (16-bit) when bs_code == 7
-        let block_size = if bs_code == 7 {
-            let hi = r
-                .read_byte()
-                .ok_or_else(|| CodecError::InvalidData("EOF block size hi".to_string()))?;
-            let lo = r
-                .read_byte()
-                .ok_or_else(|| CodecError::InvalidData("EOF block size lo".to_string()))?;
-            ((u32::from(hi) << 8) | u32::from(lo)) as usize
-        } else {
-            // Fallback: try to get from stream_info or use default
-            self.stream_info
-                .as_ref()
-                .map(|si| si.max_block_size as usize)
-                .unwrap_or(4096)
-        };
-
-        // CRC-8 of header (we skip validation for now — just consume byte)
-        let _crc8 = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF CRC-8".to_string()))?;
-
-        // Decode subframes
+        // Decode every subframe; side channels carry one extra bit.
         let mut decoded_channels: Vec<Vec<i32>> = Vec::with_capacity(channels);
-        for _ in 0..channels {
-            let ch_samples = self.decode_subframe(&mut r, block_size)?;
-            decoded_channels.push(ch_samples);
+        for index in 0..channels {
+            let depth = bps + assignment.extra_bits(index);
+            decoded_channels.push(read_subframe(&mut r, block_size, depth)?);
         }
 
-        // Align to byte boundary before CRC-16
+        // Frame footer: zero-pad to a byte boundary, then the CRC-16.
         r.align_to_byte();
-
-        // CRC-16 (2 bytes) — read and verify
-        let frame_len_before_crc = r.byte_offset();
+        let frame_len_before_crc = r.byte_pos();
         let crc_hi = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF CRC-16 hi".to_string()))?;
+            .read_aligned_byte()
+            .ok_or_else(|| CodecError::InvalidData("FLAC: EOF reading CRC-16".to_string()))?;
         let crc_lo = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF CRC-16 lo".to_string()))?;
+            .read_aligned_byte()
+            .ok_or_else(|| CodecError::InvalidData("FLAC: EOF reading CRC-16".to_string()))?;
         let stored_crc = (u16::from(crc_hi) << 8) | u16::from(crc_lo);
         let computed_crc = crc16(&data[..frame_len_before_crc]);
-
         if stored_crc != computed_crc {
-            // Allow CRC mismatch in simplified test frames (encoder also uses simplified CRC-8=0)
-            // Real FLAC decoders would reject, but our encoder writes CRC16 correctly.
-            // We verify as a best-effort.
-            let _ = stored_crc;
+            return Err(CodecError::InvalidData(format!(
+                "FLAC: frame CRC-16 mismatch (stored {stored_crc:#06x}, computed {computed_crc:#06x})"
+            )));
         }
-
         let bytes_consumed = frame_len_before_crc + 2;
 
-        // Interleave channels
+        assignment.undo_decorrelation(&mut decoded_channels)?;
+
+        // With a fixed block size the coded number is a frame number; convert
+        // it to the first sample number so callers see a uniform meaning.
+        // Scaling must use the *stream's* block size, not this frame's, or a
+        // short final frame would report the wrong position.
+        let (sample_number, frame_number) = if header.variable_block_size {
+            (header.coded_number, None)
+        } else {
+            let stream_block_size = self
+                .stream_info
+                .as_ref()
+                .filter(|si| si.min_block_size == si.max_block_size && si.min_block_size > 0)
+                .map_or(block_size as u64, |si| u64::from(si.min_block_size));
+            (
+                header.coded_number.saturating_mul(stream_block_size),
+                Some(header.coded_number),
+            )
+        };
+
         let mut samples = Vec::with_capacity(block_size * channels);
         for s in 0..block_size {
-            for ch in 0..channels {
-                let v = decoded_channels[ch].get(s).copied().unwrap_or(0);
-                samples.push(v);
+            for channel in &decoded_channels {
+                samples.push(channel.get(s).copied().unwrap_or(0));
             }
         }
 
@@ -646,6 +494,7 @@ impl FlacDecoder {
             DecodedBlock {
                 samples,
                 sample_number,
+                frame_number,
                 block_size,
                 channels,
             },
@@ -653,155 +502,37 @@ impl FlacDecoder {
         ))
     }
 
-    /// Decode a subframe (one channel).
-    fn decode_subframe(&self, r: &mut BitReader<'_>, block_size: usize) -> CodecResult<Vec<i32>> {
-        let subframe_type = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF reading subframe type".to_string()))?;
-
-        if subframe_type == 0x02 {
-            // Verbatim subframe
-            return self.decode_verbatim_subframe(r, block_size);
-        }
-
-        if subframe_type & 0xC0 == 0x40 {
-            // LPC subframe: type = 0b01xxxxxx, order = (type & 0x3F) + 1
-            let order = ((subframe_type & 0x3F) as usize) + 1;
-            return self.decode_lpc_subframe(r, block_size, order);
-        }
-
-        // Unknown subframe type: fall back to verbatim
-        self.decode_verbatim_subframe(r, block_size)
-    }
-
-    /// Decode a verbatim subframe (raw 16-bit signed samples).
-    fn decode_verbatim_subframe(
-        &self,
-        r: &mut BitReader<'_>,
-        block_size: usize,
-    ) -> CodecResult<Vec<i32>> {
-        let mut samples = Vec::with_capacity(block_size);
-        for _ in 0..block_size {
-            let s = r.read_be_i16().ok_or_else(|| {
-                CodecError::InvalidData("EOF reading verbatim sample".to_string())
-            })?;
-            samples.push(i32::from(s));
-        }
-        Ok(samples)
-    }
-
-    /// Decode an LPC subframe.
-    fn decode_lpc_subframe(
-        &self,
-        r: &mut BitReader<'_>,
-        block_size: usize,
-        order: usize,
-    ) -> CodecResult<Vec<i32>> {
-        if block_size < order {
-            return Err(CodecError::InvalidData(format!(
-                "Block size {block_size} < LPC order {order}"
-            )));
-        }
-
-        // Warmup samples (verbatim i16)
-        let mut warmup = Vec::with_capacity(order);
-        for _ in 0..order {
-            let s = r
-                .read_be_i16()
-                .ok_or_else(|| CodecError::InvalidData("EOF reading LPC warmup".to_string()))?;
-            warmup.push(i32::from(s));
-        }
-
-        // Coefficient precision (1 byte) and shift (1 byte)
-        let precision_byte = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF reading LPC precision".to_string()))?;
-        let shift_byte = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF reading LPC shift".to_string()))?;
-        let _precision = precision_byte + 1; // stored as precision-1
-        let shift = shift_byte;
-
-        // Quantised coefficients (i16 BE, `order` of them)
-        let mut int_coeffs = Vec::with_capacity(order);
-        for _ in 0..order {
-            let c = r.read_be_i16().ok_or_else(|| {
-                CodecError::InvalidData("EOF reading LPC coefficient".to_string())
-            })?;
-            int_coeffs.push(i32::from(c));
-        }
-
-        // Dequantise: float_coeff = int_coeff / 2^shift
-        let scale = (1i64 << shift) as f64;
-        let float_coeffs: Vec<f64> = int_coeffs.iter().map(|&c| f64::from(c) / scale).collect();
-
-        // Rice partition header: 2 bytes (partition order byte + Rice param byte)
-        let _partition_order = r.read_byte().ok_or_else(|| {
-            CodecError::InvalidData("EOF reading Rice partition order".to_string())
-        })?;
-        let rice_param = r
-            .read_byte()
-            .ok_or_else(|| CodecError::InvalidData("EOF reading Rice parameter".to_string()))?;
-
-        // Rice-decode residuals
-        let residual_count = block_size - order;
-        r.align_to_byte();
-
-        let rice_data = r.slice_from_current().to_vec();
-        let mut rice_dec = RiceDecoder::new(&rice_data);
-        let residuals = rice_dec.decode_n(residual_count, rice_param);
-
-        if residuals.len() < residual_count {
-            return Err(CodecError::InvalidData(format!(
-                "Expected {residual_count} residuals, got {}",
-                residuals.len()
-            )));
-        }
-
-        // Advance reader past the consumed Rice bytes
-        // Rice decoder consumed a certain number of bytes; we need to account for them.
-        // Since we can't easily query exact bytes consumed from RiceDecoder, we reconstruct
-        // what we can from the slice and advance manually.
-        // For simplicity: we re-encode to get the byte count, or just skip the remaining slice.
-        // We'll use a re-encode approach only if block parsing requires strict positioning.
-        // For frame-by-frame decoding, the caller provides the full frame data so this is fine.
-
-        // Restore signal
-        let restored = restore_signal(&warmup, &residuals, &float_coeffs);
-        Ok(restored)
-    }
-
-    /// Decode all frames from a complete FLAC byte stream (header + frames).
+    /// Decode all frames from a complete FLAC byte stream (metadata + frames).
     ///
-    /// Returns interleaved i32 PCM samples for the entire stream.
+    /// Returns interleaved i32 PCM samples for the entire stream.  Every frame
+    /// is decoded strictly: a malformed frame is an error, never silently
+    /// skipped.  Trailing bytes that are not a frame at all (an appended ID3v1
+    /// tag, say) end the stream cleanly once at least one frame was decoded.
     ///
     /// # Errors
     ///
     /// Returns `CodecError::InvalidData` if the stream is malformed.
     pub fn decode_stream(&mut self, data: &[u8]) -> CodecResult<Vec<i32>> {
-        // Parse stream header
-        let header_end = self.parse_stream_header(data)?;
-        let mut pos = header_end;
+        let mut pos = self.parse_metadata_inner(data)?;
         let mut all_samples: Vec<i32> = Vec::new();
 
-        // Decode frames until data is exhausted
-        while pos + 4 < data.len() {
-            // Quick sync check — skip non-sync bytes
-            if data[pos] != 0xFF || (data[pos + 1] & 0xFC) != 0xF8 {
-                pos += 1;
-                continue;
-            }
-
-            match self.decode_frame(&data[pos..]) {
-                Ok((block, consumed)) => {
-                    all_samples.extend_from_slice(&block.samples);
-                    pos += consumed.max(1);
+        while pos + 2 <= data.len() {
+            if data[pos] != 0xFF || (data[pos + 1] & 0xFE) != 0xF8 {
+                if all_samples.is_empty() {
+                    return Err(CodecError::InvalidData(format!(
+                        "FLAC: no frame sync at offset {pos}"
+                    )));
                 }
-                Err(_) => {
-                    // Skip one byte and try again
-                    pos += 1;
-                }
+                break;
             }
+            let (block, consumed) = self.decode_frame(&data[pos..])?;
+            all_samples.extend_from_slice(&block.samples);
+            if consumed == 0 {
+                return Err(CodecError::InvalidData(
+                    "FLAC: frame decode made no progress".to_string(),
+                ));
+            }
+            pos += consumed;
         }
 
         Ok(all_samples)

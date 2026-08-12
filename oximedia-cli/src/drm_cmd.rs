@@ -102,9 +102,17 @@ pub enum DrmCommand {
         #[arg(long)]
         key_ids: bool,
 
-        /// Show license info
+        /// Show license info. Without --cpix, no embedded-license reader
+        /// exists for media files and this reports that plainly; with
+        /// --cpix <path>, real license URLs/policies are read from that
+        /// CPIX document
         #[arg(long)]
         license: bool,
+
+        /// CPIX (Content Protection Information Exchange) sidecar document
+        /// to read real license/key/PSSH signaling from for --license
+        #[arg(long)]
+        cpix: Option<PathBuf>,
     },
 
     /// Validate DRM configuration and encrypted content
@@ -225,7 +233,8 @@ pub async fn handle_drm_command(command: DrmCommand, json_output: bool) -> Resul
             pssh,
             key_ids,
             license,
-        } => run_info(&input, pssh, key_ids, license, json_output).await,
+            cpix,
+        } => run_info(&input, pssh, key_ids, license, &cpix, json_output).await,
         DrmCommand::Validate {
             input,
             system,
@@ -296,7 +305,7 @@ async fn run_encrypt(
         });
         let s = serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "DRM Encrypt".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Input:", input.display());
@@ -371,7 +380,7 @@ async fn run_decrypt(
         });
         let s = serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
         println!("{s}");
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "DRM Decrypt".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Input:", input.display());
@@ -432,7 +441,7 @@ async fn run_keys(
                 let s =
                     serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
                 println!("{s}");
-            } else {
+            } else if !crate::progress::is_quiet() {
                 println!("{}", "DRM Key Generation".green().bold());
                 println!("{}", "=".repeat(60));
                 println!("{:20} {}", "Count:", count);
@@ -511,17 +520,9 @@ async fn run_info(
     pssh: bool,
     key_ids: bool,
     license: bool,
+    cpix: &Option<PathBuf>,
     json_output: bool,
 ) -> Result<()> {
-    // No license-acquisition metadata parser exists yet (nothing reads
-    // license URLs/policies back out of protected files), so the flag
-    // cannot produce real output; warn instead of silently dropping it.
-    // TODO(0.2.x): surface license info once oximedia-drm exposes a reader
-    // for embedded license-acquisition metadata.
-    if license {
-        eprintln!("warning: --license is not implemented yet and is ignored");
-    }
-
     if !input.exists() {
         return Err(anyhow::anyhow!("Input file not found: {}", input.display()));
     }
@@ -531,6 +532,35 @@ async fn run_info(
         .len();
 
     let systems = ["Widevine", "PlayReady", "FairPlay", "ClearKey"];
+
+    // Real license-info surfacing, via `oximedia_drm::cpix::CpixDocument`:
+    // no reader exists that extracts embedded license URLs/policies from a
+    // protected MEDIA file directly (the raw-file `--pssh`/`--key-ids`
+    // sections below share that same limit, for the same reason). What
+    // does exist is a real reader for CPIX (Content Protection Information
+    // Exchange) documents — the actual industry sidecar format DRM systems
+    // use to exchange exactly this data (license URLs, PSSH, key IDs).
+    // `--cpix <path>` names one explicitly; there is no invented sidecar
+    // filename convention to auto-discover.
+    let cpix_doc: Option<oximedia_drm::cpix::CpixDocument> = match cpix {
+        Some(path) => {
+            let xml = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read CPIX file: {}", path.display()))?;
+            let doc = oximedia_drm::cpix::CpixDocument::from_xml(&xml).map_err(|e| {
+                anyhow::anyhow!("Failed to parse CPIX document '{}': {e}", path.display())
+            })?;
+            Some(doc)
+        }
+        None => None,
+    };
+
+    if license && cpix_doc.is_none() {
+        eprintln!(
+            "warning: --license found no embedded-license reader for media files; pass \
+             --cpix <path> naming a CPIX (Content Protection Information Exchange) sidecar \
+             document to surface real license URLs/policies"
+        );
+    }
 
     if json_output {
         let mut result = serde_json::json!({
@@ -544,6 +574,22 @@ async fn run_info(
         }
         if key_ids {
             result["key_ids"] = serde_json::json!([]);
+        }
+        if license {
+            result["license"] = match &cpix_doc {
+                Some(doc) => serde_json::json!({
+                    "source": "cpix",
+                    "cpix_path": cpix.as_ref().map(|p| p.display().to_string()),
+                    "content_id": doc.content_id,
+                    "drm_systems": doc.drm_systems.iter().map(|d| serde_json::json!({
+                        "system_id": d.system_id,
+                        "key_id": d.key_id,
+                        "license_url": d.license_url,
+                        "pssh": d.pssh,
+                    })).collect::<Vec<_>>(),
+                }),
+                None => serde_json::Value::Null,
+            };
         }
         let s = serde_json::to_string_pretty(&result).context("JSON serialization failed")?;
         println!("{s}");
@@ -564,6 +610,35 @@ async fn run_info(
             println!("{}", "Key IDs".cyan().bold());
             println!("{}", "-".repeat(60));
             println!("  No embedded key IDs found.");
+        }
+        if license {
+            println!();
+            println!("{}", "License Info".cyan().bold());
+            println!("{}", "-".repeat(60));
+            match &cpix_doc {
+                Some(doc) => {
+                    println!("  {:16} CPIX document", "Source:");
+                    println!("  {:16} {}", "Content ID:", doc.content_id);
+                    if doc.drm_systems.is_empty() {
+                        println!("  (CPIX document has no DRM system signaling entries)");
+                    }
+                    for d in &doc.drm_systems {
+                        println!("  DRM system {}", d.system_id.cyan());
+                        println!("    {:14} {}", "Key ID:", d.key_id);
+                        println!(
+                            "    {:14} {}",
+                            "License URL:",
+                            d.license_url.as_deref().unwrap_or("(none)")
+                        );
+                    }
+                }
+                None => {
+                    println!(
+                        "  No embedded-license reader exists for media files; pass --cpix \
+                         <path> naming a CPIX sidecar document."
+                    );
+                }
+            }
         }
     }
 
@@ -705,5 +780,81 @@ mod tests {
         assert_eq!(key128.len(), 16);
         let key256 = generate_random_key(256);
         assert_eq!(key256.len(), 32);
+    }
+
+    // ── `--license` / `--cpix` real behaviour tests ───────────────────────
+    //
+    // `--license` previously always warned "not implemented" and produced
+    // no output. These exercise the real read side: a genuine CPIX XML
+    // document, parsed by `oximedia_drm::cpix::CpixDocument::from_xml`.
+
+    fn drm_temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "oximedia_drm_cmd_test_{}_{name}",
+            std::process::id()
+        ))
+    }
+
+    /// Build a real CPIX document (via the crate's own real XML writer) as
+    /// a fixture, so the test exercises a genuine XML round trip rather
+    /// than a hand-written string.
+    fn make_cpix_fixture() -> String {
+        use oximedia_drm::cpix::{CpixContentKey, CpixDocument, DrmSystemSignaling};
+
+        let mut doc = CpixDocument::new("content-42");
+        doc.add_content_key(
+            CpixContentKey::new("key-1").with_key_value("00112233445566778899aabbccddeeff"),
+        );
+        doc.add_drm_system(
+            DrmSystemSignaling::new("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed", "key-1")
+                .with_license_url("https://license.example.com/widevine")
+                .with_pssh("AAAAIHBzc2gAAAAA7t"),
+        );
+        doc.to_xml().expect("real CPIX document must serialize")
+    }
+
+    #[tokio::test]
+    async fn test_run_info_license_without_cpix_is_honest_no_reader() {
+        let input = drm_temp_path("info_no_cpix_in.bin");
+        std::fs::write(&input, b"not really protected media, just bytes").expect("write fixture");
+
+        run_info(&input, false, false, true, &None, true)
+            .await
+            .expect("info with --license but no --cpix must still succeed");
+
+        std::fs::remove_file(&input).ok();
+    }
+
+    #[tokio::test]
+    async fn test_run_info_license_with_cpix_surfaces_real_license_url() {
+        let input = drm_temp_path("info_cpix_in.bin");
+        std::fs::write(&input, b"protected media placeholder bytes").expect("write fixture");
+        let cpix_path = drm_temp_path("info_cpix_doc.xml");
+        std::fs::write(&cpix_path, make_cpix_fixture()).expect("write cpix fixture");
+
+        run_info(&input, false, false, true, &Some(cpix_path.clone()), true)
+            .await
+            .expect("info with a real --cpix document must succeed");
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&cpix_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_run_info_invalid_cpix_is_honest_err() {
+        let input = drm_temp_path("info_bad_cpix_in.bin");
+        std::fs::write(&input, b"media placeholder").expect("write fixture");
+        let cpix_path = drm_temp_path("info_bad_cpix_doc.xml");
+        std::fs::write(&cpix_path, b"this is not valid CPIX XML at all <<<")
+            .expect("write garbage");
+
+        let result = run_info(&input, false, false, true, &Some(cpix_path.clone()), true).await;
+        assert!(
+            result.is_err(),
+            "a malformed --cpix document must be a real error, not silently ignored"
+        );
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&cpix_path).ok();
     }
 }

@@ -15,9 +15,13 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 /// Current workspace version (`version.workspace = true` in Cargo.toml).
-/// Kept as a constant so a single edit updates every assertion below when
-/// the branch/version is bumped.
-const EXPECTED_VERSION: &str = "0.2.0";
+///
+/// Sourced from `CARGO_PKG_VERSION` rather than hand-written: this integration
+/// test is compiled as part of the `oximedia-cli` package, which is the same
+/// package that owns the `oximedia` binary, so the constant tracks the
+/// workspace version automatically across a `/bump` instead of silently
+/// drifting out of date (it was pinned at `0.2.0` through the 0.2.1 bump).
+const EXPECTED_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn oximedia() -> Command {
     Command::cargo_bin("oximedia").expect("oximedia binary should exist")

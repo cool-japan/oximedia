@@ -317,10 +317,12 @@ fn write_scope_output(
     std::fs::write(output, &scope.data)
         .with_context(|| format!("Failed to write scope image to {}", output.display()))?;
 
-    println!("{}", format!("{scope_label} Scope").green().bold());
-    println!("  Output:     {}", output.display());
-    println!("  Dimensions: {}x{}", scope.width, scope.height);
-    println!("  Format:     RGBA ({} bytes)", scope.data.len());
+    if !crate::progress::is_quiet() {
+        println!("{}", format!("{scope_label} Scope").green().bold());
+        println!("  Output:     {}", output.display());
+        println!("  Dimensions: {}x{}", scope.width, scope.height);
+        println!("  Format:     RGBA ({} bytes)", scope.data.len());
+    }
 
     Ok(())
 }
@@ -607,18 +609,20 @@ async fn run_false_color(
 
     let stats = oximedia_scopes::false_color::compute_false_color_stats(&frame_data, fw, fh);
 
-    println!("{}", "False Color Scope".green().bold());
-    println!("  Output:         {}", output.display());
-    println!(
-        "  Dimensions:     {}x{}",
-        scope_data.width, scope_data.height
-    );
-    println!("  Format:         RGBA ({} bytes)", final_data.len());
-    println!("  Good exposure:  {:.1}%", stats.good_exposure_percent);
-    println!("  Shadow clip:    {:.1}%", stats.shadow_clip_percent);
-    println!("  Highlight clip: {:.1}%", stats.highlight_clip_percent);
-    if show_scale {
-        println!("  Legend:          appended ({}px tall)", 20);
+    if !crate::progress::is_quiet() {
+        println!("{}", "False Color Scope".green().bold());
+        println!("  Output:         {}", output.display());
+        println!(
+            "  Dimensions:     {}x{}",
+            scope_data.width, scope_data.height
+        );
+        println!("  Format:         RGBA ({} bytes)", final_data.len());
+        println!("  Good exposure:  {:.1}%", stats.good_exposure_percent);
+        println!("  Shadow clip:    {:.1}%", stats.shadow_clip_percent);
+        println!("  Highlight clip: {:.1}%", stats.highlight_clip_percent);
+        if show_scale {
+            println!("  Legend:          appended ({}px tall)", 20);
+        }
     }
 
     Ok(())
@@ -720,14 +724,16 @@ async fn run_analyze(
         return Ok(());
     }
 
-    println!("{}", "Scopes Analysis".green().bold());
-    println!("{}", "=".repeat(60));
-    println!("{:20} {}", "Input:", input.display());
-    println!("{:20} {}", "Frame:", frame);
-    println!("{:20} {}", "Output dir:", output_dir.display());
-    println!();
-    for (name, path, w, h) in &generated {
-        println!("  {} {}x{} → {}", name.cyan(), w, h, path.display());
+    if !crate::progress::is_quiet() {
+        println!("{}", "Scopes Analysis".green().bold());
+        println!("{}", "=".repeat(60));
+        println!("{:20} {}", "Input:", input.display());
+        println!("{:20} {}", "Frame:", frame);
+        println!("{:20} {}", "Output dir:", output_dir.display());
+        println!();
+        for (name, path, w, h) in &generated {
+            println!("  {} {}x{} → {}", name.cyan(), w, h, path.display());
+        }
     }
 
     Ok(())

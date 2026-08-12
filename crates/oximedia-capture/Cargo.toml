@@ -1,0 +1,87 @@
+[package]
+name = "oximedia-capture"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Pure-Rust live video capture (V4L2 / AVFoundation / Media Foundation) for OxiMedia"
+keywords = ["capture", "camera", "webcam", "v4l2", "video"]
+categories = ["multimedia", "hardware-support"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Deterministic synthetic capture backend, for this crate's own tests and for
+# downstream crates that need to drive a camera-shaped pipeline without a
+# camera. Also compiled automatically under `cfg(test)`.
+mock = []
+# Optional Tokio-native receive path: `CaptureStream::into_async`. A thin
+# bridge on top of the (unchanged) synchronous core — see `src/asyncio.rs`.
+# Off by default so that a caller with no async runtime never pays for tokio.
+tokio = ["dep:tokio"]
+
+[dependencies]
+oximedia-core = { workspace = true }
+# The workspace entry already pins `default-features = false`; this crate needs
+# only the frame types (`VideoFrame`, `Plane`), never a codec body.
+oximedia-codec = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+# Only the mpsc channel type is needed — the bridge thread in `asyncio.rs` is
+# a plain `std::thread`, never a tokio task, so no runtime/executor feature is
+# pulled in here. See that module for why `dep:tokio` alone is sufficient.
+tokio = { workspace = true, optional = true, features = ["sync"] }
+
+# ── macOS: AVFoundation backend (package A5) ─────────────────────────────────
+#
+# Target-gated so that no other platform — including `wasm32-unknown-unknown`,
+# which must keep building the `UnsupportedBackend` path — ever resolves an
+# objc2 crate. Cargo evaluates `[target.'cfg(...)'.dependencies]` against the
+# *target* triple, so these are absent from a Linux or Windows lockfile
+# resolution for this crate as well.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+block2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-core-foundation = { workspace = true }
+objc2-av-foundation = { workspace = true }
+objc2-core-media = { workspace = true }
+objc2-core-video = { workspace = true }
+dispatch2 = { workspace = true }
+
+# ── Linux: V4L2 backend (package A6) ─────────────────────────────────────────
+#
+# One dependency, and it compiles no C: on `linux-gnu` and `linux-musl` rustix
+# selects its `linux_raw` backend and issues syscalls directly. Target-gated for
+# the same reason as the objc2 block above — a macOS, Windows or wasm32
+# resolution of this crate never sees it.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
+# ── Windows: Media Foundation backend (package A7) ───────────────────────────
+#
+# One dependency, and it compiles no C: windows-rs generates `extern "system"`
+# declarations and COM vtable calls from metadata, and links against OS DLLs
+# rather than vendored source. Target-gated for the same reason as the two
+# blocks above — a macOS, Linux or wasm32 resolution of this crate never sees
+# it, which also keeps `windows`' own `#![cfg(windows)]` crate root from being
+# an empty module in those builds.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# Unconditional (unlike the optional runtime dependency above): the `tokio`
+# feature's own tests need `#[tokio::test]` and a runtime to drive them,
+# regardless of whether a downstream consumer enables the feature. Cargo
+# unifies this with the optional `dep:tokio` above when both are in play,
+# exactly as `oximedia-drm` already does for its own optional tokio surface.
+tokio = { workspace = true, features = ["full", "test-util"] }

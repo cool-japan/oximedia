@@ -1,12 +1,13 @@
 # OxiMedia — The Sovereign Media Framework: Development Roadmap
 
-**Version: 0.2.0 (active, dev branch `0.2.0`) / 0.1.9 (stable, `master`)**
-**Status as of: 2026-07-15**
-**Total SLOC: ~2,951,319 lines of code (Rust, measured via `tokei .` this session; 3,603,734 total lines / 9,309 files / 181,073 comments)**
-**Total Tests: 101,814 passing with `--all-features` / 100,160 with default features (0 failed, 0 warnings — `cargo nextest run --workspace`, genuine full run this session, verified 2026-07-13)**
-**Total Crates: 114 (measured via `cargo metadata --no-deps` this session; root workspace only — `web/` is a separate, excluded nested workspace, see below)**
-**Crate Status: 110 Stable library crates under `crates/` + facade `oximedia` + `oximedia-cli` + `oximedia-wasm` + internal bench harness = 114 workspace members; 0 Alpha / 0 Partial**
-**Current Branch: 0.2.0 — production-readiness release landed 2026-07-08 (100% Pure Rust default build); Waves 21–30 + `oximedia-web` (browser modules) shipped in 0.1.9. This session (0.2.0 dev): a real frame-level transcode engine (`oximedia-transcode`), real AV1, VP9 and VP8 key-frame/intra video decoders (bit-exact vs dav1d/aomdec/libvpx/libwebp; inter-frame decode still open), ~40 `oximedia-cli` flags made real or honest, real CENC/`cbcs` packager encryption, a real RFC 3394 SRT key wrap, a broad fabricated-success-elimination sweep (Python bindings, RTMP relay, workflow executor, codec error honesty), and parser bounds/DoS hardening across MP4/DVB/RTSP/RTMP/WebRTC/AAF — see `CHANGELOG.md`'s `[0.2.0]` section for full detail, and the new "Deferred (0.2.x)" section at the end of this file for what's left. SLOC/test counts below are the last full measurement (2026-07-13, pre-dating this session's work) and have not been re-measured.**
+**Version: 0.2.1 (active, dev branch `0.2.1`; gains a new `oximedia-capture` crate — see "0.2.1 Capture" near the end of this file) / 0.2.0 (stable, `master` — released 2026-07-15)**
+**Status as of: 2026-08-12**
+**Total SLOC: 3,057,331 lines of Rust code (measured via `tokei .` on 2026-08-12; 3,697,874 total Rust lines / 9,013 files / 163,846 comments. Whole tree, all languages: 3,754,585 lines / 3,074,095 code / 9,563 files)**
+**Total Tests: 104,693 passing with `--all-features` / 103,322 with default features (0 failed, 155 / 144 skipped, 576 test binaries — `cargo nextest run --workspace`, genuine full runs, verified 2026-08-12)**
+**Total Crates: 115 (measured via `cargo metadata --no-deps` on 2026-08-12; root workspace only — `web/` is a separate, excluded nested workspace, see below)**
+**Crate Status: 111 Stable library crates under `crates/` + facade `oximedia` + `oximedia-cli` + `oximedia-wasm` + internal bench harness = 115 workspace members; 0 Alpha / 0 Partial**
+**Quality gates (2026-08-12, all green): `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` 0 lints across 261 crates; `cargo deny check bans` + `check licenses` both ok; `wasm32-unknown-unknown` builds for `oximedia-wasm` and `oximedia`; `cargo check -p oximedia-py` clean; no source file over 2,000 lines.**
+**Current Branch: 0.2.1 — production-readiness release landed 2026-07-08 (100% Pure Rust default build); Waves 21–30 + `oximedia-web` (browser modules) shipped in 0.1.9. 0.2.0 shipped 2026-07-15 (tagged, pushed, live on crates.io): a real frame-level transcode engine (`oximedia-transcode`), real AV1, VP9 and VP8 key-frame/intra video decoders (bit-exact vs dav1d/aomdec/libvpx/libwebp), ~40 `oximedia-cli` flags made real or honest, real CENC/`cbcs` packager encryption, a real RFC 3394 SRT key wrap, a broad fabricated-success-elimination sweep, and parser bounds/DoS hardening across MP4/DVB/RTSP/RTMP/WebRTC/AAF — see `CHANGELOG.md`'s `[0.2.0]` section. **On this branch since:** VP8 inter-frame decode (bit-exact vs libvpx on 5 multi-frame streams, 2026-08-11); a new `oximedia-capture` crate; lossy WebP decode; a corrected EBU R128 / K-weighting loudness stack; and (2026-08-12) VP9 inter-frame and intra-only decode (bit-exact vs libvpx on 10 conformance streams), a full RFC 9639 FLAC rebuild verified against libFLAC/ffmpeg in both directions, real AVIF decode via AV1, and a workspace-wide fabricated-success elimination sweep across nine crates that took the `TODO(0.2.x)` marker count from 123 to 22. See `CHANGELOG.md`'s `[0.2.1]` section for full detail and the rewritten "Deferred (0.2.x)" section at the end of this file for exactly what is left.**
 
 ---
 
@@ -14,7 +15,7 @@
 
 | Category | Count | Notes |
 |----------|-------|-------|
-| Stable crates | 110 | Library crates under `crates/`; no `todo!()`/`unimplemented!()` stubs. (+ facade `oximedia`, `oximedia-cli`, `oximedia-wasm`, internal bench harness = 114 workspace members total) |
+| Stable crates | 111 | Library crates under `crates/`; no `todo!()`/`unimplemented!()` stubs. (+ facade `oximedia`, `oximedia-cli`, `oximedia-wasm`, internal bench harness = 115 workspace members total) |
 | Alpha crates | 0 | All former alpha crates promoted to stable |
 | Partial crates | 0 | All former partial crates completed and promoted to stable |
 
@@ -258,6 +259,8 @@ All 22 former alpha crates have been audited, documented, tested, and promoted t
 |----------|-------|-------|--------|
 | None/Resolved | `oxiarc-archive` (dep) | Bumped to 0.3.6 (2026-07-13, "bump oxiarc" commit) while sibling crates `oxiarc-brotli`/`oxiarc-bzip2`/`oxiarc-lzma`/`oxiarc-snappy` stayed at 0.3.5; `oxiarc-archive` 0.3.6's source calls `decompress_with_limit`/`decompress_frame_with_limit`/`DICT_SIZE_ALLOC_CAP`/`with_max_output`/`with_max_output_size` APIs that don't exist in the 0.3.5 siblings — 11 compile errors. Breaks `oxiarc-archive` itself and transitively `oximedia-archive-pro`, `oximedia-batch`, `oximedia-convert`, `oximedia-cli`, `oximedia-py`, `oximedia-wasm` (all in workspace `default-members` except `oximedia-py`) — a plain `cargo build` currently fails. `oximedia` facade unaffected under default (no-feature) build (these three deps are optional there). Pure-Rust API mismatch only, not a C/C++/Fortran regression. | Resolved (2026-07-14 — cargo check --workspace --all-features passes clean; oxiarc-brotli/bzip2/lzma/snappy republished at 0.3.6 matching oxiarc-archive) |
 | None/Resolved | `oximedia-net` | `todo!()` confirmed in documentation comment only in ABR controller — not executable code, no runtime impact | Resolved |
+| Low | `oximedia-wasm` (dep chain, pre-existing) | `oximedia-watermark` → `reed-solomon-erasure` v6.0.0 → `parking_lot` v0.11.2 → `instant` v0.1.13, confirmed via `cargo tree -p oximedia-watermark -i instant` (2026-08-11). Unrelated to and untouched by package A8 (`oximedia-capture`); recorded here per that package's verification pass, not investigated further. | Open |
+| Low | `oximedia-mam` (dep chain, pre-existing) | `cargo deny check licenses` rejects MPL-2.0 reached via `oximedia-mam` → `async-graphql` → `fast_chemail`/`ascii_utils`, and separately via `oximedia-cloud`'s dev-dependency `mockito` → `colored`; confirmed 2026-08-11. `deny.toml`'s `[licenses] allow` list has no MPL-2.0 entry. Unrelated to and untouched by package A8; recorded here per that package's verification pass, not investigated further. | Open |
 
 ---
 
@@ -439,13 +442,13 @@ is missing, and the effort rationale.
 | Codec | Current | Missing | Effort | Target |
 |-------|---------|---------|--------|--------|
 | AV1 decode | **Functional** (keyframe/intra only, 0.2.0 — `crates/oximedia-codec/src/av1/kf/`, bit-exact vs dav1d 1.5.1/aomdec-libaom v3.12.1 on 13 vectors, full deblock/CDEF/loop-restoration chain) | Inter-frame decode (motion vectors, reference-frame management, compound prediction); intra block copy, palette mode, super-resolution, quantizer matrices, film-grain synthesis, 10/12-bit, monochrome, 4:2:2/4:4:4; issue #9 | specialist | 0.2.0+ |
-| VP9 decode | **Functional** (keyframe/intra only, 0.2.0 — `crates/oximedia-codec/src/vp9/kf/`, bit-exact vs libvpx/ffmpeg reference decodes) | Inter-frame decode (motion-vector/ref-frame syntax, eighth-pel MC, compound prediction, backward prob adaptation) and intra-only-frame context tracking; non-8-bit / non-4:2:0 profiles | large | 0.2.0+ |
-| VP8 decode | **Functional** (keyframe/intra only, 0.2.0 — `crates/oximedia-codec/src/vp8/keyframe/`, full RFC 6386 pipeline, bit-exact vs libwebp) | Inter-frame decode (motion-vector entropy decode, quarter-pel MC, last/golden/altref reference management) | medium | 0.2.0+ |
+| VP9 decode | **Verified** (key + intra-only + inter frames, 0.2.1 — `crates/oximedia-codec/src/vp9/dec/`, renamed from `vp9/kf/`; cross-frame reference/probability state, `find_mv_refs` candidate scan, inter mode + MV entropy decode, `vpx_convolve8` eight-tap MC across all four filter sets, compound prediction, backward probability adaptation, `show_existing_frame` and superframes; bit-exact vs libvpx on 10 conformance streams through the public API, 0 ignores / 0 thresholds / 0 skips) | Inter-frame segmentation (`read_inter_segment_id` + predicted seg map; `p9seg` fixture committed, refusal asserted at packet 1) and reference scaling (scale factors + `vpx_scaled_2d`; `scaled` fixture committed, refusal asserted at packet 6); profiles 1-3 / non-4:2:0 / non-8-bit (`vp9/dec/mod.rs:102`) | small-medium each | 0.2.x |
+| VP8 decode | **Verified** (key + inter frames, 0.2.1 — `crates/oximedia-codec/src/vp8/dec/`, full RFC 6386 pipeline incl. inter-frame decode: motion-vector entropy decode, per-macroblock prediction records, six-tap/bilinear sub-pixel MC, last/golden/altref reference management incl. hidden `show_frame == 0` frames; bit-exact vs libvpx on 5 multi-frame conformance streams covering a hidden altref, SPLITMV at a non-macroblock-aligned width, error-resilient entropy reset, and segmentation) | Not covered by a fixture (parsed and implemented, but unproven): bitstream versions 1-3 (bilinear/full-pel profiles) and multi-token-partition inter frames; see `docs/codec_status.md` | small | 0.2.x |
 | Theora decode | Bitstream-parsing (decode hand-off fixed in 0.1.7) | Encoder↔decoder bitstream alignment so a self-consistent encode→decode round-trip succeeds; promote to Functional once that lands. | medium | 0.2.0+ |
-| AVIF decode | Bitstream-parsing | Real AV1 pixel output + image-item demux (follows AV1) | specialist | follows AV1 |
-| WebP VP8 lossy decode | Missing | Full lossy VP8 WebP decoder (follows VP8) | large | follows VP8 |
+| AVIF decode | **Functional** (0.2.1 — `crates/oximedia-codec/src/avif/{container,decode}.rs`; `decode()` feeds the extracted AV1 OBU through `Av1Decoder`, so scope is that decoder's: 8-bit 4:2:0. Byte-identical to ffmpeg/dav1d on a real libaom fixture. Also fixed: the `iloc` parser accepted only box version 1 — what this crate's own encoder writes — and would have rejected essentially every real-world AVIF, which writes version 0) | Alpha (real-world AVIF encodes it as **monochrome** AV1) and 10/12-bit items — both blocked on AV1 `recon.rs:1606`, not on anything in `avif/`; committed fixtures pin both refusals | follows AV1 | follows AV1 |
+| WebP VP8 lossy decode | **Functional** (0.2.1 — `crates/oximedia-codec/src/webp/vp8_decoder.rs`; wires the RIFF `VP8 ` chunk to the existing bit-exact VP8 key-frame decoder (`vp8::decode_keyframe`) — a lossy WebP image *is* a VP8 key frame, so this is plumbing, not a new decoder; bit-exact vs `dwebp -yuv` on all 3 `vp8_fixtures` key-frame vectors, wrapped in a hand-built RIFF container; uncompressed `ALPH` alpha merges into RGBA32) | VP8L-compressed `ALPH` alpha (`webp/alpha.rs`'s pre-existing honest `UnsupportedFeature`, not a new gap); n/a for inter frames (a lossy WebP is always exactly one key frame, never inter) | small (done) | 0.2.1 |
 | Vorbis decode | Bitstream-parsing | Full codebook / residue / floor curve / MDCT-IMDCT / OLA / channel coupling | specialist | 0.2.0+ |
-| Opus SILK / hybrid | Functional (CELT only) | Real SILK LP analysis/synthesis (LTP, LSF, LPC); hybrid-mode band splitting | specialist | 0.1.6 / 0.2.0+ |
+| Opus (`oximedia-codec`) | **Bitstream-parsing** — DEMOTED 0.2.1 on empirical evidence. CELT/SILK/Hybrid decode paths exist and are dispatched, but on **real libopus packets** decode returns silence (0 non-zero of 49,920 samples) or out-of-range output, and the encoder emits a TOC byte that misdescribes its own payload. The ~82 existing tests are self-consistency round-trips, which is why a prior source-reading audit promoted this entry upward | A decoder debugged packet-by-packet against libopus output **and** an encoder rebuilt against RFC 6716 §3.1; official RFC 6716 test vectors are a prerequisite, not a follow-up. Every wired consumer now refuses rather than passing the output on | specialist | 0.2.x+ (unscheduled) |
 
 ### Supporting deliverables
 
@@ -454,10 +457,66 @@ is missing, and the effort rationale.
 - [x] README + `crates/oximedia-codec/README.md` demoted: AV1 / VP9 / VP8 / Theora / Vorbis / AVIF labelled `Bitstream-parsing`
 - [x] `examples/decode_video.rs` rewritten to reflect the real decoder-status matrix (no fake `println!` code samples)
 - [x] Theora decoder hand-off bug-fix — `to_vec()` mis-copy replaced with direct write into `frame.planes[i].data`; pinned by `theora::tests::test_issue_9_to_video_frame_writes_planes_into_videoframe` (small; completed in 0.1.7 — 2026-05-03)
-- [ ] Opus SILK decoder (specialist; 0.2.0+)
+- [ ] Opus (`oximedia-codec`) real decoder **and** encoder — the SILK/CELT/Hybrid
+  paths shipped and are dispatched, but were demoted to Bitstream-parsing in
+  0.2.1 after being fed real libopus packets for the first time (silence /
+  out-of-range output; encoder emits an invalid TOC). Specialist; 0.2.x+,
+  unscheduled — see the Deferred section
 - [x] AV1 keyframe/intra reconstruction wiring — bit-exact vs dav1d 1.5.1 and aomdec/libaom v3.12.1 on 13 keyframe test vectors, full deblock/CDEF/loop-restoration (Wiener + SGRPROJ) chain (`crates/oximedia-codec/src/av1/kf/`); inter-frame decode remains open (specialist; 0.2.x+; see Deferred section)
-- [x] VP9 keyframe/intra reconstruction wiring — bit-exact vs libvpx/ffmpeg reference decodes (`crates/oximedia-codec/src/vp9/kf/`); inter-frame decode remains open (large; 0.2.x+; see Deferred section)
-- [x] VP8 keyframe/intra decode — full RFC 6386 pipeline, bit-exact vs libwebp (`crates/oximedia-codec/src/vp8/keyframe/`); inter-frame decode remains open (medium; 0.2.x+; see Deferred section)
+- [x] VP9 keyframe/intra reconstruction wiring — bit-exact vs libvpx/ffmpeg reference decodes (`crates/oximedia-codec/src/vp9/kf/`, renamed to `vp9/dec/` in 0.2.1 when inter decode landed)
+- [x] VP9 inter-frame **and** intra-only decode — cross-frame reference/probability
+  state (four frame contexts, an eight-slot MI-aligned DPB with per-MI MV grids,
+  loop-filter-delta and segmentation inheritance), the `find_mv_refs` candidate
+  scan with sign-bias flipping and temporal candidates, inter mode / reference /
+  motion-vector entropy decode incl. sub-8x8 and the `use_mv_hp` gate, the
+  `vpx_convolve8` eight-tap MC family across all four interpolation filter sets,
+  compound prediction, backward probability adaptation, `show_existing_frame`
+  redisplay and superframe unpacking (`crates/oximedia-codec/src/vp9/dec/`,
+  ported from libvpx v1.15.2 with per-function `file:line` citations against a
+  `diff`-verified upstream fetch). **10 of 10** non-deferred conformance streams
+  decode bit-exactly through the public `VideoDecoder::send_packet` /
+  `receive_frame` API — `p9still`/`p9basic`/`p9er`/`p9hp` (76x42, 8 frames each),
+  `p9tc` (512x64, 2 tile columns), `p9alt` (128x128, hidden ALTREF in a
+  superframe), `compound` (13 coded / 12 shown, compound prediction + a second
+  hidden ARF), `switch` (100x68, >1 interp filter at a non-8-aligned width),
+  `p9sef` (SEF redisplay) and `p9io` (352x288 intra-only) — with 0 `#[ignore]`,
+  0 PSNR thresholds and 0 skips, an anti-vacuity test that a planted mismatch is
+  reported, and a coverage assertion that puts a floor on the decoder's own
+  symbol counters (compound blocks + `comp_ref` reads, all four inter modes,
+  intra-and-inter blocks inside inter frames, real per-block filter choice on
+  SWITCHABLE frames, non-zero MVs per component, and the 1/8-pel high-precision
+  bit) so a header-permitted-but-unexercised feature cannot pass. Inter segmentation and
+  reference scaling refuse at a **pinned packet index** with committed gate
+  fixtures (`p9seg`, `scaled`). Suite: `vp9/dec/inter_fixture_tests.rs`;
+  provenance: `vp9/dec/testdata/RECIPE.md`. 0.2.1, 2026-08-12; see
+  `CHANGELOG.md`'s Unreleased section
+- [x] Five hollow VP9 modules deleted (~4,800 lines) — `vp9/compressed.rs`,
+  `prediction.rs`, `mvref.rs`, `inter.rs`, `reference.rs`, each verified to have
+  zero real consumers workspace-wide first; `vp9::dec::decode_keyframe` removed
+  once its last caller went away
+- [x] AVIF decode wired to the AV1 keyframe decoder — `avif/decode.rs` +
+  `avif/container.rs`; byte-identical to ffmpeg/dav1d on a real libaom fixture.
+  Fixed in the same pass: the `iloc` parser accepted only box version 1 and
+  would have rejected essentially every real-world AVIF. Alpha (monochrome AV1)
+  and 10/12-bit refuse honestly, with committed fixtures pinning both
+- [x] FLAC (`oximedia-codec`) encoder **and** decoder rebuilt to RFC 9639 —
+  the pair was previously self-consistent but could not interoperate with any
+  real FLAC in either direction (the decoder *panicked* on stock ffmpeg output).
+  Now verified in both directions against libFLAC/ffmpeg. New
+  `flac/{bitio,frame,subframe,residual}.rs`; `crates/oximedia-audio/src/flac/`
+  is a separate implementation and was not touched
+- [x] VP8 keyframe/intra decode — full RFC 6386 pipeline, bit-exact vs libwebp (`crates/oximedia-codec/src/vp8/dec/`, renamed from `vp8/keyframe/` when inter-frame decode landed alongside it — see immediately below)
+- [x] VP8 inter-frame decode — RFC 6386 §16 per-macroblock prediction records (incl. the §16.3 near-MV survey), §17 motion-vector entropy decode, §18 six-tap/bilinear sub-pixel motion compensation, and §9.7-§9.9 last/golden/altref reference management (incl. hidden `show_frame == 0` frames and the `refresh_entropy_probs` snapshot/restore) (`crates/oximedia-codec/src/vp8/dec/`); `Vp8Decoder` now routes every frame through `dec::Vp8SequenceDecoder` instead of returning `CodecError::UnsupportedFeature` for inter frames. Verified bit-exact against libvpx on 5 multi-frame conformance streams — 39 coded / 38 shown frames spanning a genuine hidden altref frame, `SPLITMV` at a non-macroblock-aligned width (100x64), error-resilient entropy reset, and segmentation with per-segment quantiser deltas (`vp8/dec/inter_fixture_tests.rs`; fixtures and exact ffmpeg/libvpx provenance in `vp8/dec/testdata/README.md`). 0.2.1, 2026-08-11; see `CHANGELOG.md`'s Unreleased section.
+- [x] WebP lossy (VP8) decode wired to the VP8 key-frame decoder —
+  `crates/oximedia-codec/src/webp/vp8_decoder.rs` (`vp8` feature): RIFF `VP8 `
+  chunk -> `vp8::decode_keyframe` -> YUV 4:2:0 `VideoFrame`, reusing the
+  existing `WebPContainer::parse` RIFF parser rather than a second one;
+  uncompressed `ALPH` alpha merges into RGBA32. Bit-exact vs `dwebp -yuv` on
+  all 3 `vp8_fixtures` vectors wrapped in-test in a RIFF container
+  (`crates/oximedia-codec/tests/webp_vp8_lossy.rs`); `ImageDecoder::decode_webp`
+  now delegates to it instead of its own now-removed ad hoc `Vp8Decoder`
+  call. VP8L-compressed `ALPH` alpha stays an honest `UnsupportedFeature`
+  (`webp/alpha.rs`'s pre-existing boundary). 2026-08-11.
 - [ ] Vorbis full decode (specialist; 0.2.0+)
 
 ---
@@ -906,196 +965,463 @@ defect-fix and root-tokio-fix work that unblocked it. Full detail in
 
 ## Deferred (0.2.x)
 
-Harvested from `rg -n "TODO\(0\.2" --type rust` across the whole workspace
-(117 markers total, 2026-07-15) plus known open items confirmed still
-live against the current source. See `CHANGELOG.md`'s `[0.2.0]` section
-for what shipped this session. Grouped by crate; `file:line` points at the
-marker itself.
+**Re-harvested from scratch on 2026-08-12** with
+`rg -n "TODO\(0\.2" --type rust` across the whole workspace: **22 markers**,
+down from **123** at the start of this session. (The previous revision of
+this section recorded **117** at its 2026-07-15 harvest, by the same command;
+the tree gained six markers between that harvest and the start of this
+session, which is the whole of the 117 → 123 difference.) Every `file:line` below was
+read out of the current tree, not carried forward from the previous
+revision of this section (whose line numbers had drifted badly — the AV1
+entries alone were off by 100+ lines). See `CHANGELOG.md`'s `[0.2.1]`
+section for what closed.
 
-### Codec gaps (crates/oximedia-codec — sibling-owned this session; listed for tracking only)
-- **VP8/VP9 inter-frame decode** — both key-frame/intra decoders shipped
-  this session (see Codec Implementation Roadmap above); inter-frame
-  decode (motion vectors, reference-frame management, compound
-  prediction) is unimplemented in both and returns an honest
-  `CodecError::UnsupportedFeature`. `vp8/decoder.rs:119`, `vp9/decoder.rs:91,102`,
-  `vp9/kf/mod.rs:47` (profiles 1-3 / non-4:2:0 / non-8-bit).
-- **AV1 inter-frame decode and other unimplemented surfaces** — the
-  keyframe/intra decoder shipped this session (see Codec Implementation
-  Roadmap above and `CHANGELOG.md`'s `[0.2.0]` Added section, bit-exact
-  vs dav1d 1.5.1/aomdec on 13 vectors). The following still return an
-  honest `CodecError::UnsupportedFeature`: inter-frame decode
-  (`av1/kf/hdr.rs:440`), intra block copy (`av1/kf/recon.rs:665`),
-  palette mode (`av1/kf/recon.rs:739`), 10/12-bit / monochrome /
-  4:2:2 / 4:4:4 (`av1/kf/recon.rs:1475`), horizontal super-resolution
-  upscaling (`av1/kf/recon.rs:1482`), quantizer matrices
-  (`av1/kf/recon.rs:1488`), and film-grain synthesis on output
-  (`av1/kf/recon.rs:1494`).
-- **AVIF still returns an honest error** — `avif/mod.rs::decode()` has not
-  been wired to the new AV1 keyframe decoder yet; it still returns
-  `CodecError::UnsupportedFeature` ("AVIF decode requires AV1 pixel
-  reconstruction, not yet implemented"), and `AvifDecoder::extract_av1_payload`
-  remains the only way to get at the raw AV1 OBU bitstream. Natural
-  follow-up now that AV1 keyframe/intra decode is real.
-- `prores/picture.rs:139` — enforce `quant_scale` in `1..=224` once a
-  `FrameError` string variant exists.
-- **FLAC encoder/decoder in `oximedia-codec` are not round-trip
-  self-consistent** (the LPC path) — this is distinct from, and not fixed
-  by, the new `oximedia-transcode` frame-level FLAC path added this
-  session (`crates/oximedia-transcode/src/{flac_bitstream,flac_decode}.rs`),
-  which is a separate, spec-compliant implementation verified bit-exact
-  on its own round-trip. The `oximedia-codec` FLAC codec itself still
-  needs its LPC encode/decode paths reconciled.
+Deferrals that have **no code marker** — recorded in prose, or found by
+verification rather than by a comment — are listed separately at the end
+under "Deferrals without a code marker". They are real backlog and are not
+implied by the 22.
 
-### Container
-- **Matroska `block_to_packet` does not propagate `BlockDuration` into
-  `Packet`** (`crates/oximedia-container/src/demux/matroska/mod.rs:756`) —
-  the function only takes `(block, cluster_time)` and never reads or
-  forwards a duration, even though `BlockDuration` is a recognized EBML
-  element (`demux/matroska/ebml.rs:1288`). Confirmed still open.
+A broader sweep (`rg "In a real implementation|would be implemented"`,
+`--type rust`) returns 153 hits. Those were spot-checked and are dominated
+by doc comments describing what a *caller* would do and by
+deliberately-scoped, documented simplifications; they are not a second
+backlog of the same kind and are not enumerated here.
 
-### oximedia-transcode
-- `frame_level.rs:105` — re-enable Opus in the frame-level path once a
-  reference-verified encoder exists (`audio_adapters.rs:360` is the
-  matching encoder-side gap).
-- `frame_level.rs:208` — wire Matroska/Ogg in-container decoders (blocked
-  on demuxer integration).
-- `frame_level.rs:781,792` — FFV1 encode works but has no matching
-  frame-level decode path yet; ProRes needs a 10-bit 4:2:2 frame path.
-- `alac_bitstream.rs:28` — add the compressed ALAC element form (adaptive
-  Rice + LPC); only the uncompressed form ships this session.
+### The 22 markers
 
-### oximedia-packager
-- `dash/packager.rs:112`, `hls/packager.rs:103` — probe `input` via a real
-  container reader when it refers to a readable media file (currently
-  metadata-only).
-- `encryption.rs:211` — NAL-unit-aware subsample mapping for the new
-  `cbcs` pattern encryption (a clear leader per NAL); the current
-  implementation applies the crypt/skip pattern over the whole sample
-  buffer, which is correct only for already-elementary media payloads.
+| Crate | `file:line` | Deferred work |
+|---|---|---|
+| `oximedia-codec` | `av1/kf/hdr.rs:440` | AV1 inter-frame decode |
+| `oximedia-codec` | `av1/kf/recon.rs:779` | AV1 intra block copy |
+| `oximedia-codec` | `av1/kf/recon.rs:853` | AV1 palette mode |
+| `oximedia-codec` | `av1/kf/recon.rs:1606` | AV1 10/12-bit, monochrome, 4:2:2/4:4:4 |
+| `oximedia-codec` | `av1/kf/recon.rs:1613` | AV1 horizontal super-resolution (spec 7.16) |
+| `oximedia-codec` | `av1/kf/recon.rs:1619` | AV1 quantizer matrices (spec 7.12.2) |
+| `oximedia-codec` | `av1/kf/recon.rs:1625` | AV1 film-grain synthesis (spec 7.18.3) |
+| `oximedia-codec` | `vp9/dec/mod.rs:102` | VP9 profiles 1–3 (4:2:2 / 4:4:4, 10/12-bit) |
+| `oximedia-transcode` | `frame_level.rs:128` | Re-enable Opus once decode **and** encode are trustworthy |
+| `oximedia-transcode` | `frame_level.rs:946` | ProRes 10-bit 4:2:2 frame path (three blockers, below) |
+| `oximedia-transcode` | `audio_adapters.rs:369` | Matching Opus encoder/decoder adapters |
+| `oximedia-packager` | `encryption.rs:211` | NAL-aware mapping on the legacy `encrypt_sample_aes` path |
+| `oximedia-server` | `transcode/engine.rs:195` | Real per-stream transcode pipeline |
+| `oximedia-py` | `cache_py.rs:231` | 14 further `oximedia_cache` modules |
+| `oximedia-accel` | `compute_backend.rs:598` | Vulkan dispatch (call site) |
+| `oximedia-accel` | `compute_backend.rs:644` | Vulkan compute dispatch via `vulkano` |
+| `oximedia-automation` | `eas/audio.rs:505` | Real TTS for EAS voice announcements |
+| `oximedia-stabilize` | `three_d/stabilize.rs:45` | Real 3D camera-motion solve (SfM) |
+| `oximedia-cli` | `archivepro_cmd.rs:514` | `VideoFfv1Mkv` migration target |
+| `oximedia-cli` | `captions_cmd.rs:1061` | MP4 (tx3g) and ASS/SSA-in-Matroska caption extraction |
+| `oximedia-cli` | `distributed_cmd.rs:228` | State/persistence-directory config field |
+| `oximedia-cli` | `edl_cmd.rs:281` | Per-dialect EDL writers in `oximedia-edl` |
 
-### oximedia-wasm
-- `demuxer.rs` (12 markers) / `streaming_demuxer.rs` (2 markers) — no
-  in-memory `oximedia-container` demux is wired into the WASM build yet
-  for Matroska/WebM, Ogg, FLAC, WAV, or MP4; every format-specific probe
-  and demux call returns an honest "not yet available in the WASM build"
-  error. `wasm_smoke.rs:88` pins this as expected/tested behaviour.
+### Codec — AV1 (7 markers)
 
-### oximedia-server
-- `dash/segment.rs:17,24` — wire real fMP4 muxing; currently depacketizes
-  FLV into a non-compliant segment (documented, not silent).
-- `hls/segment.rs:17,26` — wire real MPEG-TS muxing; same caveat.
-- `rtmp/server.rs:450` — cache and replay sequence headers on subscribe.
-- `transcode/engine.rs:185` — implement a real per-stream transcode
-  pipeline.
+AV1 keyframe/intra decode shipped in 0.2.0 and is bit-exact vs dav1d 1.5.1
+and aomdec/libaom v3.12.1 on 13 vectors with the full deblock/CDEF/loop-restoration
+chain. Everything below returns an honest `CodecError::UnsupportedFeature`.
 
-### oximedia-py (PyO3 bindings coverage gaps)
-- `neural_py.rs` (8 markers) — `onnx_backend`/`onnx_runtime`, `attention`
-  (MultiHeadAttention/flash_attention), `recurrent` (GRU/LSTM),
-  `quantization`, `graph` (declarative ExecutionGraph/Sequential),
-  `layers` (Conv2dLayer/LinearLayer), `object_detector`/`face_detection`/
-  `optical_flow`, `model_zoo::MediaModelZoo` are not yet exposed to Python.
-- `analytics_py.rs` (10 markers) — `ab_testing`, `bandit`, `cohort`,
-  `funnel`, `retention`, `geo_device`, `quantile`/`TDigest`, `realtime`,
-  `replay`/`anomaly`/`attribution`, and explicit-`SocialSignals`
-  `compute_engagement_with_social` are not yet exposed to Python.
-- `cache_py.rs` (6 markers) — `tiered_cache`, `bloom_filter`,
-  `distributed_cache`, `cache_warming`, `eviction_policies`,
-  `content_aware_cache`/`write_behind_cache` are not yet exposed to Python.
+- **Inter-frame decode** (`av1/kf/hdr.rs:440`) — motion vectors, reference
+  frames, compound prediction. Effort: **specialist**. VP9's inter path
+  (closed this session) is the closest in-tree precedent for the shape of
+  the work, but AV1's is substantially larger.
+- **Intra block copy** (`recon.rs:779`) and **palette mode**
+  (`recon.rs:853`).
+- **10/12-bit, monochrome, 4:2:2 and 4:4:4** (`recon.rs:1606`). **This one
+  gained a hard constraint this session and is no longer a
+  straight-widening job:** slice 4A converted the inverse transform from
+  `i64` to `i32` after proving the widest 8-bit intermediate is 2^28.5
+  (0.18× of `i32::MAX`). The same range analysis shows **12-bit reaches
+  2.83× of `i32::MAX` and would overflow**. Restoring 12-bit therefore
+  requires dav1d's restructured multiplies (see the header comment of
+  `dav1d/src/itx_1d.c`, which documents this exact 19-bit-plus-sign case),
+  not a revert to `i64`. 10-bit fits at 0.71× but leaves little headroom.
+  Monochrome is separately load-bearing: real-world AVIF encodes its alpha
+  auxiliary item as monochrome AV1, so AVIF alpha is blocked on this
+  marker, not on anything in `avif/`.
+- **Horizontal super-resolution** (`recon.rs:1613`), **quantizer matrices**
+  (`recon.rs:1619`), **film-grain synthesis** (`recon.rs:1625`).
 
-### Other crates (single-item gaps)
-- `oximedia-renderfarm/src/pipeline.rs:298,337,375,396` — real dependency
-  resolution (download missing assets), per-frame checksum/corruption
-  detection, real output assembly (combine image sequences into video),
-  and real quality metrics (currently no explicit-reference / no-reference
-  metric path).
-- `oximedia-net/src/live/hls/server.rs:235` — end-to-end (glass-to-glass)
-  latency needs client-side measurement too, not just server-side.
-- `oximedia-stabilize/src/three_d/stabilize.rs:45` — real 3D camera-motion
-  solve (structure-from-motion); current path is a placeholder.
-- `oximedia-captions/src/shotchange.rs:47` — real scene-cut detection
-  (frame-diff threshold); requires decode access.
-- `oximedia-normalize/src/batch.rs:14,45,421` — additional codec support
-  (MP3/FLAC/Opus) in batch normalize; `write_metadata` config flag not yet
-  honored (no loudness metadata embed on write).
-- `oximedia-metadata/src/embed.rs:147,180,189,199,210,342` — several
-  format-specific metadata embed paths are format-naive stand-ins pending
-  real per-container work: EBML-aware Matroska `Tags` embed,
-  Photoshop-IRB-aware IPTC embed (JPEG APP13), Ogg-page/
-  `FLAC-METADATA_BLOCK`-aware VorbisComments embed, MP4/QuickTime
-  atom-tree-aware embed, and multi-segment APP1 splitting for oversized
-  JPEG payloads.
-- `oximedia-conform/src/importers/xml.rs:119,135` — real Adobe Premiere
-  Pro XML importer and real DaVinci Resolve timeline XML importer (both
-  currently minimal/best-effort parses).
+### Codec — VP9 (1 marker + 2 fixture-gated deferrals)
+
+VP9 key-frame, intra-only **and** inter decode all shipped this session,
+bit-exact vs libvpx on 10 conformance streams through the public API
+(see `docs/codec_status.md`'s VP9 entry). Three gaps remain, each an honest
+`CodecError::UnsupportedFeature`:
+
+- **Inter-frame segmentation (no marker — gated by a committed fixture).**
+  Needs `read_inter_segment_id` and the predicted segment map. The
+  `p9seg` fixture is committed and its key frame decodes bit-exactly; the
+  refusal is asserted **positionally** at packet 1, so a regression earlier
+  in the stream cannot masquerade as the expected deferral. Effort: small.
+- **Reference scaling (no marker — gated by a committed fixture).** Needs
+  the scale factors and the `vpx_scaled_2d` path for a reference whose
+  dimensions differ from the current frame's. The `scaled` fixture is
+  committed (96×64 → 64×48 at packet 6); packets 0–5 decode bit-exactly and
+  the refusal is asserted at packet 6. Effort: small–medium. Note that
+  `clamp_mv_to_umv_border_sb` is already implemented and tested even though
+  the unscaled path deliberately does not call it — libvpx applies it only
+  under `if (is_scaled)`, and this package is where it becomes live.
+- **Profiles 1–3** (`vp9/dec/mod.rs:102`) — 4:2:2 / 4:4:4 subsampling and
+  10/12-bit depths. Effort: medium.
+
+### Codec — Opus (large / specialist; the evidence is empirical)
+
+`crates/oximedia-codec/src/opus/` was **demoted to Bitstream-parsing** this
+session. This is not a wiring gap and not a missing feature — the code is
+real and dispatched — the output is wrong:
+
+- 26 real libopus-encoded **CELT** packets decode to `Ok` with **0 non-zero
+  samples out of 49,920** (silence).
+- Real **SILK** packets produce out-of-range values (max abs 4.0) and 960
+  samples per frame regardless of the configured 16 kHz.
+- The **encoder** emits a TOC byte that misdescribes its own payload
+  (`0x1c`, claiming SILK/NB/60 ms for a CELT/FB/20 ms frame). Where sample
+  counts do line up, decoded energy and correlation with the input are both
+  0.0.
+
+The ~82 existing tests are self-consistency round-trips, which is precisely
+why this survived a prior audit that promoted the entry upward by reading
+the source. Closing it needs a decoder debugged packet-by-packet against
+libopus output plus an encoder rebuilt against RFC 6716 §3.1, with the
+official RFC 6716 test vectors as a **prerequisite**, not a follow-up.
+Effort: **large / specialist**. Tracked markers:
+`oximedia-transcode/src/frame_level.rs:128` and `audio_adapters.rs:369`.
+`crates/oximedia-audio/src/opus/` is a **separate** implementation that was
+not audited; it is what `oximedia-wasm`'s `WasmOpusDecoder` uses, and it
+should not be assumed sound on the strength of the `oximedia-codec`
+measurements either way.
+
+### oximedia-transcode (3 markers)
+
+- `frame_level.rs:128` / `audio_adapters.rs:369` — Opus, per the entry
+  above.
+- `frame_level.rs:946` — **ProRes 10-bit 4:2:2**, deferred for three
+  independent reasons documented at the marker, none of which is a
+  container-extradata mapping: (1) the frame-level pipeline is flat 8-bit
+  4:2:0 and the only demuxer wired to it (Y4M) has no 10-bit chroma tag, so
+  there is no genuine 10-bit source — widening 8-bit by left-shifting is
+  refused as fabricating precision; (2) `ProResDecoder` has no 10-bit
+  output API at all, right-shifting its internal reconstruction by 2 on
+  both the inherent and trait paths; (3) the decoder independently fails on
+  realistic high-contrast content ("malformed codeword" on a 500→900 step),
+  pinned by `test_prores_decoder_rejects_high_contrast_content`, which
+  deliberately asserts today's broken behaviour with a "revisit if this
+  starts passing" note.
+
+### oximedia-packager (1 marker)
+
+- `encryption.rs:211` — NAL-unit-aware subsample mapping on the **legacy**
+  `encrypt_sample_aes` path, which still applies the crypt/skip pattern
+  over the whole sample buffer (correct only for already-elementary
+  payloads). The real NAL-aware implementation shipped this session and is
+  reachable through `EncryptionHandler::encrypt_for_codec` /
+  `nal_subsamples` / `codec_structure_for`; this marker is the older entry
+  point that has not been migrated onto it.
+
+### oximedia-server (1 marker)
+
+- `transcode/engine.rs:195` — the real per-stream transcode pipeline. This
+  is **blocked, not merely unscheduled**: it needs both inter-frame decode
+  and a trustworthy encoder for one patent-free codec, and no ingest codec
+  currently satisfies both (AV1 is keyframe-only decode and its encoder
+  does not emit a valid bitstream; FLAC decodes but an ABR ladder for
+  lossless audio gains nothing). The engine returns a per-codec honest
+  `Err` naming the specific reason rather than a generic refusal. Segment
+  *packaging* is unaffected and shipped this session.
+
+### oximedia-py (1 marker)
+
+- `cache_py.rs:231` — 14 further `oximedia_cache` modules remain unbound:
+  `two_queue`, `sharded_lru`, `cache_partitioning`, `cache_serialization`,
+  `slab_allocator`, `prefetch`, `cache_metrics`, `admission_filter`,
+  `adaptive`, `negative`, `segment_cache`, `weighted_cache`,
+  `write_through`, `tier_compressor`. The 24 neural/analytics/cache
+  families named in the previous revision of this section all shipped.
+
+### Other crates (5 markers)
+
 - `oximedia-accel/src/compute_backend.rs:598,644` — real Vulkan compute
   dispatch via `vulkano`, behind the non-default `vulkan-backend` feature.
-- `oximedia-automation/src/eas/audio.rs:131` — real TTS integration for
-  EAS audio alerts (synthesize or load pre-recorded announcements).
-- `oximedia-access/src/sign/overlay.rs:52` — real picture-in-picture
-  compositing for sign-language overlay.
-- `oximedia-vfx/src/text/render.rs:106,119,152,162,172` — real glyph
-  rasterization via a pure-Rust font engine; currently returns an honest
-  `Err` for any non-empty text rather than silently skipping it.
-- `oximedia-bitstream/src/integer.rs:510` — commented-out
-  `shl_default`/`shr_default` unbounded-shift methods, pending MSRV
-  support for `unbounded_shl`/`unbounded_shr` (carried over, still open).
+  Needs a dependency decision first (Pure-Rust policy: `vulkano` and the
+  shader-compilation toolchain must be assessed against the C/C++-free
+  default-build rule before this is scheduled).
+- `oximedia-automation/src/eas/audio.rs:505` — real TTS for EAS voice
+  announcements. The SAME/AFSK **data** path is no longer deferred: a real
+  continuous-phase modulator shipped this session with round-trip
+  verification through a Goertzel demodulator.
+- `oximedia-stabilize/src/three_d/stabilize.rs:45` — real 3D camera-motion
+  solve (structure-from-motion). Effort: **specialist**; needs its own
+  wave, not a slice.
 
-### oximedia-cli (29 markers; full detail in `oximedia-cli/TODO.md`, not
-duplicated here since that file was refreshed this session — summary only)
-- Frame-level-pipeline-shaped gaps that share one root cause (no
-  CLI-reachable decode→process→encode frame path yet) across
-  `scaling_cmd.rs` (3), `denoise_cmd.rs`, `stabilize_cmd.rs`,
-  `multicam_cmd.rs` (per-angle `ColorStats`), `subtitle_cmd.rs` and
-  `timecode_cmd.rs` (burn-in — see Changed in `CHANGELOG.md` for the
-  honest-error behaviour shipped this session), and `captions_cmd.rs`
-  (burn-in; MP4 tx3g / ASS-in-Matroska extraction).
-- Remaining `--quiet` rollout: `progress.rs:35` / `main.rs:353` — logging
-  and a handful of commands are wired; ~50 subcommand handlers still print
-  unconditionally.
-- **`--resume` flag disposition — USER-UNDECIDED.** Currently removed
-  from the CLI surface entirely (not merely hidden); see the "`--resume`
-  disposition record" in `oximedia-cli/TODO.md` for the full design
-  question (its only real backing, `TranscodeJob::resume()`, is
-  job-queue-level resume from a different subsystem, not adaptable to
-  per-file transcode resume without new persisted fields). Needs an
-  explicit decision from the user before any implementation proceeds.
-- Assorted single-command gaps: `archivepro_cmd.rs:507` (video/image
-  preservation migration formats), `cloud_cmd.rs:485` (force-multipart
-  option), `collab_cmd.rs:578` (edit-event tracking), `distributed_cmd.rs:222,485`
-  (config fields; real gRPC polling loop), `dolbyvision_cmd.rs:366,377`
-  (`_preserve_levels`; remaining profile-pair transforms), `drm_cmd.rs:519`
-  (license-info surfacing), `edl_cmd.rs:274` (per-dialect writers),
-  `mam_cmd.rs:337` (`ProxyGenerator` wiring into ingest),
-  `renderfarm_cmd.rs:325` (persistent state directory), `switcher_cmd.rs:356`
-  (real encoder for live capture), `transcode.rs:388,416` (encoder-preset
-  → speed knobs; `--audio-bitrate` → Opus), `validate.rs:139,676` (real
-  EBU R103 legal-range check; decode coverage beyond WAV), and
-  `workflow_cmd.rs:579` (SQLite-backed workflow state commands).
+### oximedia-cli (4 markers; full detail in `oximedia-cli/TODO.md`)
 
-### Cross-file drift flagged, not fixed (out of scope for this pass)
-- ~~`docs/codec_status.md` is now stale for VP9/VP8~~ — **Resolved**:
-  `docs/codec_status.md`'s AV1, VP9, and VP8 entries (plus a new "0.2.0
-  re-audit summary" section) were updated in a follow-up documentation
-  pass to reflect the real keyframe/intra decoders, matching the
-  `crates/oximedia-codec/src/lib.rs` matrix rows and the top-level
-  `README.md` Codec Matrix. Two further stale mechanism descriptions
-  found during that pass were **also fixed** in the same pass: the AVIF
-  entry (previously claimed `decode()` returns a raw AV1 bitstream in
-  `y_plane`; it actually validates the ISOBMFF container then returns an
-  honest `CodecError::UnsupportedFeature`, `avif/mod.rs:249` — wiring it
-  to the new AV1 keyframe decoder is tracked in "Deferred (0.2.x)" above)
-  and the Vorbis entry (previously claimed `decode_audio_packet` returns
-  `Ok(Vec::new())`; it actually returns an honest
-  `CodecError::UnsupportedFeature`, `vorbis/decoder.rs:275`). Both now
-  match `lib.rs`'s "honest `Err`" matrix rows.
-- **Follow-up (2026-07-15, `/readme` pass) — fully resolved:** the
-  top-level `README.md` Codec Matrix's own Vorbis and AVIF rows were the
-  one piece of this drift the pass above didn't reach (it explicitly
-  scoped its fix to `docs/codec_status.md`). They still read "returns
-  empty" (Vorbis) and "Depends on AV1 decoder, which is itself
-  bitstream-parsing" (AVIF — stale now that the AV1 row in the same table
-  reads `Functional`). Both rows are now corrected to match
-  `docs/codec_status.md`/`lib.rs`: Vorbis "`decode_audio_packet` returns
-  an honest `Err` (not fabricated empty samples)"; AVIF "container
-  validates; `decode()` returns an honest `Err` — not yet wired to the new
-  AV1 keyframe/intra decoder."
+The frame-level-pipeline root cause named in the previous revision of this
+section is **closed** — a shared `frame_harness/` module now backs nine
+commands (scaling ×3, denoise, stabilize, multicam colour-match, timecode
+burn, subtitle burn, captions burn). Four markers remain, each verified
+still present in the tree on 2026-08-12:
+
+- `archivepro_cmd.rs:514` — `VideoFfv1Mkv` migration target. Honest refusal
+  today: `oximedia-transcode`'s frame level writes FFV1 only in its own
+  private raw framing, and labelling that output `.mkv` would be exactly
+  the mislabelling this command refuses elsewhere.
+- `captions_cmd.rs:1061` — MP4 (tx3g) and ASS/SSA-in-Matroska extraction.
+- `distributed_cmd.rs:228` — a state/persistence-directory config field.
+- `edl_cmd.rs:281` — real per-dialect writers in `oximedia-edl`.
+
+**`--resume` remains USER-UNDECIDED** and its disposition is unchanged by
+this session: removed from the CLI surface entirely (not hidden), because
+its only real backing, `TranscodeJob::resume()`, is job-queue-level resume
+from a different subsystem and is not adaptable to per-file transcode
+resume without new persisted fields. See the "`--resume` disposition
+record" in `oximedia-cli/TODO.md`. **Do not implement without an explicit
+user decision.**
+
+### Deferrals without a code marker
+
+Real backlog that carries no `TODO(0.2.x)` comment, so a marker harvest
+alone will not surface it:
+
+- **VP9 inter segmentation** and **VP9 reference scaling** — see the VP9
+  section above. Both have a committed gate fixture.
+- **`oximedia` facade: the `video` feature reaches zero codecs.** The root
+  `Cargo.toml` pins `oximedia-codec` with `default-features = false`, and
+  `oximedia/Cargo.toml` declares `video = ["dep:oximedia-codec"]` with no
+  sub-feature forwarding, so `--features video` compiles and exposes no
+  AV1/VP9/VP8 decoder — contradicting `oximedia/src/lib.rs`'s own feature
+  table. Every other consumer in the workspace forwards explicitly. Under
+  `--features full` the codecs are present only by unification from sibling
+  crates. `minimal = ["audio", "video", "metadata-ext"]` inherits the gap.
+  Ready-to-apply, following the same file's `mjpeg`/`apv` precedent:
+  `video = ["dep:oximedia-codec", "oximedia-codec/av1", "oximedia-codec/vp9", "oximedia-codec/vp8"]`.
+  Left unapplied pending a maintainer decision on the default feature
+  surface.
+- **`oximedia` facade: `capture` does not forward `oximedia-capture/tokio`**,
+  so `CaptureStream::into_async` is unreachable through the facade at any
+  feature combination.
+- **`oximedia-normalize`'s batch path refuses MP3 even though a real MP3
+  decoder exists in-tree.** `batch/codecs.rs:104-106` sniffs ID3v2 / MPEG
+  frame sync and returns an honest `NormalizeError::UnsupportedFormat`
+  reading "MP3 decoding is not wired into oximedia-normalize's batch …".
+  That wording is deliberate and correct — the decoder at
+  `crates/oximedia-audio/src/mp3/` is real and complete (MP3 decoding
+  patents expired 2017; see the MP3 entry in `docs/codec_status.md`), so
+  this is **unwired, not absent**, and the entry must not be restated as
+  "no decoder in tree" or "patent-encumbered". Small, well-scoped follow-up:
+  add the dependency and route the sniff to it.
+- **`oximedia-container`'s `FlacDemuxer` estimates frame boundaries** from
+  `STREAMINFO.max_frame_size` instead of resolving them via CRC-16 — its
+  own doc comment says so. `oximedia-normalize`'s new FLAC path bypasses it
+  deliberately; every other caller inherits the estimate.
+- **CMAF/`fragment/mp4.rs` config-box payload conformance is the caller's
+  duty.** The muxer now writes correctly *named* config boxes but forwards
+  `track.extradata` verbatim, so a `dOps`/`dfLa` box is only conformant if
+  the caller supplied a real `OpusSpecificBox`/`FLACSpecificBox` record.
+  `oximedia-server`'s ingest path converts properly; `fragment/mp4.rs`
+  passes `codec_params.extradata` through unchanged.
+- **`MultiFormatProber` never parses MP4 `tkhd` or the visual `stsd`
+  entry**, so `DetailedStreamInfo::width`/`height` are always `None` for
+  MP4. No prober path populates `fps` either, so probe-derived ABR ladders
+  use a documented `DEFAULT_FRAMERATE = 30.0` that feeds `fps_factor` and
+  shifts every rung's bitrate.
+- **`VideoFrame::allocate()` under-allocates `P010`/`P016`** — it sizes
+  planes at one byte per sample, consulting the stride table only for
+  `Yuyv422`/`Uyvy422` and NV12/NV21 chroma. No in-tree caller allocates
+  either format; documented in `allocate`'s doc comment as a deliberate
+  deferral, and the consumer that would need it is `oximedia-capture`'s
+  legacy path.
+- **`oximedia-gaming` has no OS input hook.** `InputCapture::poll_events`
+  is an honest `UnsupportedPlatform` error; the crate's `capture::hooks` is
+  screen-capture region/FPS hooks, an unrelated concept despite the name.
+  Its `KNOWN_GAMES` table is also an unverified best-effort sample — a
+  wrong entry means "never matches", never a false positive, because
+  matching is exact-name and the tests lock that in. Do not "fix" it into
+  substring matching.
+- **WebRTC DTLS is still non-functional** (`oximedia-net`), unchanged this
+  session. It remains labelled and unexported; see the "Network & DRM
+  crypto status" section of `docs/codec_status.md`.
+- **`oximedia-capture` Linux and Windows live-device runs.** ABI layouts
+  are const-verified and the logic is host-tested against synthetic input,
+  but no `/dev/video*` node or Media Foundation device has been opened by
+  this crate in this workspace's own verification. Needs hardware; see
+  "0.2.1 Capture — Known follow-ups" below for the exact commands.
+- **WebP VP8L-compressed `ALPH` alpha** — a pre-existing honest
+  `UnsupportedFeature` in `webp/alpha.rs`, not a new gap.
+- **`crates/oximedia-codec/src/lib.rs`'s Codec Feature Matrix is the last
+  stale copy of the codec status.** It is a `//!` doc comment, so it ships
+  in that crate's published rustdoc. Four rows disagree with the tree as of
+  2026-08-12: `lib.rs:46` VP9 "inter not yet (honest `Err`)"; `lib.rs:55`
+  AVIF "not supported (honest `Err`)"; `lib.rs:58` WebP "lossless VP8L
+  only; no lossy VP8 WebP decode"; `lib.rs:59` Opus decode "✓ (CELT + SILK
+  + Hybrid)" — the exact overclaim this release demotes. Corrected text for
+  all four is in `docs/codec_status.md` and the README Codec Matrix. Not
+  edited because the 2026-08-12 documentation pass was scoped to `TODO.md`
+  / `CHANGELOG.md` / `README.md` / `docs/` / `oximedia-cli/TODO.md`. Small,
+  fully specified follow-up.
+- **`oximedia-wasm`'s `instant` dependency chain**
+  (`oximedia-watermark` → `reed-solomon-erasure` → `parking_lot` 0.11 →
+  `instant`) is unfixable upstream — `reed-solomon-erasure` 6.0.0 is the
+  latest release. The RUSTSEC advisory is already ignored with a recorded
+  rationale.
+
+### Corrections to the previous revision of this section
+
+- **`oximedia-bitstream/src/integer.rs:510` is CLOSED.** The
+  `shl_default`/`shr_default` unbounded-shift methods are implemented at
+  `integer.rs:516-522` via `unbounded_shl`/`unbounded_shr`, which have been
+  stable since Rust 1.87. The item said "pending MSRV support"; the MSRV
+  moved and the item was never re-checked.
+- **"Container — (nothing open)" was wrong when written, and is now
+  *mostly* right for a different reason.** Three gaps existed at the time
+  (`MpegTsMuxer::streams()` returning `&[]`, a decorative
+  `streaming/demux.rs` buffering path, and a simplified Ogg Vorbis setup
+  extraction) and all three closed this session, along with a CMAF
+  config-box bug and a reachable Matroska panic-DoS. What remains open in
+  `oximedia-container` is listed under "Deferrals without a code marker"
+  above: the `FlacDemuxer` frame-boundary estimate, the MP4 prober's
+  missing `tkhd`/`stsd` parse, and the CMAF extradata-passthrough caveat.
+- **The FLAC entry is moot.** It described the `oximedia-codec` FLAC
+  encoder and decoder as "not round-trip self-consistent (the LPC path)".
+  That understated it — the decoder *panicked* on stock `ffmpeg` output —
+  and both sides have since been rebuilt to RFC 9639 and verified against
+  libFLAC/ffmpeg in both directions.
+- **The AVIF entry is closed.** `decode()` is wired to the AV1 keyframe
+  decoder and byte-identical to ffmpeg/dav1d on a real libaom fixture.
+  Alpha and 10/12-bit refuse honestly and are tracked under AV1 above, not
+  under AVIF.
+- **The `oximedia-wasm`, `oximedia-server`, `oximedia-py`,
+  `oximedia-metadata`, `oximedia-renderfarm`, `oximedia-conform`,
+  `oximedia-captions`, `oximedia-vfx`, `oximedia-access` and `oximedia-net`
+  entries are closed** — see the `[0.2.1]` Added section of
+  `CHANGELOG.md`. `oximedia-transcode`'s FFV1 and ALAC items are closed;
+  only Opus and ProRes 10-bit remain.
+- **`oximedia-normalize` is only *partly* closed.** Of its old entry —
+  "additional codec support (MP3/FLAC/Opus) in batch normalize;
+  `write_metadata` config flag not yet honored" — FLAC and `write_metadata`
+  shipped, and Opus is correctly rolled into the Opus deferral above. **MP3
+  did not close**, and it is a different kind of gap from the other two; it
+  is listed under "Deferrals without a code marker".
+- **All AV1 marker line numbers in the previous revision were stale** (it
+  cited `recon.rs:665,739,1475,1482,1488,1494`; the real lines are
+  `779,853,1606,1613,1619,1625`). The table above is a fresh read.
+- **`prores/picture.rs:139` is closed** — `quant_scale` is now enforced in
+  `1..=224` per RDD 36 §6.5.3, with a new `FrameError::BadQuantScale`
+  variant and four boundary tests.
+- **The "Cross-file drift flagged, not fixed" subsection was removed**, not
+  lost: every item in it was already marked resolved, and the drift it
+  tracked (`docs/codec_status.md` / `README.md` / `lib.rs` disagreeing about
+  AV1/VP9/VP8/AVIF/Vorbis) was re-checked and re-synchronised across all
+  three files on 2026-08-12. The one genuinely stale row it had missed —
+  `README.md`'s "WebP (VP8L) … Lossless only — no VP8 lossy WebP decoder",
+  which had contradicted the shipped `webp/vp8_decoder.rs` — is now
+  corrected too.
+
+---
+
+## 0.2.1 Capture — packages A4–A8 (completed 2026-08-11)
+
+Pure-Rust live camera/device capture, landed as a new `oximedia-capture`
+crate plus the `oximedia-core`/`oximedia-codec`/`oximedia-simd` pixel-format
+work it needed. Packages A4 (skeleton: format model, negotiation, delivery
+queue, mock backend), A5 (macOS AVFoundation), A6 (Linux V4L2) and A7
+(Windows Media Foundation) implemented the crate itself; this entry is where
+all of A4–A7 first get recorded in `TODO.md`/`CHANGELOG.md`/`README.md`. A8
+(this pass) is documentation + umbrella wiring only — no new capture logic.
+
+- [x] `oximedia-capture` — new workspace crate (`crates/oximedia-capture/`).
+  `enumerate()`/`open()`/`backend_kind()` entry points; `CaptureConfig`,
+  `CaptureDevice`, `CaptureFormat`, `CaptureEncoding` (`Raw(PixelFormat)` /
+  `Mjpeg`), `DeviceSelector`, `DropPolicy`, `CaptureSession`/`CaptureStream`/
+  `CaptureStats`, a deterministic `negotiate()`. Three backends behind one
+  API: AVFoundation (macOS, `objc2`), V4L2 (Linux, `rustix` syscalls), Media
+  Foundation (Windows, `windows-rs` COM) — zero C/C++/Fortran on any of them.
+  `mock` feature (also compiled automatically under `cfg(test)`) drives the
+  whole pipeline without hardware, and honestly refuses to fake MJPEG (see
+  follow-ups). 246 host unit tests pass (`cargo test -p oximedia-capture
+  --features mock`, verified 2026-08-11); opt-in `#[ignore]`d live-device
+  tests behind `OXIMEDIA_CAPTURE_DEVICE` for all three platforms
+  (`tests/live_capture.rs`). Already registered in workspace `Cargo.toml`
+  `members`/`default-members` by package A4; this pass (A8) additionally
+  wires it into the `oximedia` facade behind a new `capture` feature
+  (optional dependency, feature declaration, `full` list, `pub mod capture`
+  re-export, curated `prelude.rs` re-export, feature-flag doc table) and
+  into the root `README.md` crate table. See
+  `crates/oximedia-capture/README.md` for the full per-platform verification
+  breakdown.
+- [x] `oximedia_core::PixelFormat::{Yuyv422, Uyvy422}` — packed YUV 4:2:2
+  variants backing the two most common UVC/AVFoundation raw formats
+  (`crates/oximedia-core/src/types/pixel_format.rs`). Full property support
+  (bpp/plane count/planar-ness/chroma subsampling/`frame_buffer_size`/
+  `stride_for_width`/`FromStr`/`Display`); new unit tests plus
+  `pixel_format_exhaustive.rs` coverage.
+- [x] `VideoFrame::allocate()` packed-4:2:2 + NV12/NV21 chroma stride fix
+  (`crates/oximedia-codec/src/frame.rs`) — both families were under-allocated
+  (packed 4:2:2 by 2x; the NV12/NV21 chroma plane by 2x). Fixed via
+  `PixelFormat::stride_for_width()`; every pre-existing planar format
+  verified byte-identical via a new regression test. `P010`/`P016` left on
+  the legacy, still-undersized path on purpose — see the follow-ups below.
+- [x] `oximedia_simd::yuv_ops::convert_uyvy422_row_to_rgb`
+  (`crates/oximedia-simd/src/yuv_ops.rs`) — UYVY-order sibling of
+  `convert_yuv422_row_to_rgb`; cross-verified byte-for-byte against it on
+  even and odd widths. The sibling function's own length assertion was
+  simultaneously tightened (`width.div_ceil(2) * 4`, not `width * 2` — the
+  old bound under-counted odd-width rows).
+- [x] `pf_is_yuv422` widened to the packed variants
+  (`crates/oximedia-core/src/codec_negotiation.rs`) — `Yuyv422`/`Uyvy422`
+  now score as same-family against `Yuv422p` during negotiation. 10/12/16-bit
+  planar 4:2:2 variants deliberately left out of this helper (pre-existing
+  scope, unchanged).
+
+### Known follow-ups
+
+- **Linux backend has no real-device run yet.** ABI layouts are
+  const-verified (`crates/oximedia-capture/README.md`'s Linux specifics; the
+  golden-layout table passes `cargo check` on both
+  `aarch64-unknown-linux-gnu` and `i686-unknown-linux-gnu`), but no
+  `/dev/video*` node has been opened by this crate in this workspace's own
+  verification. Needs a container with a `/dev/video*` node, or a real Linux
+  host, running
+  `OXIMEDIA_CAPTURE_DEVICE=/dev/videoN cargo test -p oximedia-capture --test live_capture -- --ignored`.
+- **Windows backend likewise has no real-device run yet** — `mf_logic.rs` is
+  host-tested against synthetic inputs only; needs a Windows host with a
+  camera and the equivalent `OXIMEDIA_CAPTURE_DEVICE` live test.
+- **`P010`/`P016` `allocate()` sizing left legacy.** Documented in
+  `oximedia-codec/src/frame.rs`'s `allocate()` doc comment as a deliberate
+  deferral (no in-tree caller allocates them today); fixing it is a small,
+  well-scoped follow-up whenever a caller needs it.
+- **`mock` cannot emit MJPEG, by design.** Asking the mock backend for
+  `CaptureEncoding::Mjpeg` returns `CaptureError::FormatRejected` rather than
+  bytes that claim to be a JPEG and are not — the same honesty policy the
+  crate applies to real backends, not a gap to close.
+- ~~**Async `recv()` deferred.**~~ **CLOSED 2026-08-12.** The new opt-in
+  `tokio` feature adds `CaptureStream::into_async()` /
+  `into_async_with_capacity()` (`src/asyncio.rs`), a **bounded** bridge that
+  preserves the ring buffer's drop policy as backpressure rather than
+  converting it into unbounded channel latency. It touches no platform code:
+  every `!Send` handle already lives and dies on the dedicated capture
+  thread, and the bridge consumes only the already-public
+  `recv_timeout`/`is_ended`. The `recv()` tri-state
+  (`Ok(Some)` / `Ok(None)` = ended / `Err`) survives the wrapper unchanged.
+  The synchronous API is untouched, and the feature is off by default so a
+  caller with no async runtime never pays for tokio. **Remaining caveat:** the
+  `oximedia` facade's `capture` feature does not forward
+  `oximedia-capture/tokio`, so the async path is reachable only by depending
+  on `oximedia-capture` directly — see "Deferrals without a code marker".
+- **Stepwise frame-size negotiation is an approximation, on purpose.** A
+  `STEPWISE`/`CONTINUOUS` V4L2 range is sampled at its two corners and a
+  step-snapped midpoint rather than enumerated in full (a real range can be
+  500,000+ distinct modes); documented in
+  `platform/linux/mod.rs::stepwise_size_corners`.
+- **`oximedia-wasm` `instant` breakage — pre-existing, unrelated.** See
+  Known Issues above (`oximedia-watermark` → `reed-solomon-erasure` →
+  `parking_lot` 0.11 → `instant`); not touched by package A8.
+- ~~**`oximedia-mam` MPL license failures — pre-existing.**~~ **CLOSED
+  2026-08-12.** `cargo deny check licenses` and `check bans` are both green
+  (30 rejected crates → 0). `async-graphql` moved to
+  `default-features = false` with its default set minus `email-validator`,
+  which removes `fast_chemail`/`ascii_utils` from the graph entirely
+  (behaviour-neutral — `oximedia-mam`'s GraphQL surface uses no email
+  validator); `colored`, `option-ext` and `serialport` are scoped MPL-2.0
+  exceptions; `fuchsia-cprng` is clarified. Note the diagnosis in the
+  original entry was partly wrong: `colored` is a **direct, non-optional
+  `oximedia-cli` dependency**, not a `mockito` dev-dep ingress.

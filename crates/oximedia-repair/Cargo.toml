@@ -19,6 +19,7 @@ workspace = true
 oximedia-core = { workspace = true }
 oximedia-container = { workspace = true }
 oximedia-codec = { workspace = true, default-features = true }
+oximedia-video = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }

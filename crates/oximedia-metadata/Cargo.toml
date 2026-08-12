@@ -23,3 +23,9 @@ serde = { workspace = true, features = ["derive"] }
 quick-xml = { workspace = true }
 encoding_rs = { workspace = true }
 rayon = { workspace = true }
+md-5 = { workspace = true }
+
+[dev-dependencies]
+oximedia-container = { workspace = true }
+oximedia-io = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

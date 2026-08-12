@@ -1,9 +1,11 @@
 //! Honesty tests for `subtitle extract` / `subtitle burn` / `timecode burn`.
 //!
-//! `subtitle extract` now delegates to the real Matroska/WebM subtitle demux
-//! shared with `captions extract`; the two burn-in commands fail honestly
-//! (no compositor path exists) instead of printing success while writing
-//! nothing.
+//! `subtitle extract` delegates to the real Matroska/WebM subtitle demux
+//! shared with `captions extract`. `subtitle burn` and `timecode burn` are
+//! both implemented for real now, on the Y4M frame harness — here each must
+//! refuse a non-Y4M input with the shared actionable error rather than
+//! fabricating an output file; their real burn-in pixel coverage lives in
+//! `frame_harness_e2e.rs`.
 
 use assert_cmd::Command;
 use std::path::Path;
@@ -156,8 +158,10 @@ fn subtitle_extract_non_matroska_errors() {
     assert!(!output.exists(), "no output may be fabricated on failure");
 }
 
-/// `subtitle burn` validates inputs, then errors honestly — never a
-/// success banner with no output file.
+/// `subtitle burn` is real now (see `frame_harness_e2e.rs`), but its input
+/// contract is Y4M in / Y4M out: a WebM input is refused with the shared,
+/// actionable "convert it first" error, and no output file is fabricated —
+/// mirroring `timecode_burn_errors_honestly` below.
 #[test]
 fn subtitle_burn_errors_honestly() {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -184,13 +188,19 @@ fn subtitle_burn_errors_honestly() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
     assert!(
-        stderr.contains("not implemented"),
-        "burn must state it is unimplemented, got:\n{stderr}"
+        stderr.contains("YUV4MPEG2"),
+        "subtitle burn must state its Y4M input requirement, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("oximedia transcode"),
+        "the error must tell the user how to convert, got:\n{stderr}"
     );
     assert!(!output.exists(), "burn must not fabricate an output file");
 }
 
-/// `timecode burn` validates parameters, then errors honestly.
+/// `timecode burn` is real now (see `frame_harness_e2e.rs`), but its input
+/// contract is Y4M in / Y4M out: a WebM input is refused with the shared,
+/// actionable "convert it first" error, and no output file is fabricated.
 #[test]
 fn timecode_burn_errors_honestly() {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -217,8 +227,12 @@ fn timecode_burn_errors_honestly() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
     assert!(
-        stderr.contains("not implemented"),
-        "timecode burn must state it is unimplemented, got:\n{stderr}"
+        stderr.contains("YUV4MPEG2"),
+        "timecode burn must state its Y4M input requirement, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("oximedia transcode"),
+        "the error must tell the user how to convert, got:\n{stderr}"
     );
     assert!(
         !output.exists(),
@@ -226,7 +240,8 @@ fn timecode_burn_errors_honestly() {
     );
 }
 
-/// Parameter validation still fires first: a bad position is its own error.
+/// Parameter validation still fires first: a bad position is its own error,
+/// reported before the input format and the font are even looked at.
 #[test]
 fn timecode_burn_still_validates_parameters() {
     let dir = tempfile::TempDir::new().expect("tempdir");

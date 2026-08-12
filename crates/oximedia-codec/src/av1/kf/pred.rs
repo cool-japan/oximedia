@@ -88,8 +88,19 @@ pub fn predict_intra(buf: &mut [u8], stride: usize, x: usize, y: usize, p: &Pred
     } else {
         let above_limit =
             core::cmp::min(p.max_x, x + if p.have_above_right { 2 * w } else { w } - 1);
-        for i in 0..w + h {
-            above[2 + i] = px(core::cmp::min(above_limit, x + i), y - 1);
+        // `min(above_limit, x + i)` is `x + i` while `i <= above_limit - x`
+        // and `above_limit` after that, so the loop splits into a straight
+        // widening copy of a contiguous run followed by an edge-replicating
+        // fill.  This is the same sequence of values, without a clamp per
+        // sample.
+        let n_copy = core::cmp::min(w + h, above_limit + 1 - x);
+        let src_off = (y - 1) * stride + x;
+        for (i, &b) in buf[src_off..src_off + n_copy].iter().enumerate() {
+            above[2 + i] = i32::from(b);
+        }
+        let edge_val = px(above_limit, y - 1);
+        for v in above.iter_mut().take(2 + w + h).skip(2 + n_copy) {
+            *v = edge_val;
         }
     }
 
@@ -105,8 +116,15 @@ pub fn predict_intra(buf: &mut [u8], stride: usize, x: usize, y: usize, p: &Pred
         }
     } else {
         let left_limit = core::cmp::min(p.max_y, y + if p.have_below_left { 2 * h } else { h } - 1);
-        for i in 0..w + h {
-            left[2 + i] = px(x - 1, core::cmp::min(left_limit, y + i));
+        // Same split as AboveRow; the reads stay column-strided so only the
+        // clamp is removed, not the load pattern.
+        let n_copy = core::cmp::min(w + h, left_limit + 1 - y);
+        for i in 0..n_copy {
+            left[2 + i] = px(x - 1, y + i);
+        }
+        let edge_val = px(x - 1, left_limit);
+        for v in left.iter_mut().take(2 + w + h).skip(2 + n_copy) {
+            *v = edge_val;
         }
     }
 
@@ -147,27 +165,30 @@ pub fn predict_intra(buf: &mut [u8], stride: usize, x: usize, y: usize, p: &Pred
         // PAETH_PRED (basic intra prediction process).
         debug_assert_eq!(p.mode, PAETH_PRED);
         for i in 0..h {
-            for j in 0..w {
-                let base = above[2 + j] + left[2 + i] - above[1];
-                let p_left = (base - left[2 + i]).abs();
+            let (li, tl) = (left[2 + i], above[1]);
+            let row = &mut pred[i * w..(i + 1) * w];
+            for (j, r) in row.iter_mut().enumerate() {
+                let base = above[2 + j] + li - tl;
+                let p_left = (base - li).abs();
                 let p_top = (base - above[2 + j]).abs();
-                let p_top_left = (base - above[1]).abs();
-                pred[i * w + j] = if p_left <= p_top && p_left <= p_top_left {
-                    left[2 + i]
+                let p_top_left = (base - tl).abs();
+                *r = if p_left <= p_top && p_left <= p_top_left {
+                    li
                 } else if p_top <= p_top_left {
                     above[2 + j]
                 } else {
-                    above[1]
+                    tl
                 };
             }
         }
     }
 
     for i in 0..h {
-        for j in 0..w {
+        let off = (y + i) * stride + x;
+        for (b, &v) in buf[off..off + w].iter_mut().zip(&pred[i * w..(i + 1) * w]) {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             {
-                buf[(y + i) * stride + (x + j)] = pred[i * w + j].clamp(0, 255) as u8;
+                *b = v.clamp(0, 255) as u8;
             }
         }
     }
@@ -283,20 +304,43 @@ fn directional_intra(
     if p_angle < 90 {
         let dx = i32::from(DR_INTRA_DERIVATIVE[p_angle as usize]);
         let max_base_x = ((w + h - 1) << ua) as i32;
+        let tail = above[2 + max_base_x as usize];
         for i in 0..h {
-            for j in 0..w {
-                let idx = (i as i32 + 1) * dx;
-                let base = (idx >> (6 - ua)) + ((j as i32) << ua);
-                let shift = ((idx << ua) >> 1) & 0x1F;
-                pred[i * w + j] = if base < max_base_x {
-                    round2(
-                        above[(2 + base) as usize] * (32 - shift)
-                            + above[(2 + base + 1) as usize] * shift,
-                        5,
-                    )
+            let idx = (i as i32 + 1) * dx;
+            let base0 = idx >> (6 - ua);
+            let shift = ((idx << ua) >> 1) & 0x1F;
+            let row = &mut pred[i * w..(i + 1) * w];
+            if ua == 0 {
+                // `base` advances by exactly one per `j`, so the two taps
+                // read two overlapping contiguous windows of AboveRow.
+                // `count` is how many leading `j` satisfy `base < maxBaseX`;
+                // beyond it the spec substitutes AboveRow[maxBaseX], so the
+                // kernel never reads past the edge buffer.
+                let count = (max_base_x - base0).clamp(0, w as i32) as usize;
+                if count == 0 {
+                    row.fill(tail);
                 } else {
-                    above[2 + max_base_x as usize]
-                };
+                    let edge = &above[(2 + base0) as usize..];
+                    for (j, r) in row[..count].iter_mut().enumerate() {
+                        *r = round2(edge[j] * (32 - shift) + edge[j + 1] * shift, 5);
+                    }
+                    row[count..].fill(tail);
+                }
+            } else {
+                // Upsampled edge: `base` advances by two per `j`, so the
+                // loads are strided — kept on the spec's scalar path.
+                for j in 0..w {
+                    let base = base0 + ((j as i32) << ua);
+                    row[j] = if base < max_base_x {
+                        round2(
+                            above[(2 + base) as usize] * (32 - shift)
+                                + above[(2 + base + 1) as usize] * shift,
+                            5,
+                        )
+                    } else {
+                        tail
+                    };
+                }
             }
         }
     } else if p_angle > 90 && p_angle < 180 {
@@ -340,17 +384,14 @@ fn directional_intra(
             }
         }
     } else if p_angle == 90 {
+        // V_PRED: every row is a copy of AboveRow[0..w].
         for i in 0..h {
-            for j in 0..w {
-                pred[i * w + j] = above[2 + j];
-            }
+            pred[i * w..(i + 1) * w].copy_from_slice(&above[2..2 + w]);
         }
     } else {
-        // p_angle == 180
+        // p_angle == 180 — H_PRED: every row is a splat of LeftCol[i].
         for i in 0..h {
-            for j in 0..w {
-                pred[i * w + j] = left[2 + i];
-            }
+            pred[i * w..(i + 1) * w].fill(left[2 + i]);
         }
     }
 }
@@ -532,31 +573,35 @@ fn smooth_intra(
     if mode == SMOOTH_PRED {
         let wx = weights(log2w);
         let wy = weights(log2h);
+        let (lb, ar) = (left[2 + h - 1], above[2 + w - 1]);
         for i in 0..h {
-            for j in 0..w {
-                let sm = i32::from(wy[i]) * above[2 + j]
-                    + (256 - i32::from(wy[i])) * left[2 + h - 1]
-                    + i32::from(wx[j]) * left[2 + i]
-                    + (256 - i32::from(wx[j])) * above[2 + w - 1];
-                pred[i * w + j] = round2(sm, 9);
+            let (wyi, li) = (i32::from(wy[i]), left[2 + i]);
+            let row = &mut pred[i * w..(i + 1) * w];
+            for (j, r) in row.iter_mut().enumerate() {
+                let wxj = i32::from(wx[j]);
+                let sm = wyi * above[2 + j] + (256 - wyi) * lb + wxj * li + (256 - wxj) * ar;
+                *r = round2(sm, 9);
             }
         }
     } else if mode == SMOOTH_V_PRED {
         let wy = weights(log2h);
+        let lb = left[2 + h - 1];
         for i in 0..h {
-            for j in 0..w {
-                let sm =
-                    i32::from(wy[i]) * above[2 + j] + (256 - i32::from(wy[i])) * left[2 + h - 1];
-                pred[i * w + j] = round2(sm, 8);
+            let wyi = i32::from(wy[i]);
+            let row = &mut pred[i * w..(i + 1) * w];
+            for (j, r) in row.iter_mut().enumerate() {
+                *r = round2(wyi * above[2 + j] + (256 - wyi) * lb, 8);
             }
         }
     } else {
         let wx = weights(log2w);
+        let ar = above[2 + w - 1];
         for i in 0..h {
-            for j in 0..w {
-                let sm =
-                    i32::from(wx[j]) * left[2 + i] + (256 - i32::from(wx[j])) * above[2 + w - 1];
-                pred[i * w + j] = round2(sm, 8);
+            let li = left[2 + i];
+            let row = &mut pred[i * w..(i + 1) * w];
+            for (j, r) in row.iter_mut().enumerate() {
+                let wxj = i32::from(wx[j]);
+                *r = round2(wxj * li + (256 - wxj) * ar, 8);
             }
         }
     }

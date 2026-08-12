@@ -498,7 +498,12 @@ fn output_format_from_path(path: &PathBuf) -> oximedia_image::format_detect::Ima
     }
 }
 
-fn read_input_frame(
+/// Decode an image file into an in-memory frame.
+///
+/// `pub(crate)` so other subcommands with a genuine need for the real image
+/// codec path (e.g. `archive-pro migrate`'s TIFF/PNG preservation targets)
+/// reuse this exact decode logic instead of duplicating it.
+pub(crate) fn read_input_frame(
     path: &PathBuf,
     fmt: &oximedia_image::format_detect::ImageFormat,
 ) -> Result<oximedia_image::ImageFrame> {
@@ -527,7 +532,10 @@ fn read_input_frame(
     }
 }
 
-fn write_output_frame(
+/// Encode an in-memory frame to an image file.
+///
+/// `pub(crate)` — see [`read_input_frame`].
+pub(crate) fn write_output_frame(
     path: &PathBuf,
     frame: &oximedia_image::ImageFrame,
     fmt: &oximedia_image::format_detect::ImageFormat,

@@ -1,0 +1,112 @@
+layout: compound  (source: compound.ivf)
+IVF header: 96x64  fourcc=VP90  timebase=25/1  declared_frame_count=12
+actual IVF packet count parsed: 12
+
+N     pkt/sf        size    type   show  intra  er  dims       q    seg  interp          refresh  ref_idx  hsib
+----------------------------------------------------------------------------------------------------------------------------------
+   0  pkt0   sf0     1992B  key    show=1  intra_only=0  er=0  dims=96x64      q= 25  seg=off  interp=-               refresh=0xff  ref_idx=[-]  hsib=82  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=-  adapt=YES
+        loop_filter deltas: ref=[1, None, -1, -1] mode=[None, None]
+   1  pkt1   sf0     1161B  inter  show=0  intra_only=0  er=0  dims=96x64      q= 40  seg=off  interp=EIGHTTAP        refresh=0x04  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=50  fpdm=0  refresh_ctx=1  ctx_idx=1  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   2  pkt1   sf1      147B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 95  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   3  pkt2   sf0      245B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 95  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   4  pkt3   sf0      214B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 94  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   5  pkt4   sf0      265B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 94  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   6  pkt5   sf0      246B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 93  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   7  pkt6   sf0      211B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 93  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   8  pkt7   sf0      194B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 92  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+   9  pkt8   sf0      241B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 92  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+  10  pkt9   sf0      185B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 91  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+  11  pkt10  sf0      152B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 91  seg=off  interp=EIGHTTAP        refresh=0x01  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)sb1]  hsib=6  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+  12  pkt11  sf0       16B  inter  show=1  intra_only=0  er=0  dims=96x64      q= 96  seg=off  interp=EIGHTTAP        refresh=0x04  ref_idx=[L0:slot0(found_ref) L1:slot1(found_ref not read: earlier ref matched) L2:slot2(found_ref not read: earlier ref matched)]  hsib=3  fpdm=0  refresh_ctx=1  ctx_idx=0  reset_ctx=0  adapt=YES
+        loop_filter deltas: ref=None mode=None
+----------------------------------------------------------------------------------------------------------------------------------
+
+superframe packets:
+  pkt 1: SUPERFRAME, 2 frames, 2 bytes/size, sizes=[1161, 147], index_sz=6
+
+frame accounting
+----------------------------------------
+IVF packets:       12
+coded frames:      13  (key=1, inter=12, of which show_existing_frame=0)
+hidden coded frames (show_frame=0, not show_existing_frame): 1
+output pictures:   12  = count(show_existing_frame==1) [0] + count(show_existing_frame==0 && show_frame==1) [12]
+
+coded-frame-index -> output-picture-index mapping (n/a rows contribute no output picture)
+coded_idx  pkt  show_existing  show_frame  output_idx  dims
+        0    0              0  1           0           96x64
+        1    1              0  0           n/a         -
+        2    1              0  1           1           96x64
+        3    2              0  1           2           96x64
+        4    3              0  1           3           96x64
+        5    4              0  1           4           96x64
+        6    5              0  1           5           96x64
+        7    6              0  1           6           96x64
+        8    7              0  1           7           96x64
+        9    8              0  1           8           96x64
+       10    9              0  1           9           96x64
+       11   10              0  1           10          96x64
+       12   11              0  1           11          96x64
+
+compound.ref.yuv: homogeneous 96x64 (4:2:0 planar, 9216 bytes/frame) x 12 output pictures = 110592 bytes total (byte-offset table omitted: offset = output_idx * frame_bytes)
+
+stream-level summary
+----------------------------------------
+key frames: 1  (task requires exactly 1, at coded index 0)
+hidden frames (show_frame=0): 1
+distinct frame-level interpolation_filter values seen: ['EIGHTTAP']
+frames with segmentation_enabled=1: []
+distinct coded (width,height) seen: [(96, 64)]
+distinct profile values seen: [0]
+
+stream notes / expected+observed reference-frame coverage:
+  -auto-alt-ref 1 -lag-in-frames 16 -g 250 -keyint_min 250 -cpu-used 0 -frame-parallel 0,
+  2-pass. -frame-parallel 0 is REQUIRED and was added after discovering (self-review,
+  not part of the original recipe) that ffmpeg's default frame-parallel='auto' resolved
+  to frame_parallel_decoding_mode=1 on every frame of an earlier version of this stream
+  -- per spec refresh_probs() (6.1.2), backward probability adaptation
+  (adapt_coef_probs()/adapt_noncoef_probs()) only runs when
+  error_resilient_mode==0 AND frame_parallel_decoding_mode==0; with fpdm=1 this
+  stream would have silently carried ZERO backward adaptation despite being this
+  wave's designated adaptation fixture ('the adaptation workhorse... so backward
+  probability adaptation bugs surface'). Confirmed fixed: fpdm=0 on all 13 coded
+  frames of the shipped stream (see the fpdm/refresh_ctx/ctx_idx/reset_ctx columns
+  in the per-frame table below, and 'adapt=YES' on every frame).
+  1-pass vs 2-pass and lag-in-frames bisection (properly isolated -- lag alone,
+  independent of the pass-count switch): lag=8 in 2-pass genuinely produces ZERO
+  hidden frames at 12 source frames (not just an artifact of trying 1-pass first) --
+  the brief's literal -lag-in-frames 8 does not work with this ffmpeg/libvpx version
+  regardless of pass count; lag=16 is the minimum that was tested to work. Full
+  bisection table (1-pass lag in {8,10,12,16}, 2-pass lag in {8,16}) in RECIPE.md.
+  Expected+observed: coded frame 1 is a genuine hidden altref (show_frame=0,
+  refresh_frame_flags=0x04 i.e. refreshes the ALTREF slot only), BUNDLED into a VP9
+  superframe together with coded frame 2 (the following shown frame) inside IVF packet
+  1 -- VP9-specific: unlike VP8 (Wave 2), where a hidden altref always gets its own
+  separate IVF packet, VP9 encoders commonly pack a hidden ARF + the next shown frame
+  into ONE superframe/IVF packet (12 IVF packets carry 13 coded frames here).
+  sign_bias_alternate_frame (=ref_frame_sign_bias[2]) is 1 on frames 2-11, confirming
+  the altref is bitstream-marked as a genuine forward-biased reference, not just
+  refreshed-and-ignored. GOLDEN (slot 1) is never refreshed after the keyframe, so it
+  stays a 3rd, distinct (older) reference throughout -- three genuinely different
+  reference pictures are available for prediction at any point past frame 2 (LAST=most
+  recent, ALTREF=filtered/future-biased, GOLDEN=original keyframe), the frame-level
+  precondition for compound (two-reference) prediction to be RD-favorable.
+  NOTE: no coded frame in this stream uses show_existing_frame (the OTHER libvpx
+  mechanism for an ARF-driven 'repeat this reference as output' -- see RECIPE.md
+  'known gap' section: a bounded probe at 20 and 30 source frames, and with
+  near-static content, never produced one either; V4 should not assume this fixture
+  set exercises that path).
+  Actual per-block use of two-reference COMPOUND_REFERENCE mode is coded in the
+  compressed header (frame_reference_mode(), spec 6.3) which requires arithmetic
+  decoding and is out of this static parser's scope -- same scope boundary as Wave 2's
+  splitmv per-MB partition-type claim (see split_ivf.py's docstring).

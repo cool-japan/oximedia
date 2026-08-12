@@ -344,7 +344,7 @@ async fn render_lower_third(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Lower-Third Rendered".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Output:", output.display());
@@ -407,7 +407,7 @@ async fn render_ticker(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Ticker Rendered".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Output:", output.display());
@@ -524,7 +524,7 @@ async fn render_overlay(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Overlay Composited".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Input:", input.display());
@@ -599,7 +599,7 @@ async fn render_template(
         let json_str =
             serde_json::to_string_pretty(&result).context("Failed to serialize result")?;
         println!("{}", json_str);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "Template Rendered".green().bold());
         println!("{}", "=".repeat(60));
         println!("{:20} {}", "Template:", template_name);

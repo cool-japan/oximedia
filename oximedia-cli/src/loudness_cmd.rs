@@ -680,6 +680,10 @@ fn cmd_info(standard_str: &str, json_output: bool) -> Result<()> {
             "Amazon Music HD targets -14 LUFS integrated with a -1.0 dBTP true-peak ceiling. \
              Consistent with the broad streaming consensus for loudness normalisation."
         }
+        oximedia_metering::Standard::TikTok => {
+            "TikTok normalises short-form video audio to -14 LUFS integrated with a \
+             -1.0 dBTP true-peak ceiling, matching the streaming consensus."
+        }
         oximedia_metering::Standard::Custom { .. } => "Custom target standard.",
     };
 

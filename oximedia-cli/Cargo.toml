@@ -110,6 +110,10 @@ oximedia-caption-gen = { workspace = true, optional = true, features = ["onnx"] 
 scirs2-core = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+# Stream a local file into `oximedia_storage::ByteStream` for the real
+# `cloud upload --multipart` path (see cloud_cmd.rs::file_byte_stream).
+bytes.workspace = true
+futures.workspace = true
 clap.workspace = true
 ratatui.workspace = true
 crossterm = "0.29"

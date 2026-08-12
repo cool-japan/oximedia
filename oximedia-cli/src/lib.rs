@@ -3,7 +3,14 @@
 //!
 //! The main `oximedia` binary is defined in `main.rs` and declares all modules
 //! privately. This lib target re-declares only the modules that auxiliary
-//! binaries need to share, so they don't have to duplicate code.
+//! binaries — and the integration tests — need to share, so they don't have to
+//! duplicate code or shell out to the binary.
+//!
+//! [`frame_harness`] is the decode → process → encode path for pixel-level
+//! commands; [`multicam_cmd`], [`timecode_cmd`], [`denoise_cmd`],
+//! [`stabilize_cmd`], [`scaling_cmd`], [`subtitle_cmd`] and [`captions_cmd`]
+//! are exposed so `tests/frame_harness_e2e.rs` can drive their real entry
+//! points in-process.
 
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::unused_async)]
@@ -28,6 +35,14 @@
 #![allow(clippy::needless_continue)]
 #![allow(clippy::single_char_pattern)]
 
+pub mod captions_cmd;
+pub mod denoise_cmd;
+pub mod frame_harness;
+pub mod multicam_cmd;
 pub mod presets;
 pub mod progress;
+pub mod scaling_cmd;
+pub mod stabilize_cmd;
+pub mod subtitle_cmd;
+pub mod timecode_cmd;
 pub mod transcode;

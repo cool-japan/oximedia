@@ -6,7 +6,7 @@ Hand-written assembly SIMD kernels and high-performance pixel operations for Oxi
 
 Part of the [oximedia](https://github.com/cool-japan/oximedia) workspace — a comprehensive pure-Rust media processing framework.
 
-Version: 0.2.0 — 2026-07-15 — extensively tested
+Version: 0.2.1 — 2026-08-12 — extensively tested
 
 ## Overview
 
@@ -45,7 +45,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia-simd = "0.1.9"
+oximedia-simd = "0.2.0"
 ```
 
 ```rust

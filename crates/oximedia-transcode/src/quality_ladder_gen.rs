@@ -454,21 +454,13 @@ impl LadderOptimizer {
     }
 
     /// Removes adjacent rungs that differ by fewer than `vmaf_equivalence_threshold`.
+    ///
+    /// Delegates to [`Self::filter_equivalent`], which implements this
+    /// correctly (this method previously stopped after keeping only the
+    /// first rung — see `optimize` vs `optimize_full`, which are now
+    /// equivalent).
     fn remove_equivalent_rungs(&self, rungs: Vec<BitrateRung>) -> Vec<BitrateRung> {
-        if rungs.is_empty() {
-            return rungs;
-        }
-
-        let mut kept: Vec<BitrateRung> = Vec::with_capacity(rungs.len());
-        kept.push(rungs.into_iter().next().expect("non-empty"));
-
-        // Safety: we already pushed the first element above, so this is sound.
-        // We reconstruct by iterating via index on a separate vec.
-        // Re-collect to iterate
-        // (borrowing issue avoided by reconstructing inline)
-        // This is a known pattern: we need to compare adjacent pairs.
-        // Re-implement with an index loop.
-        kept
+        self.filter_equivalent(rungs)
     }
 
     /// Fills large VMAF gaps by inserting a midpoint rung between adjacent pairs.
@@ -796,6 +788,39 @@ mod tests {
         // Optimizer may remove rungs; it should not dramatically increase them
         // (gap filling could add at most N-1 rungs for N rungs)
         assert!(optimized.rungs.len() <= original_count * 2 + 1);
+    }
+
+    #[test]
+    fn test_optimize_retains_distinct_rungs_not_just_first() {
+        // Regression test: `remove_equivalent_rungs` (used by `optimize`)
+        // used to push only the first rung and return, silently discarding
+        // every other rendition in the ladder regardless of how different
+        // it was from its neighbours.
+        let spec = LadderSpec {
+            preset: LadderPreset::WebVod,
+            rungs: vec![
+                BitrateRung::new(1080, 1920, 6000, "h264", 192),
+                BitrateRung::new(720, 1280, 3000, "h264", 128),
+                BitrateRung::new(480, 854, 1200, "h264", 96),
+                BitrateRung::new(240, 426, 400, "h264", 64),
+            ],
+            min_rungs: 2,
+            max_rungs: 5,
+        };
+        let opt = LadderOptimizer::new();
+
+        let via_optimize = opt.optimize(spec.clone());
+        assert!(
+            via_optimize.rungs.len() > 1,
+            "expected more than one surviving rung for four clearly distinct \
+             renditions, got {}",
+            via_optimize.rungs.len()
+        );
+
+        // `optimize` and `optimize_full` must now agree; the plain
+        // `optimize` path previously stopped after the first rung.
+        let via_optimize_full = opt.optimize_full(spec);
+        assert_eq!(via_optimize.rungs.len(), via_optimize_full.rungs.len());
     }
 
     #[test]

@@ -194,7 +194,9 @@ fn run_report(
     if let Some(out_path) = output {
         std::fs::write(out_path, &content)
             .with_context(|| format!("Failed to write report to {}", out_path.display()))?;
-        println!("Report saved to: {}", out_path.display());
+        if !crate::progress::is_quiet() {
+            println!("Report saved to: {}", out_path.display());
+        }
     } else {
         println!("{content}");
     }
@@ -304,7 +306,7 @@ fn run_fix(input: &PathBuf, output: &PathBuf, dry_run: bool, json_output: bool) 
                 "{}",
                 serde_json::json!({ "status": "no_issues", "message": "No fixable issues found" })
             );
-        } else {
+        } else if !crate::progress::is_quiet() {
             println!("{}", "No fixable QC issues found.".green());
         }
         return Ok(());
@@ -329,7 +331,7 @@ fn run_fix(input: &PathBuf, output: &PathBuf, dry_run: bool, json_output: bool) 
             "fixable_issues": fixes,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
-    } else {
+    } else if !crate::progress::is_quiet() {
         println!("{}", "QC Auto-Fix".green().bold());
         println!("  Input:  {}", input.display());
         println!("  Output: {}", output.display());

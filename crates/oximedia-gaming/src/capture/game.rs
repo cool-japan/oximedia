@@ -2,7 +2,7 @@
 //!
 //! Provides optimized capture profiles for different game genres.
 
-use crate::GamingResult;
+use crate::{GamingError, GamingResult};
 
 /// Game capture with genre-specific optimizations.
 pub struct GameCapture {
@@ -48,6 +48,74 @@ pub struct GameInfo {
     pub has_hardware_accel: bool,
 }
 
+/// Known process executable names mapped to a display title and the
+/// [`GameProfile`] [`GameCapture::auto_detect`] recommends for it.
+///
+/// Keys are lowercase, with any trailing `.exe` already stripped (see
+/// [`normalize_process_name`]) -- they are matched exactly, never as a
+/// substring, so a short key like `"cs2"` cannot accidentally match an
+/// unrelated process whose name merely contains it.
+///
+/// This is intentionally a small, best-effort sample (one well-known title
+/// per genre) rather than an exhaustive registry, in the same spirit as
+/// OBS Studio's built-in game-process list: growing it only grows the set
+/// of titles `auto_detect` can name, it never changes how the scan itself
+/// works.
+///
+/// `cfg`-gated together with its two lookup helpers below: they exist only
+/// to serve the non-`wasm32` branch of [`GameCapture::auto_detect`], so on
+/// `wasm32` they would otherwise be dead code.
+#[cfg(not(target_arch = "wasm32"))]
+const KNOWN_GAMES: &[(&str, &str, GameProfile)] = &[
+    ("csgo", "Counter-Strike: Global Offensive", GameProfile::Fps),
+    ("cs2", "Counter-Strike 2", GameProfile::Fps),
+    ("valorant-win64-shipping", "VALORANT", GameProfile::Fps),
+    ("r5apex", "Apex Legends", GameProfile::Fps),
+    (
+        "fortniteclient-win64-shipping",
+        "Fortnite",
+        GameProfile::Fps,
+    ),
+    ("overwatch", "Overwatch 2", GameProfile::Fps),
+    ("dota2", "Dota 2", GameProfile::Moba),
+    ("leagueclient", "League of Legends", GameProfile::Moba),
+    ("streetfighter6", "Street Fighter 6", GameProfile::Fighting),
+    ("tekken8", "Tekken 8", GameProfile::Fighting),
+    ("forzahorizon5", "Forza Horizon 5", GameProfile::Racing),
+    ("sc2", "StarCraft II", GameProfile::Strategy),
+    ("eldenring", "Elden Ring", GameProfile::Rpg),
+    ("witcher3", "The Witcher 3", GameProfile::Rpg),
+    ("celeste", "Celeste", GameProfile::Platformer),
+    ("hollowknight", "Hollow Knight", GameProfile::Platformer),
+];
+
+/// Normalize a raw OS process name for matching against [`KNOWN_GAMES`]:
+/// lowercased, with one trailing `.exe` stripped.
+///
+/// Process names returned by the OS process table are already bare
+/// executable names rather than full paths, so no path stripping is
+/// needed here.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+fn normalize_process_name(raw_name: &str) -> String {
+    let lower = raw_name.to_ascii_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+}
+
+/// Look up a raw OS process name in [`KNOWN_GAMES`].
+///
+/// Returns the display name and recommended [`GameProfile`] on an exact
+/// (case-insensitive, `.exe`-insensitive) match, `None` otherwise.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+fn match_known_game(raw_name: &str) -> Option<(&'static str, GameProfile)> {
+    let normalized = normalize_process_name(raw_name);
+    KNOWN_GAMES
+        .iter()
+        .find(|(key, _, _)| *key == normalized)
+        .map(|(_, display_name, profile)| (*display_name, *profile))
+}
+
 impl GameCapture {
     /// Create a new game capture with the given profile.
     #[must_use]
@@ -60,12 +128,74 @@ impl GameCapture {
 
     /// Auto-detect running games and select appropriate profile.
     ///
+    /// Scans the live OS process table (via `sysinfo`) and matches each
+    /// process's executable name against `KNOWN_GAMES`. This performs a
+    /// real scan, not a simulation: on a machine with no matching game
+    /// running (e.g. CI) it genuinely returns an empty list, and on a
+    /// machine that *is* running one of `KNOWN_GAMES` it returns a real
+    /// PID pulled from the OS.
+    ///
+    /// Detected entries carry `window_handle: 0` and `resolution: (0, 0)`:
+    /// resolving an actual window handle needs platform-specific window
+    /// enumeration (Win32 `HWND` / X11 `XID` / macOS `CGWindowID`), which
+    /// this crate does not implement -- callers resolve a real handle via
+    /// [`Self::attach`]. `has_hardware_accel` is always `false` because no
+    /// real hardware-acceleration probe is wired up (see
+    /// `encode::nvenc`/`encode::qsv`/`encode::vce`, whose own
+    /// `is_available()` are themselves still simulated).
+    ///
     /// # Errors
     ///
-    /// Returns error if game detection fails.
+    /// Returns [`GamingError::UnsupportedPlatform`] when there is no
+    /// process table to scan: on the `wasm32` target, and on any desktop
+    /// OS `sysinfo` itself does not support process enumeration for
+    /// (`sysinfo::IS_SUPPORTED_SYSTEM == false`).
     pub fn auto_detect() -> GamingResult<Vec<GameInfo>> {
-        // In a real implementation, this would scan running processes
-        Ok(Vec::new())
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(GamingError::UnsupportedPlatform(
+                "process enumeration requires an OS process table, which wasm32 does not have; \
+                 GameCapture::auto_detect cannot run in this build target"
+                    .to_string(),
+            ))
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !sysinfo::IS_SUPPORTED_SYSTEM {
+                return Err(GamingError::UnsupportedPlatform(
+                    "sysinfo has no process-enumeration backend for this operating system; \
+                     GameCapture::auto_detect is only implemented where sysinfo supports it \
+                     (Windows, macOS, Linux, FreeBSD, NetBSD)"
+                        .to_string(),
+                ));
+            }
+
+            // `nothing()` still populates each process's name and PID --
+            // those are fetched unconditionally during enumeration. Only
+            // the expensive extras (cmdline, environment, cwd, disk I/O,
+            // CPU%) are gated by `ProcessRefreshKind`, and this scan needs
+            // none of them.
+            let refresh = sysinfo::RefreshKind::nothing()
+                .with_processes(sysinfo::ProcessRefreshKind::nothing());
+            let system = sysinfo::System::new_with_specifics(refresh);
+
+            let mut detected = Vec::new();
+            for (pid, process) in system.processes() {
+                let raw_name = process.name().to_string_lossy();
+                if let Some((display_name, profile)) = match_known_game(&raw_name) {
+                    detected.push(GameInfo {
+                        name: display_name.to_string(),
+                        pid: pid.as_u32(),
+                        window_handle: 0,
+                        profile,
+                        resolution: (0, 0),
+                        has_hardware_accel: false,
+                    });
+                }
+            }
+            Ok(detected)
+        }
     }
 
     /// Attach to a specific game window.
@@ -229,9 +359,56 @@ mod tests {
 
     #[test]
     fn test_auto_detect() {
-        let games = GameCapture::auto_detect().expect("auto detect should succeed");
-        // Should return empty list if no games are running
-        assert_eq!(games.len(), 0);
+        // A real process-table scan cannot be asserted to an exact count:
+        // it is legitimately empty on a CI runner but may find a nonzero
+        // number of matches on a developer machine that happens to be
+        // running one of `KNOWN_GAMES`. Assert the scan succeeds and that
+        // whatever it returns is structurally valid, rather than pinning a
+        // length.
+        let games = GameCapture::auto_detect()
+            .expect("auto detect should succeed on a sysinfo-supported platform");
+        for game in &games {
+            assert!(!game.name.is_empty());
+            assert!(game.pid > 0);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_match_known_game_exact_hits() {
+        assert_eq!(
+            match_known_game("csgo.exe"),
+            Some(("Counter-Strike: Global Offensive", GameProfile::Fps))
+        );
+        assert_eq!(
+            match_known_game("CS2.EXE"),
+            Some(("Counter-Strike 2", GameProfile::Fps))
+        );
+        assert_eq!(
+            match_known_game("dota2"),
+            Some(("Dota 2", GameProfile::Moba))
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_match_known_game_rejects_unrelated_processes() {
+        // Regression guard: these must NOT match despite containing a
+        // KNOWN_GAMES key as a substring (e.g. "cs2" inside "cs2ools"),
+        // and common dev-machine/CI processes must never false-positive.
+        assert_eq!(match_known_game("cargo"), None);
+        assert_eq!(match_known_game("rustc"), None);
+        assert_eq!(match_known_game("zsh"), None);
+        assert_eq!(match_known_game("cs2ools"), None);
+        assert_eq!(match_known_game(""), None);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_normalize_process_name() {
+        assert_eq!(normalize_process_name("CSGO.EXE"), "csgo");
+        assert_eq!(normalize_process_name("dota2"), "dota2");
+        assert_eq!(normalize_process_name("Overwatch"), "overwatch");
     }
 
     #[test]

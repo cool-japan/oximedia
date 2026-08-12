@@ -95,7 +95,7 @@ pub fn kalman_filter(
 
         kalman_filter_plane(
             input_plane.data.as_ref(),
-            &mut plane.data.clone(),
+            plane.data.as_mut(),
             state,
             width as usize,
             height as usize,

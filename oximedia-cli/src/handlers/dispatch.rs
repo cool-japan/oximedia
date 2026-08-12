@@ -211,6 +211,7 @@ pub(crate) async fn handle_captions_command(
             output,
             font_size,
             font_color,
+            font,
         } => {
             let opts = captions_cmd::CaptionsBurnOptions {
                 video,
@@ -218,6 +219,7 @@ pub(crate) async fn handle_captions_command(
                 output,
                 font_size,
                 font_color,
+                font,
             };
             captions_cmd::run_captions_burn(opts, json_output).await
         }

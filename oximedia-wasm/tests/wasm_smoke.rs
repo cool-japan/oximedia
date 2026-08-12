@@ -4,10 +4,15 @@
 //! JavaScript callers:
 //!
 //! - Real magic-byte format detection (`probe_format`).
-//! - `WasmDemuxer`'s honesty contract: `probe()` must return an honest
-//!   `Err` for every container format rather than fabricating a plausible
-//!   stream/packet, since full per-container parsing is not wired in yet
-//!   (see `src/demuxer.rs` module docs).
+//! - `WasmDemuxer`'s real demux path: `probe()`/`streams()`/`read_packet()`
+//!   are backed by the actual `oximedia-container` per-format demuxers (see
+//!   `src/demuxer.rs` module docs) -- `real_wav_round_trip_demuxes_actual_packets`
+//!   below feeds it a genuine (if minimal) WAV file and checks the streams
+//!   and packet bytes it returns are the real ones, not fabricated.
+//! - `WasmDemuxer`'s honesty contract for inputs that are *not* a real,
+//!   complete container: `probe()` must return an honest `Err` rather than
+//!   fabricating a plausible stream/packet (see the deliberately truncated
+//!   fixtures below).
 //! - `WasmStreamingDemuxer`'s equivalent honesty contract for the
 //!   chunk-oriented API (see `src/streaming_demuxer.rs` module docs).
 //! - Real, deterministic content hashing (`probe_hash`) that reflects the
@@ -80,12 +85,74 @@ fn probe_format_rejects_garbage() {
     );
 }
 
+/// Builds a real, minimal WAV file (RIFF/WAVE header + `fmt ` chunk + `data`
+/// chunk) directly, byte-for-byte -- mirrors the `make_sine_wav` pattern in
+/// `oximedia-cli/src/decode_helper.rs`'s tests, simplified to constant PCM
+/// since this test only checks byte counts/stream info, not audio content.
+fn make_wav_bytes(sample_rate: u32, channels: u16, num_frames: u32) -> Vec<u8> {
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample / 8);
+    let block_align = channels * (bits_per_sample / 8);
+    let data_size = num_frames * u32::from(channels) * u32::from(bits_per_sample / 8);
+    let file_size = 36 + data_size;
+
+    let mut buf = Vec::with_capacity(44 + data_size as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&file_size.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&bits_per_sample.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_size.to_le_bytes());
+    buf.extend(std::iter::repeat_n(0u8, data_size as usize));
+    buf
+}
+
+#[wasm_bindgen_test]
+fn real_wav_round_trip_demuxes_actual_packets() {
+    // Flipped from the old "asserts unavailability" shape: this is a real,
+    // complete, decodable WAV file, and `WasmDemuxer` is now backed by the
+    // real `oximedia-container` demuxers -- probe/streams/read_packet must
+    // all succeed and return the genuine parsed data, not fabricate it.
+    let data = make_wav_bytes(44100, 2, 512);
+    let mut demuxer = oximedia_wasm::WasmDemuxer::new(&data);
+    let probe = demuxer.probe().expect("a real, complete WAV must probe");
+    assert_eq!(probe.format(), "Wav");
+
+    let streams = demuxer.streams();
+    assert_eq!(streams.len(), 1, "exactly one real PCM stream");
+    assert_eq!(streams[0].codec(), "Pcm");
+    assert_eq!(streams[0].codec_params().sample_rate(), Some(44100));
+    assert_eq!(streams[0].codec_params().channels(), Some(2));
+
+    let mut total_bytes = 0usize;
+    loop {
+        let packet = demuxer.read_packet().expect("read_packet must not error");
+        let Some(packet) = packet else { break };
+        total_bytes += packet.size();
+    }
+    assert_eq!(
+        total_bytes,
+        512 * 2 * 2,
+        "every real PCM byte must be accounted for across packets"
+    );
+    assert!(demuxer.is_eof());
+}
+
 #[wasm_bindgen_test]
 fn demuxer_probe_is_honest_not_fabricated() {
     // The demuxer must never invent a stream/packet it did not actually
-    // parse. Until real container parsing is wired in (see the
-    // `TODO(0.2.x)` markers in `src/demuxer.rs`), `probe()` must fail
-    // loudly instead of returning a fake single-stream guess.
+    // parse. `tiny_flac_bytes()` is real FLAC magic followed by a
+    // STREAMINFO block header declaring 34 bytes of data that are never
+    // actually present -- the real FLAC demuxer (see `src/demuxer.rs`
+    // module docs) genuinely cannot parse this, so `probe()` must fail for
+    // that real reason, never by fabricating a plausible stream.
     let data = tiny_flac_bytes();
     let mut demuxer = oximedia_wasm::WasmDemuxer::new(&data);
     let result = demuxer.probe();

@@ -2,24 +2,40 @@
 //!
 //! Provides utilities for processing multiple audio files with normalization.
 //!
-//! # Supported input/output format
+//! # Supported input/output formats
 //!
 //! This module decodes and encodes **WAV** (PCM / IEEE float, via
-//! [`oximedia_audio::wav`]) — the format `oximedia-audio`'s pure-Rust codec
-//! already fully round-trips. Any file that is not a valid WAV stream produces an
-//! honest per-file [`NormalizeError`] (surfaced as `Err` from [`BatchProcessor::process_file`],
-//! or as a failed [`BatchResult`] entry from [`BatchProcessor::process_directory`] /
-//! [`BatchProcessor::process_files`]) rather than a fabricated success.
+//! [`oximedia_audio::wav`]) and **FLAC** (RFC 9639, via
+//! [`oximedia_codec::flac`] — bit-exact vs libFLAC/ffmpeg per that crate's own
+//! module docs). Input is sniffed by magic bytes (`codecs::decode_input`); output
+//! defaults to the same container as the input, or [`BatchConfig::output_format`]
+//! when set. Two further formats are *recognized* but deliberately refused rather
+//! than decoded:
 //!
-//! `// TODO(0.2.x):` additional codecs (MP3/FLAC/Opus/etc.) can be wired in here
-//! once this module needs to support them — the two-pass analyze → gain → process
-//! pipeline in [`process_decoded`] is already format-agnostic (it only needs
-//! decoded `f32` samples plus a sample rate / channel count).
+//! - **Opus** (Ogg): the in-tree Opus decoder was empirically found untrustworthy
+//!   this session — real CELT packets decode to silence — so batch normalize
+//!   refuses to measure/gain it rather than report a fabricated success over
+//!   silence.
+//! - **MP3**: not wired into this crate's dependency graph (an MP3 decoder exists
+//!   at `oximedia-audio::mp3`, but this crate does not yet depend on it for batch
+//!   processing).
+//!
+//! Any other file that is not a valid WAV stream produces an honest per-file
+//! [`NormalizeError`] (surfaced as `Err` from [`BatchProcessor::process_file`], or
+//! as a failed [`BatchResult`] entry from [`BatchProcessor::process_directory`] /
+//! [`BatchProcessor::process_files`]) rather than a fabricated success. The
+//! two-pass analyze → gain → process pipeline in `process_decoded` itself stays
+//! format-agnostic — it only needs decoded `f32` samples plus a sample rate /
+//! channel count, carried generically in an [`oximedia_audio::wav::WavSpec`]
+//! regardless of which codec produced them.
+
+mod codecs;
 
 use crate::{
-    AnalysisResult, LoudnessAnalyzer, NormalizationProcessor, NormalizeError, NormalizeResult,
-    ProcessorConfig, ReplayGainCalculator, ReplayGainValues,
+    AnalysisResult, LoudnessAnalyzer, LoudnessMetadata, NormalizationProcessor, NormalizeError,
+    NormalizeResult, ProcessorConfig, ReplayGainCalculator, ReplayGainValues,
 };
+use codecs::Container;
 use oximedia_audio::wav::{WavReader, WavSpec, WavWriter};
 use oximedia_metering::Standard;
 use std::fs::File;
@@ -40,16 +56,32 @@ pub struct BatchConfig {
     /// Enable dynamic range compression.
     pub enable_drc: bool,
 
-    /// Write loudness metadata tags.
+    /// Write loudness metadata tags to the output file.
     ///
-    /// `// TODO(0.2.x):` not yet honored by [`BatchProcessor::process_file`] — see
-    /// the module docs on [`process_decoded`] for what a real implementation needs.
+    /// Measured on the actual *output* samples (post-gain/limiter/DRC), not the
+    /// pre-gain input, so the embedded values describe the bytes being written.
+    /// WAV output gets a real BWF `bext` chunk (EBU Tech 3285 v2 loudness fields:
+    /// `LoudnessValue`/`LoudnessRange`/`MaxTruePeakLevel`/`MaxMomentaryLoudness`/
+    /// `MaxShortTermLoudness`). FLAC output gets a VORBIS_COMMENT metadata block
+    /// with `LOUDNESS_*`/`NORMALIZATION_*`/`REPLAYGAIN_*` (when
+    /// [`write_replaygain`](Self::write_replaygain) is also set)/`R128_*`/
+    /// `iTunNORM` tags — see [`crate::metadata::LoudnessMetadata::to_tags`].
     pub write_metadata: bool,
 
     /// Calculate and write ReplayGain tags.
     pub write_replaygain: bool,
 
-    /// Output format (None = same as input).
+    /// Output container: `"wav"` or `"flac"` (case-insensitive), or `None` for
+    /// "same as input".
+    ///
+    /// Honored by [`BatchProcessor::process_file`] / [`BatchProcessor::process_files`]
+    /// (which take an explicit, caller-owned `output_path`) and by
+    /// [`BatchProcessor::process_directory`] for the *encoded content* — but
+    /// `process_directory` always names each output after its input file
+    /// (including extension), so overriding the container there can leave a
+    /// filename/content mismatch (e.g. FLAC bytes in a `.wav`-named file). Prefer
+    /// `process_file`/`process_files` with an explicitly-chosen output path when
+    /// overriding the format for directory-style batches.
     pub output_format: Option<String>,
 
     /// Maximum gain adjustment in dB.
@@ -175,17 +207,19 @@ impl BatchProcessor {
         Self { config }
     }
 
-    /// Process a single WAV file: decode, run the real two-pass loudness
-    /// normalization pipeline, and write the normalized output.
+    /// Process a single audio file (WAV or FLAC — see the module docs): decode, run
+    /// the real two-pass loudness normalization pipeline, and write the normalized
+    /// output.
     ///
     /// `sample_rate` / `channels` are validated against the file's own decoded
-    /// format (a WAV file is self-describing) — a mismatch is a caller error and
-    /// is reported as [`NormalizeError::InvalidConfig`] rather than silently
-    /// measuring/processing the audio under the wrong assumptions.
+    /// format (both WAV and FLAC are self-describing) — a mismatch is a caller
+    /// error and is reported as [`NormalizeError::InvalidConfig`] rather than
+    /// silently measuring/processing the audio under the wrong assumptions.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be decoded as WAV, if `sample_rate` /
+    /// Returns an error if the file cannot be decoded (including a recognized but
+    /// unsupported format — Opus or MP3, see the module docs), if `sample_rate` /
     /// `channels` do not match the file's actual format, or if analysis/processing/
     /// encoding fails.
     pub fn process_file(
@@ -197,7 +231,7 @@ impl BatchProcessor {
     ) -> NormalizeResult<BatchResult> {
         let start_time = Instant::now();
 
-        let (samples, spec) = decode_wav(input_path)?;
+        let (samples, spec, source_format) = codecs::decode_input(input_path)?;
 
         if spec.channels as usize != channels {
             return Err(NormalizeError::InvalidConfig(format!(
@@ -216,7 +250,14 @@ impl BatchProcessor {
             )));
         }
 
-        self.process_decoded(input_path, output_path, samples, spec, start_time)
+        self.process_decoded(
+            input_path,
+            output_path,
+            samples,
+            spec,
+            source_format,
+            start_time,
+        )
     }
 
     /// Process all files in a directory: every regular file in `input_dir` (no
@@ -225,9 +266,9 @@ impl BatchProcessor {
     /// `Vec` always reflects the directory's real contents instead of an
     /// unconditional empty result.
     ///
-    /// Sample rate and channel count are taken from each file's own decoded WAV
-    /// header (there is no single external hint to validate against, unlike
-    /// [`Self::process_file`]).
+    /// Sample rate and channel count are taken from each file's own decoded header
+    /// (WAV `fmt ` or FLAC STREAMINFO — there is no single external hint to
+    /// validate against, unlike [`Self::process_file`]).
     ///
     /// # Errors
     ///
@@ -278,8 +319,8 @@ impl BatchProcessor {
                 continue;
             }
 
-            let outcome = decode_wav(&input_path).and_then(|(samples, spec)| {
-                self.process_decoded(&input_path, &output_path, samples, spec, start_time)
+            let outcome = codecs::decode_input(&input_path).and_then(|(samples, spec, fmt)| {
+                self.process_decoded(&input_path, &output_path, samples, spec, fmt, start_time)
             });
             match outcome {
                 Ok(result) => results.push(result),
@@ -353,15 +394,17 @@ impl BatchProcessor {
 
     /// Core two-pass pipeline shared by [`Self::process_file`] and
     /// [`Self::process_directory`]: analyze the real decoded `samples`, compute
-    /// and apply gain (with optional limiter/DRC), write the normalized output,
-    /// and — when configured — compute real ReplayGain values from the same
-    /// samples.
+    /// and apply gain (with optional limiter/DRC), write the normalized output in
+    /// the resolved output container (see [`BatchConfig::output_format`]), embed
+    /// real loudness metadata when [`BatchConfig::write_metadata`] is set, and —
+    /// when configured — compute real ReplayGain values from the same samples.
     fn process_decoded(
         &self,
         input_path: &Path,
         output_path: &Path,
         samples: Vec<f32>,
         spec: WavSpec,
+        source_format: Container,
         start_time: Instant,
     ) -> NormalizeResult<BatchResult> {
         if samples.is_empty() {
@@ -397,8 +440,67 @@ impl BatchProcessor {
         let mut output_samples = vec![0.0_f32; samples.len()];
         processor.process_f32(&samples, &mut output_samples, gain_db)?;
 
-        // Write the real, normalized audio to disk (not a placeholder / no-op).
-        encode_wav(output_path, &output_samples, spec)?;
+        // Calculate ReplayGain from the same real (pre-gain) samples (not an empty
+        // meter) — computed here, ahead of encoding, so write_metadata can embed it
+        // alongside the loudness tags below.
+        let replay_gain = if self.config.write_replaygain {
+            let mut rg_calc = ReplayGainCalculator::new(sample_rate, channels)?;
+            rg_calc.process_f32(&samples);
+            rg_calc.calculate().ok()
+        } else {
+            None
+        };
+
+        // Loudness metadata for embedding describes the *output* — the bytes
+        // actually being written — so it is measured on `output_samples` (post
+        // gain/limiter/DRC), not the pre-gain `analysis` above. Gated behind
+        // `write_metadata` so the extra analyzer pass is opt-in.
+        let embed_metadata = if self.config.write_metadata {
+            let mut output_analyzer =
+                LoudnessAnalyzer::new(self.config.standard, sample_rate, channels)?;
+            output_analyzer.process_f32(&output_samples);
+            let mut metadata = LoudnessMetadata::from_analysis(output_analyzer.result(), gain_db);
+            if let Some(ref rg) = replay_gain {
+                metadata = metadata.with_replay_gain(rg.clone());
+            }
+            Some(metadata)
+        } else {
+            None
+        };
+
+        // Write the real, normalized audio to disk (not a placeholder / no-op), in
+        // whichever real container the output resolves to.
+        match codecs::resolve_output_container(source_format, self.config.output_format.as_deref())?
+        {
+            Container::Wav => {
+                encode_wav(output_path, &output_samples, spec)?;
+                if let Some(ref metadata) = embed_metadata {
+                    let loudness = codecs::LoudnessFields {
+                        integrated_lufs: metadata.integrated_lufs,
+                        loudness_range: metadata.loudness_range,
+                        true_peak_dbtp: metadata.true_peak_dbtp,
+                        max_momentary_lufs: metadata
+                            .r128_metadata
+                            .as_ref()
+                            .map_or(f64::NAN, |r| r.max_momentary),
+                        max_short_term_lufs: metadata
+                            .r128_metadata
+                            .as_ref()
+                            .map_or(f64::NAN, |r| r.max_short_term),
+                    };
+                    codecs::write_wav_bext(output_path, spec, &loudness)?;
+                }
+            }
+            Container::Flac => {
+                let vorbis_tags = embed_metadata.as_ref().map(|m| m.to_tags().entries);
+                codecs::encode_flac_output(
+                    output_path,
+                    &output_samples,
+                    spec,
+                    vorbis_tags.as_deref(),
+                )?;
+            }
+        }
 
         let processing_time = start_time.elapsed().as_secs_f64();
         let mut result = BatchResult::success(
@@ -408,21 +510,9 @@ impl BatchProcessor {
             gain_db,
             processing_time,
         );
-
-        // Calculate ReplayGain from the same real samples (not an empty meter).
-        if self.config.write_replaygain {
-            let mut rg_calc = ReplayGainCalculator::new(sample_rate, channels)?;
-            rg_calc.process_f32(&samples);
-            if let Ok(rg) = rg_calc.calculate() {
-                result = result.with_replay_gain(rg);
-            }
+        if let Some(rg) = replay_gain {
+            result = result.with_replay_gain(rg);
         }
-
-        // TODO(0.2.x): honor `self.config.write_metadata` by embedding loudness /
-        // ReplayGain tags into the output container — e.g. append an `"id3 "` RIFF
-        // sub-chunk built from `oximedia_metadata::{Metadata, MetadataFormat::Id3v2}`
-        // and repatch the RIFF size field. Not implemented this pass;
-        // `BatchConfig::write_metadata` is currently inert for WAV output.
 
         Ok(result)
     }
@@ -519,6 +609,33 @@ fn encode_wav(path: &Path, samples: &[f32], spec: WavSpec) -> NormalizeResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oximedia_codec::flac::{FlacConfig, FlacDecoder, FlacEncoder};
+
+    /// Write a real mono FLAC file (16-bit) containing a sine wave at the given
+    /// linear-i16 amplitude, via the real [`FlacEncoder`], and return the raw
+    /// interleaved i32 PCM that was encoded (for exact-length / cross-checks).
+    fn write_sine_flac(path: &Path, sample_rate: u32, amplitude: f64, secs: f64) -> Vec<i32> {
+        let n = (f64::from(sample_rate) * secs) as usize;
+        let pcm: Vec<i32> = (0..n)
+            .map(|i| {
+                (amplitude
+                    * (std::f64::consts::TAU * 1000.0 * i as f64 / f64::from(sample_rate)).sin())
+                    as i32
+            })
+            .collect();
+        let mut encoder = FlacEncoder::new(FlacConfig {
+            sample_rate,
+            channels: 1,
+            bits_per_sample: 16,
+        });
+        let (_provisional_header, frames) = encoder.encode(&pcm).expect("encode test flac");
+        let mut stream = encoder.finalized_stream_header();
+        for frame in &frames {
+            stream.extend_from_slice(&frame.data);
+        }
+        std::fs::write(path, &stream).expect("write test flac");
+        pcm
+    }
 
     /// Write a real mono WAV file (16-bit PCM) containing a sine wave of the given
     /// linear amplitude, and return the samples that were written.
@@ -763,5 +880,397 @@ mod tests {
         assert!(matches!(result, Err(NormalizeError::InvalidConfig(_))));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── FLAC end-to-end ──────────────────────────────────────────────────────
+
+    /// FLAC batch round-trip: decode a real quiet FLAC file, normalize it, re-encode
+    /// to FLAC, then *independently* re-decode the output (a fresh `FlacDecoder`,
+    /// not any state `process_file` used) and re-measure its loudness — proving the
+    /// written bytes, not just the in-process `BatchResult`, actually converge
+    /// toward the configured target.
+    #[test]
+    fn test_process_file_flac_round_trip_reaches_loudness_target() {
+        let dir = std::env::temp_dir().join("oximedia_batch_flac_roundtrip_test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let input_path = dir.join("quiet.flac");
+        let output_path = dir.join("normalized.flac");
+
+        let sample_rate = 44_100u32;
+        let standard = Standard::Spotify; // target -14.0 LUFS
+        let input_pcm = write_sine_flac(&input_path, sample_rate, 2000.0, 3.0);
+
+        let config = BatchConfig {
+            standard,
+            enable_limiter: false,
+            enable_drc: false,
+            write_metadata: false,
+            write_replaygain: false,
+            output_format: None,
+            max_gain_db: 40.0,
+            overwrite: true,
+            parallel: false,
+        };
+        let processor = BatchProcessor::new(config);
+
+        let result = processor
+            .process_file(&input_path, &output_path, f64::from(sample_rate), 1)
+            .expect("process_file should decode, gain, and re-encode real FLAC end-to-end");
+        assert!(result.success);
+        assert!(
+            result.applied_gain_db > 1.0,
+            "a quiet input targeting -14 LUFS should need a substantial positive gain, got {}",
+            result.applied_gain_db
+        );
+
+        // Independently re-decode the output and re-measure — this is the
+        // "loudness target assertion (re-measure output)" check.
+        let data = std::fs::read(&output_path).expect("read output flac");
+        let mut decoder = FlacDecoder::new();
+        let decoded_pcm = decoder.decode_stream(&data).expect("decode output flac");
+        let info = decoder
+            .stream_info()
+            .expect("decoded output must carry STREAMINFO");
+        assert_eq!(info.channels, 1);
+        assert_eq!(info.sample_rate, sample_rate);
+        assert_eq!(decoded_pcm.len(), input_pcm.len());
+
+        let decoded_f32: Vec<f32> = decoded_pcm.iter().map(|&s| s as f32 / 32_768.0).collect();
+        let mut output_analyzer =
+            LoudnessAnalyzer::new(standard, f64::from(sample_rate), 1).expect("create analyzer");
+        output_analyzer.process_f32(&decoded_f32);
+        let output_lufs = output_analyzer.result().integrated_lufs;
+        assert!(
+            (output_lufs - standard.target_lufs()).abs() < 0.5,
+            "re-measured FLAC output loudness ({output_lufs} LUFS) should converge near the \
+             target ({} LUFS)",
+            standard.target_lufs()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `output_format` override: FLAC input, `output_format = Some("wav")` must
+    /// produce a real, independently-decodable WAV file despite the FLAC source.
+    #[test]
+    fn test_process_file_output_format_override_flac_to_wav() {
+        let dir = std::env::temp_dir().join("oximedia_batch_output_format_override_test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let input_path = dir.join("in.flac");
+        let output_path = dir.join("out.wav");
+
+        let sample_rate = 44_100u32;
+        let input_pcm = write_sine_flac(&input_path, sample_rate, 3000.0, 1.0);
+
+        let config = BatchConfig {
+            standard: Standard::EbuR128,
+            enable_limiter: false,
+            enable_drc: false,
+            write_metadata: false,
+            write_replaygain: false,
+            output_format: Some("wav".to_string()),
+            max_gain_db: 40.0,
+            overwrite: true,
+            parallel: false,
+        };
+        let processor = BatchProcessor::new(config);
+        let result = processor
+            .process_file(&input_path, &output_path, f64::from(sample_rate), 1)
+            .expect("process_file with output_format override should succeed");
+        assert!(result.success);
+
+        let (samples, spec) = decode_wav(&output_path).expect("output must be a real WAV file");
+        assert_eq!(spec.sample_rate, sample_rate);
+        assert_eq!(samples.len(), input_pcm.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_process_file_rejects_unknown_output_format() {
+        let dir = std::env::temp_dir().join("oximedia_batch_bad_output_format_test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let input_path = dir.join("in.wav");
+        let output_path = dir.join("out.mp3");
+        write_sine_wav(&input_path, 44_100, 0.2, 0.3);
+
+        let config = BatchConfig {
+            output_format: Some("mp3".to_string()),
+            ..BatchConfig::minimal(Standard::EbuR128)
+        };
+        let processor = BatchProcessor::new(config);
+        let result = processor.process_file(&input_path, &output_path, 44_100.0, 1);
+        assert!(matches!(result, Err(NormalizeError::InvalidConfig(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── write_metadata ───────────────────────────────────────────────────────
+
+    /// `write_metadata=true` on WAV output must embed a real BWF `bext` chunk whose
+    /// `LoudnessValue` is a plausible, finite LUFS reading near the configured
+    /// standard's target (the metadata is measured on the *output*, i.e. post-gain,
+    /// samples — see [`BatchConfig::write_metadata`]).
+    #[test]
+    fn test_process_file_write_metadata_embeds_wav_bext_loudness() {
+        let dir = std::env::temp_dir().join("oximedia_batch_write_metadata_wav_test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let input_path = dir.join("quiet.wav");
+        let output_path = dir.join("out.wav");
+
+        let sample_rate = 48_000u32;
+        write_sine_wav(&input_path, sample_rate, 0.05, 2.0);
+
+        let config = BatchConfig {
+            standard: Standard::EbuR128,
+            enable_limiter: false,
+            enable_drc: false,
+            write_metadata: true,
+            write_replaygain: true,
+            output_format: None,
+            max_gain_db: 40.0,
+            overwrite: true,
+            parallel: false,
+        };
+        let processor = BatchProcessor::new(config);
+        let result = processor
+            .process_file(&input_path, &output_path, f64::from(sample_rate), 1)
+            .expect("process_file should succeed");
+        assert!(result.success);
+
+        // The file must still be a valid, fully decodable WAV after the bext append.
+        let file = File::open(&output_path).expect("open output wav");
+        let mut reader = WavReader::new(BufReader::new(file)).expect("parse output wav");
+        assert!(!reader
+            .read_samples_f32()
+            .expect("decode samples")
+            .is_empty());
+
+        let bext = reader
+            .extra_chunks()
+            .iter()
+            .find(|c| &c.id == b"bext")
+            .expect("write_metadata=true must embed a bext chunk for WAV output");
+
+        // LoudnessValue is the first WORD after Description..UMID
+        // (256+32+32+10+8+4+4+2+64 = 412), per EBU Tech 3285 v2.
+        let loudness_value_off = 412;
+        let loudness_value = i16::from_le_bytes([
+            bext.data[loudness_value_off],
+            bext.data[loudness_value_off + 1],
+        ]);
+        let embedded_lufs = f64::from(loudness_value) / 100.0;
+        assert!(
+            embedded_lufs.is_finite() && (-70.0..0.0).contains(&embedded_lufs),
+            "embedded LoudnessValue {embedded_lufs} should be a real, finite LUFS reading"
+        );
+        assert!(
+            (embedded_lufs - Standard::EbuR128.target_lufs()).abs() < 1.0,
+            "embedded (post-gain, re-measured) loudness {embedded_lufs} should be close to the \
+             EBU R128 target {}",
+            Standard::EbuR128.target_lufs()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `write_metadata=true` on FLAC output must embed a real VORBIS_COMMENT block
+    /// carrying loudness / normalization / `ReplayGain` / R128 tags, and the frames
+    /// following it must still decode correctly (the inserted metadata block must
+    /// not corrupt frame parsing).
+    #[test]
+    fn test_process_file_write_metadata_embeds_flac_vorbis_tags() {
+        let dir = std::env::temp_dir().join("oximedia_batch_write_metadata_flac_test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let input_path = dir.join("quiet.flac");
+        let output_path = dir.join("out.flac");
+
+        let sample_rate = 44_100u32;
+        let input_pcm = write_sine_flac(&input_path, sample_rate, 1500.0, 2.0);
+
+        let config = BatchConfig {
+            standard: Standard::Spotify,
+            enable_limiter: false,
+            enable_drc: false,
+            write_metadata: true,
+            write_replaygain: true,
+            output_format: None,
+            max_gain_db: 40.0,
+            overwrite: true,
+            parallel: false,
+        };
+        let processor = BatchProcessor::new(config);
+        let result = processor
+            .process_file(&input_path, &output_path, f64::from(sample_rate), 1)
+            .expect("process_file should succeed");
+        assert!(result.success);
+
+        let data = std::fs::read(&output_path).expect("read output flac");
+
+        // Frames after the inserted VORBIS_COMMENT block must still decode.
+        let mut full_decoder = FlacDecoder::new();
+        let decoded = full_decoder
+            .decode_stream(&data)
+            .expect("decode_stream must still succeed with VORBIS_COMMENT present");
+        assert_eq!(decoded.len(), input_pcm.len());
+
+        let mut decoder = FlacDecoder::new();
+        decoder
+            .parse_metadata(&data)
+            .expect("parse_metadata should succeed");
+        let comments = decoder
+            .comment_block()
+            .expect("write_metadata=true must embed a VORBIS_COMMENT block for FLAC output");
+        let get = |key: &str| {
+            comments
+                .comments
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert!(
+            get("LOUDNESS_INTEGRATED").is_some(),
+            "expected a LOUDNESS_INTEGRATED tag"
+        );
+        assert!(
+            get("NORMALIZATION_GAIN").is_some(),
+            "expected a NORMALIZATION_GAIN tag"
+        );
+        assert!(
+            get("REPLAYGAIN_TRACK_GAIN").is_some(),
+            "write_replaygain=true should add REPLAYGAIN_* tags"
+        );
+        assert!(
+            get("R128_TRACK_LOUDNESS").is_some(),
+            "expected an R128_TRACK_LOUDNESS tag"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Opus / MP3: honest per-file errors, never silence or a silent skip ──────
+
+    /// Opus input must fail with an error explaining the in-tree decoder is
+    /// untrustworthy — not decode to (fabricated) silence, and not a generic/
+    /// unrelated parse error.
+    #[test]
+    fn test_process_file_opus_input_is_honest_error_not_silence() {
+        let dir = std::env::temp_dir().join("oximedia_batch_opus_process_file_test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let input_path = dir.join("clip.opus");
+        let output_path = dir.join("out.wav");
+        std::fs::write(&input_path, pseudo_opus_bytes()).expect("write pseudo-opus file");
+
+        let processor = BatchProcessor::new(BatchConfig::minimal(Standard::EbuR128));
+        let result = processor.process_file(&input_path, &output_path, 48_000.0, 1);
+        match result {
+            Err(NormalizeError::UnsupportedFormat(msg)) => {
+                assert!(
+                    msg.contains("untrustworthy") && msg.contains("silence"),
+                    "Opus error must explain the decoder is untrustworthy (CELT decodes to \
+                     silence), got: {msg}"
+                );
+            }
+            other => panic!("expected an honest UnsupportedFormat error for Opus, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `process_directory` must surface Opus/MP3 inputs as failed [`BatchResult`]
+    /// entries carrying a real, descriptive error — never a crash, never a silent
+    /// skip — while a genuine WAV file in the same directory still succeeds.
+    #[test]
+    fn test_process_directory_surfaces_opus_and_mp3_as_failed_results() {
+        let dir = std::env::temp_dir().join("oximedia_batch_opus_mp3_process_directory_test");
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        write_sine_wav(&dir.join("real.wav"), 44_100, 0.1, 0.5);
+        std::fs::write(dir.join("clip.opus"), pseudo_opus_bytes()).expect("write pseudo-opus");
+        std::fs::write(dir.join("clip.mp3"), pseudo_mp3_bytes()).expect("write pseudo-mp3");
+
+        let config = BatchConfig {
+            standard: Standard::EbuR128,
+            enable_limiter: false,
+            enable_drc: false,
+            write_metadata: false,
+            write_replaygain: false,
+            output_format: None,
+            max_gain_db: 40.0,
+            overwrite: true,
+            parallel: false,
+        };
+        let processor = BatchProcessor::new(config);
+
+        let results = processor.process_directory(&dir, &out_dir).expect(
+            "process_directory itself must not crash / top-level-error on unsupported formats",
+        );
+
+        assert_eq!(
+            results.len(),
+            3,
+            "every input file must produce exactly one result -- not silently skipped"
+        );
+
+        let wav_result = results
+            .iter()
+            .find(|r| r.input_path.ends_with("real.wav"))
+            .expect("wav result present");
+        assert!(wav_result.success, "the real WAV file must still succeed");
+
+        let opus_result = results
+            .iter()
+            .find(|r| r.input_path.ends_with("clip.opus"))
+            .expect("opus result present");
+        assert!(
+            !opus_result.success,
+            "not a crash: a failed BatchResult, not a panic"
+        );
+        let opus_err = opus_result
+            .error
+            .as_deref()
+            .expect("opus failure must carry an error message");
+        assert!(
+            opus_err.contains("untrustworthy") && opus_err.contains("silence"),
+            "got: {opus_err}"
+        );
+
+        let mp3_result = results
+            .iter()
+            .find(|r| r.input_path.ends_with("clip.mp3"))
+            .expect("mp3 result present");
+        assert!(!mp3_result.success);
+        let mp3_err = mp3_result
+            .error
+            .as_deref()
+            .expect("mp3 failure must carry an error message");
+        assert!(mp3_err.contains("MP3"), "got: {mp3_err}");
+        assert!(
+            !mp3_err.contains("no decoder in tree"),
+            "must not claim no MP3 decoder exists anywhere -- oximedia-audio has one, it is \
+             simply not wired into this batch path; got: {mp3_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal but structurally real Ogg page containing an `OpusHead` ID header,
+    /// for sniff-detection tests. Not a decodable Opus stream (no audio packets) —
+    /// only the container-identification magic is exercised.
+    fn pseudo_opus_bytes() -> Vec<u8> {
+        let mut data = b"OggS".to_vec();
+        data.extend_from_slice(&[0u8; 22]); // rest of the fixed Ogg page header
+        data.push(1); // 1 segment
+        data.push(19); // segment length
+        data.extend_from_slice(b"OpusHead\x01\x02\x00\x00\x80\xbb\x00\x00\x00\x00\x00");
+        data
+    }
+
+    /// A minimal ID3v2-tagged byte sequence, for MP3 sniff-detection tests.
+    fn pseudo_mp3_bytes() -> Vec<u8> {
+        let mut data = b"ID3\x03\x00\x00\x00\x00\x00\x00".to_vec();
+        data.extend_from_slice(&[0u8; 32]);
+        data
     }
 }

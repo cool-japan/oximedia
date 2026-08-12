@@ -12,6 +12,8 @@
 //! - **Digital Peak Meter** - Sample-accurate peak detection in dBFS
 //! - **RMS Level Meter** - Root mean square level measurement
 //! - **LUFS Meter** - Integrated with existing loudness module (EBU R128)
+//! - **Batch Meter** ([`batch::BatchMeterProcessor`]) - peak / RMS / true-peak
+//!   for many channels in a single allocation-free pass (mixing-console style)
 //!
 //! ## Frequency Meters
 //!
@@ -124,10 +126,34 @@
 //!     println!("Warning: Phase issues detected");
 //! }
 //! ```
+//!
+//! # Files in this directory that are deliberately not modules
+//!
+//! `meters/itu.rs` and `meters/dolby.rs` exist on disk but are **not** declared
+//! here, so they are not compiled. This is intentional, not an oversight:
+//!
+//! - **`itu.rs`** would add a *third* ITU-R BS.1770-4 loudness meter alongside
+//!   [`crate::loudness`] and `oximedia_metering::ebu_r128_impl`, and its
+//!   `Bs1770Meter` computes ITU channel weights but never applies them (5.1
+//!   LFE would be metered at weight 1.0 instead of 0.0), while its
+//!   `true_peak_dbtp` is a plain sample peak with no oversampling. It also has
+//!   two `E0502` borrow errors and no tests.
+//! - **`dolby.rs`** is a sketch: its A-weighting coefficients are hard-coded
+//!   for one unstated sample rate and its `sample_rate` argument is ignored,
+//!   its M-weighting is two hand-tuned biquads labelled "simplified", and its
+//!   spectral-flatness helper takes the product of every sample in a frame,
+//!   which underflows to zero for realistic frame sizes.
+//!
+//! Both need real work plus conformance tests before they can be exposed. The
+//! blocker-by-blocker assessment lives in the "Orphan meter modules" section of
+//! this crate's task list.
 
 #![forbid(unsafe_code)]
 
 pub mod ballistics;
+/// Multi-lane batch metering: peak / RMS / true-peak for many channels in one
+/// pass. See [`batch::BatchMeterProcessor`].
+pub mod batch;
 pub mod correlation;
 pub mod peak;
 pub mod ppm;
@@ -139,6 +165,7 @@ use crate::frame::AudioFrame;
 pub use ballistics::{
     BallisticsConfig, BallisticsProcessor, OverloadDetector, PeakDetector, RmsWindow,
 };
+pub use batch::{BatchMeterConfig, BatchMeterProcessor, BatchMeterReading};
 pub use correlation::{
     CorrelationMeter, CorrelationVisualization, GonioPoint, Goniometer, GoniometerMode,
     GoniometerVisualization,

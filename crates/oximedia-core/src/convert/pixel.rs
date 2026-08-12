@@ -212,8 +212,8 @@ impl Default for PixelConverter {
 /// # Arguments
 ///
 /// * `y_plane` - Y (luma) plane data
-/// * `u_plane` - U (chroma) plane data (width/2 * height/2)
-/// * `v_plane` - V (chroma) plane data (width/2 * height/2)
+/// * `u_plane` - U (chroma) plane data (`div_ceil(width, 2) * div_ceil(height, 2)`)
+/// * `v_plane` - V (chroma) plane data (`div_ceil(width, 2) * div_ceil(height, 2)`)
 /// * `width` - Frame width in pixels
 /// * `height` - Frame height in pixels
 /// * `matrix` - Color matrix to use for conversion
@@ -224,18 +224,21 @@ impl Default for PixelConverter {
 ///
 /// # Panics
 ///
-/// Panics if input planes have incorrect sizes.
+/// Panics if input planes have incorrect sizes. Chroma plane sizes are
+/// ceiling-divided (VP8/WebP odd-dimension convention:
+/// `div_ceil(width, 2) * div_ceil(height, 2)`), not floor-divided -- for
+/// even `width`/`height` this is identical to `(width / 2) * (height / 2)`.
 ///
 /// # Examples
 ///
 /// ```
 /// use oximedia_core::convert::pixel::{yuv420p_to_rgb24, ColorMatrix};
 ///
-/// let width = 4;
-/// let height = 4;
+/// let width: usize = 4;
+/// let height: usize = 4;
 /// let y_plane = vec![128u8; width * height];
-/// let u_plane = vec![128u8; (width / 2) * (height / 2)];
-/// let v_plane = vec![128u8; (width / 2) * (height / 2)];
+/// let u_plane = vec![128u8; width.div_ceil(2) * height.div_ceil(2)];
+/// let v_plane = vec![128u8; width.div_ceil(2) * height.div_ceil(2)];
 ///
 /// let rgb = yuv420p_to_rgb24(&y_plane, &u_plane, &v_plane, width, height, ColorMatrix::Bt709);
 /// assert_eq!(rgb.len(), width * height * 3);
@@ -249,9 +252,27 @@ pub fn yuv420p_to_rgb24(
     height: usize,
     matrix: ColorMatrix,
 ) -> Vec<u8> {
-    assert_eq!(y_plane.len(), width * height);
-    assert_eq!(u_plane.len(), (width / 2) * (height / 2));
-    assert_eq!(v_plane.len(), (width / 2) * (height / 2));
+    // 4:2:0 chroma is ceiling-divided (VP8/WebP odd-dimension convention),
+    // not floor-divided: identical to floor division for even width/height.
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    assert_eq!(
+        y_plane.len(),
+        width * height,
+        "y_plane length must equal width * height"
+    );
+    assert_eq!(
+        u_plane.len(),
+        chroma_width * chroma_height,
+        "u_plane length must equal the ceil-divided 4:2:0 chroma size \
+         div_ceil(width, 2) * div_ceil(height, 2)"
+    );
+    assert_eq!(
+        v_plane.len(),
+        chroma_width * chroma_height,
+        "v_plane length must equal the ceil-divided 4:2:0 chroma size \
+         div_ceil(width, 2) * div_ceil(height, 2)"
+    );
 
     let converter = PixelConverter::new(matrix);
     let mut rgb = vec![0u8; width * height * 3];
@@ -259,8 +280,8 @@ pub fn yuv420p_to_rgb24(
     for y in 0..height {
         for x in 0..width {
             let y_val = y_plane[y * width + x];
-            let u_val = u_plane[(y / 2) * (width / 2) + (x / 2)];
-            let v_val = v_plane[(y / 2) * (width / 2) + (x / 2)];
+            let u_val = u_plane[(y / 2) * chroma_width + (x / 2)];
+            let v_val = v_plane[(y / 2) * chroma_width + (x / 2)];
 
             let (r, g, b) = converter.yuv_to_rgb(y_val, u_val, v_val);
 
@@ -288,7 +309,10 @@ pub fn yuv420p_to_rgb24(
 ///
 /// # Returns
 ///
-/// Tuple of (Y plane, U plane, V plane)
+/// Tuple of (Y plane, U plane, V plane). The chroma planes are sized by
+/// ceiling division (`div_ceil(2)`) of width and height (VP8/WebP
+/// odd-dimension convention) -- identical to floor division for even
+/// `width`/`height`.
 ///
 /// # Panics
 ///
@@ -299,14 +323,14 @@ pub fn yuv420p_to_rgb24(
 /// ```
 /// use oximedia_core::convert::pixel::{rgb24_to_yuv420p, ColorMatrix};
 ///
-/// let width = 4;
-/// let height = 4;
+/// let width: usize = 4;
+/// let height: usize = 4;
 /// let rgb = vec![128u8; width * height * 3];
 ///
 /// let (y_plane, u_plane, v_plane) = rgb24_to_yuv420p(&rgb, width, height, ColorMatrix::Bt709);
 /// assert_eq!(y_plane.len(), width * height);
-/// assert_eq!(u_plane.len(), (width / 2) * (height / 2));
-/// assert_eq!(v_plane.len(), (width / 2) * (height / 2));
+/// assert_eq!(u_plane.len(), width.div_ceil(2) * height.div_ceil(2));
+/// assert_eq!(v_plane.len(), width.div_ceil(2) * height.div_ceil(2));
 /// ```
 #[must_use]
 #[allow(clippy::similar_names)]
@@ -316,12 +340,25 @@ pub fn rgb24_to_yuv420p(
     height: usize,
     matrix: ColorMatrix,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    assert_eq!(rgb.len(), width * height * 3);
+    assert_eq!(
+        rgb.len(),
+        width * height * 3,
+        "rgb length must equal width * height * 3"
+    );
+
+    // 4:2:0 chroma is ceiling-divided (VP8/WebP odd-dimension convention),
+    // not floor-divided -- identical to floor division for even
+    // width/height. Before this fix, a floor-divided allocation and index
+    // stride here panicked out of bounds for any odd width/height (e.g.
+    // 3x3: `u_plane[(y / 2) * (width / 2) + x / 2]` indexes 1 into a
+    // 1-byte plane once `x` reaches 2).
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
 
     let converter = PixelConverter::new(matrix);
     let mut y_plane = vec![0u8; width * height];
-    let mut u_plane = vec![0u8; (width / 2) * (height / 2)];
-    let mut v_plane = vec![0u8; (width / 2) * (height / 2)];
+    let mut u_plane = vec![0u8; chroma_width * chroma_height];
+    let mut v_plane = vec![0u8; chroma_width * chroma_height];
 
     // Convert RGB to YUV and downsample chroma
     for y in 0..height {
@@ -334,7 +371,15 @@ pub fn rgb24_to_yuv420p(
             let (y_val, u_val, v_val) = converter.rgb_to_yuv(r, g, b);
             y_plane[y * width + x] = y_val;
 
-            // Subsample chroma (average 2x2 blocks)
+            // Subsample chroma (average 2x2 blocks). A chroma sample at the
+            // right/bottom edge of an odd-width/height frame has no
+            // right/bottom neighbor pixel to average, so -- exactly as this
+            // loop already did for even dimensions' unreachable edge case --
+            // it averages only the pixels that exist via the `x + 1 <
+            // width` / `y + 1 < height` guards below; that averaging
+            // behavior is unchanged by this fix, only the chroma plane
+            // allocation size and index stride (`chroma_width`, ceil- not
+            // floor-divided) are.
             if y % 2 == 0 && x % 2 == 0 {
                 let mut u_sum = u32::from(u_val);
                 let mut v_sum = u32::from(v_val);
@@ -366,7 +411,7 @@ pub fn rgb24_to_yuv420p(
                     count += 1;
                 }
 
-                let u_idx = (y / 2) * (width / 2) + (x / 2);
+                let u_idx = (y / 2) * chroma_width + (x / 2);
                 u_plane[u_idx] = (u_sum / count) as u8;
                 v_plane[u_idx] = (v_sum / count) as u8;
             }
@@ -384,8 +429,8 @@ pub fn rgb24_to_yuv420p(
 /// # Arguments
 ///
 /// * `y_plane` - Y (luma) plane data
-/// * `u_plane` - U (chroma) plane data (width/2 * height/2)
-/// * `v_plane` - V (chroma) plane data (width/2 * height/2)
+/// * `u_plane` - U (chroma) plane data (`div_ceil(width, 2) * div_ceil(height, 2)`)
+/// * `v_plane` - V (chroma) plane data (`div_ceil(width, 2) * div_ceil(height, 2)`)
 /// * `width` - Frame width in pixels
 /// * `height` - Frame height in pixels
 ///
@@ -395,18 +440,21 @@ pub fn rgb24_to_yuv420p(
 ///
 /// # Panics
 ///
-/// Panics if input planes have incorrect sizes.
+/// Panics if input planes have incorrect sizes. Chroma plane sizes are
+/// ceiling-divided (VP8/WebP odd-dimension convention:
+/// `div_ceil(width, 2) * div_ceil(height, 2)`), not floor-divided -- for
+/// even `width`/`height` this is identical to `(width / 2) * (height / 2)`.
 ///
 /// # Examples
 ///
 /// ```
 /// use oximedia_core::convert::pixel::yuv420p_to_yuv444p;
 ///
-/// let width = 4;
-/// let height = 4;
+/// let width: usize = 4;
+/// let height: usize = 4;
 /// let y_plane = vec![128u8; width * height];
-/// let u_plane = vec![100u8; (width / 2) * (height / 2)];
-/// let v_plane = vec![150u8; (width / 2) * (height / 2)];
+/// let u_plane = vec![100u8; width.div_ceil(2) * height.div_ceil(2)];
+/// let v_plane = vec![150u8; width.div_ceil(2) * height.div_ceil(2)];
 ///
 /// let (y_out, u_out, v_out) = yuv420p_to_yuv444p(&y_plane, &u_plane, &v_plane, width, height);
 /// assert_eq!(y_out.len(), width * height);
@@ -421,15 +469,32 @@ pub fn yuv420p_to_yuv444p(
     width: usize,
     height: usize,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    assert_eq!(y_plane.len(), width * height);
-    assert_eq!(u_plane.len(), (width / 2) * (height / 2));
-    assert_eq!(v_plane.len(), (width / 2) * (height / 2));
+    // 4:2:0 chroma is ceiling-divided (VP8/WebP odd-dimension convention),
+    // not floor-divided -- identical to floor division for even
+    // width/height.
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    assert_eq!(
+        y_plane.len(),
+        width * height,
+        "y_plane length must equal width * height"
+    );
+    assert_eq!(
+        u_plane.len(),
+        chroma_width * chroma_height,
+        "u_plane length must equal the ceil-divided 4:2:0 chroma size \
+         div_ceil(width, 2) * div_ceil(height, 2)"
+    );
+    assert_eq!(
+        v_plane.len(),
+        chroma_width * chroma_height,
+        "v_plane length must equal the ceil-divided 4:2:0 chroma size \
+         div_ceil(width, 2) * div_ceil(height, 2)"
+    );
 
     let y_out = y_plane.to_vec();
     let mut u_out = vec![0u8; width * height];
     let mut v_out = vec![0u8; width * height];
-
-    let chroma_width = width / 2;
 
     // Upsample chroma using bilinear interpolation
     for y in 0..height {
@@ -447,12 +512,12 @@ pub fn yuv420p_to_yuv444p(
             } else {
                 c00_idx
             };
-            let c01_idx = if cy + 1 < height / 2 {
+            let c01_idx = if cy + 1 < chroma_height {
                 (cy + 1) * chroma_width + cx
             } else {
                 c00_idx
             };
-            let c11_idx = if cx + 1 < chroma_width && cy + 1 < height / 2 {
+            let c11_idx = if cx + 1 < chroma_width && cy + 1 < chroma_height {
                 (cy + 1) * chroma_width + cx + 1
             } else {
                 c00_idx
@@ -497,18 +562,25 @@ pub fn yuv420p_to_yuv444p(
 /// # Arguments
 ///
 /// * `y_plane` - Y (luma) plane data
-/// * `u_plane` - U (chroma) plane data at full resolution
-/// * `v_plane` - V (chroma) plane data at full resolution
+/// * `u_plane` - U (chroma) plane data at full resolution (`width * height`)
+/// * `v_plane` - V (chroma) plane data at full resolution (`width * height`)
 /// * `width` - Frame width in pixels
 /// * `height` - Frame height in pixels
 ///
 /// # Returns
 ///
-/// Tuple of (Y plane, U plane, V plane) with subsampled chroma
+/// Tuple of (Y plane, U plane, V plane) with subsampled chroma. The
+/// returned chroma planes are ceiling-divided (VP8/WebP odd-dimension
+/// convention: `div_ceil(width, 2) * div_ceil(height, 2)`), not
+/// floor-divided -- for even `width`/`height` this is identical to
+/// `(width / 2) * (height / 2)`.
 ///
 /// # Panics
 ///
-/// Panics if input planes have incorrect sizes.
+/// Panics if input planes have incorrect sizes. Note that `u_plane` and
+/// `v_plane` are `YUV444p` (full chroma resolution), so their required
+/// length is always `width * height` regardless of whether `width`/`height`
+/// are even or odd.
 ///
 /// # Examples
 ///
@@ -523,8 +595,8 @@ pub fn yuv420p_to_yuv444p(
 ///
 /// let (y_out, u_out, v_out) = yuv444p_to_yuv420p(&y_plane, &u_plane, &v_plane, width, height);
 /// assert_eq!(y_out.len(), width * height);
-/// assert_eq!(u_out.len(), (width / 2) * (height / 2));
-/// assert_eq!(v_out.len(), (width / 2) * (height / 2));
+/// assert_eq!(u_out.len(), width.div_ceil(2) * height.div_ceil(2));
+/// assert_eq!(v_out.len(), width.div_ceil(2) * height.div_ceil(2));
 /// ```
 #[must_use]
 pub fn yuv444p_to_yuv420p(
@@ -534,33 +606,81 @@ pub fn yuv444p_to_yuv420p(
     width: usize,
     height: usize,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    assert_eq!(y_plane.len(), width * height);
-    assert_eq!(u_plane.len(), width * height);
-    assert_eq!(v_plane.len(), width * height);
+    assert_eq!(
+        y_plane.len(),
+        width * height,
+        "y_plane length must equal width * height"
+    );
+    assert_eq!(
+        u_plane.len(),
+        width * height,
+        "u_plane length must equal width * height (YUV444p input chroma is full resolution, \
+         not subsampled)"
+    );
+    assert_eq!(
+        v_plane.len(),
+        width * height,
+        "v_plane length must equal width * height (YUV444p input chroma is full resolution, \
+         not subsampled)"
+    );
+
+    // Output 4:2:0 chroma is ceiling-divided (VP8/WebP odd-dimension
+    // convention), not floor-divided -- identical to floor division for
+    // even width/height. Before this fix, the output chroma planes were
+    // floor-allocated as `(width/2) * (height/2)` (e.g. a 3x3 source
+    // needed a 2x2 = 4 byte output but got a 1x1 = 1 byte one), and the
+    // unconditional `(y + dy) * width + (x + dx)` block read for `dy, dx`
+    // in `0..2` overran the *source* planes for odd height/width -- e.g.
+    // at `y = 2` (the last valid row of a 3-row source) `dy = 1` computes
+    // row 3, one past the end.
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
 
     let y_out = y_plane.to_vec();
-    let mut u_out = vec![0u8; (width / 2) * (height / 2)];
-    let mut v_out = vec![0u8; (width / 2) * (height / 2)];
+    let mut u_out = vec![0u8; chroma_width * chroma_height];
+    let mut v_out = vec![0u8; chroma_width * chroma_height];
 
-    // Downsample chroma by averaging 2x2 blocks
+    // Downsample chroma by averaging 2x2 blocks. A block at the
+    // right/bottom edge of an odd-width/height frame has no right/bottom
+    // neighbor pixel to average -- mirroring how the fixed
+    // `rgb24_to_yuv420p` handles its own partial 2x2 blocks, average only
+    // the pixels that exist via the `x + 1 < width` / `y + 1 < height`
+    // guards below (dynamic divisor, not a hardcoded `/ 4`). Even-dimension
+    // output is bit-identical: within a `step_by(2)` walk every block
+    // always has all four neighbors in bounds, so `count` is always 4 and
+    // the sum is the same four terms in the same order as the original
+    // unconditional `dy`/`dx` loop.
     for y in (0..height).step_by(2) {
         for x in (0..width).step_by(2) {
-            let mut u_sum = 0u32;
-            let mut v_sum = 0u32;
+            let idx00 = y * width + x;
+            let mut u_sum = u32::from(u_plane[idx00]);
+            let mut v_sum = u32::from(v_plane[idx00]);
+            let mut count = 1u32;
 
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let idx = (y + dy) * width + (x + dx);
-                    u_sum += u32::from(u_plane[idx]);
-                    v_sum += u32::from(v_plane[idx]);
-                }
+            if x + 1 < width {
+                let idx = y * width + (x + 1);
+                u_sum += u32::from(u_plane[idx]);
+                v_sum += u32::from(v_plane[idx]);
+                count += 1;
+            }
+            if y + 1 < height {
+                let idx = (y + 1) * width + x;
+                u_sum += u32::from(u_plane[idx]);
+                v_sum += u32::from(v_plane[idx]);
+                count += 1;
+            }
+            if x + 1 < width && y + 1 < height {
+                let idx = (y + 1) * width + (x + 1);
+                u_sum += u32::from(u_plane[idx]);
+                v_sum += u32::from(v_plane[idx]);
+                count += 1;
             }
 
-            let out_idx = (y / 2) * (width / 2) + (x / 2);
+            let out_idx = (y / 2) * chroma_width + (x / 2);
             #[allow(clippy::cast_possible_truncation)]
             {
-                u_out[out_idx] = (u_sum / 4) as u8;
-                v_out[out_idx] = (v_sum / 4) as u8;
+                u_out[out_idx] = (u_sum / count) as u8;
+                v_out[out_idx] = (v_sum / count) as u8;
             }
         }
     }
@@ -714,7 +834,10 @@ pub fn gray8_to_rgb24(gray: &[u8], width: usize, height: usize) -> Vec<u8> {
 ///
 /// # Returns
 ///
-/// Tuple of (Y plane, U plane, V plane)
+/// Tuple of (Y plane, U plane, V plane). The chroma planes are sized by
+/// ceiling division (`div_ceil(2)`) of width and height (VP8/WebP
+/// odd-dimension convention) -- identical to floor division for even
+/// `width`/`height` -- matching every other 4:2:0 function in this module.
 ///
 /// # Panics
 ///
@@ -731,16 +854,32 @@ pub fn gray8_to_rgb24(gray: &[u8], width: usize, height: usize) -> Vec<u8> {
 ///
 /// let (y_plane, u_plane, v_plane) = gray8_to_yuv420p(&gray, width, height);
 /// assert_eq!(y_plane.len(), width * height);
-/// assert_eq!(u_plane.len(), (width / 2) * (height / 2));
-/// assert_eq!(v_plane.len(), (width / 2) * (height / 2));
+/// assert_eq!(u_plane.len(), width.div_ceil(2) * height.div_ceil(2));
+/// assert_eq!(v_plane.len(), width.div_ceil(2) * height.div_ceil(2));
 /// ```
 #[must_use]
 pub fn gray8_to_yuv420p(gray: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    assert_eq!(gray.len(), width * height);
+    assert_eq!(
+        gray.len(),
+        width * height,
+        "gray length must equal width * height"
+    );
+
+    // 4:2:0 chroma is ceiling-divided (VP8/WebP odd-dimension convention),
+    // not floor-divided -- identical to floor division for even
+    // width/height. There is no indexed write into u_plane/v_plane here
+    // (they are a constant 128 fill), so a floor-sized allocation never
+    // panicked -- but the returned planes were inconsistent with the
+    // div_ceil(2) convention every other 4:2:0 function in this module now
+    // follows: e.g. a 3x3 gray image produced a 1-byte chroma plane, and
+    // the now ceil-aware `yuv420p_to_rgb24` requires 2x2 = 4 bytes for that
+    // size and would reject it.
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
 
     let y_plane = gray.to_vec();
-    let u_plane = vec![128u8; (width / 2) * (height / 2)];
-    let v_plane = vec![128u8; (width / 2) * (height / 2)];
+    let u_plane = vec![128u8; chroma_width * chroma_height];
+    let v_plane = vec![128u8; chroma_width * chroma_height];
 
     (y_plane, u_plane, v_plane)
 }
@@ -810,13 +949,18 @@ pub fn f32_to_u8_slice(src: &[f32], dst: &mut [u8]) {
 ///
 /// The Y, U, and V planes follow the standard `YUV420p` layout:
 /// - Y plane: `width × height` bytes (full resolution)
-/// - U / V planes: `(width/2) × (height/2)` bytes each (4:2:0 subsampling)
+/// - U / V planes: `div_ceil(width, 2) × div_ceil(height, 2)` bytes each
+///   (4:2:0 subsampling, VP8/WebP odd-dimension convention -- identical to
+///   `(width/2) × (height/2)` for even `width`/`height`)
 ///
 /// Output is packed RGB, stride = `width × 3`.
 ///
 /// # Panics
 ///
 /// Panics if the input plane sizes do not match the expected dimensions.
+/// Chroma plane sizes are ceiling-divided (`div_ceil(width, 2) *
+/// div_ceil(height, 2)`), not floor-divided -- for even `width`/`height`
+/// this is identical to `(width / 2) * (height / 2)`.
 ///
 /// # Examples
 ///
@@ -826,8 +970,8 @@ pub fn f32_to_u8_slice(src: &[f32], dst: &mut [u8]) {
 /// let w = 4_u32;
 /// let h = 4_u32;
 /// let y = vec![128_u8; (w * h) as usize];
-/// let u = vec![128_u8; (w / 2 * (h / 2)) as usize];
-/// let v = vec![128_u8; (w / 2 * (h / 2)) as usize];
+/// let u = vec![128_u8; (w.div_ceil(2) * h.div_ceil(2)) as usize];
+/// let v = vec![128_u8; (w.div_ceil(2) * h.div_ceil(2)) as usize];
 /// let rgb = yuv420_to_rgb(&y, &u, &v, w, h);
 /// assert_eq!(rgb.len(), (w * h * 3) as usize);
 /// ```
@@ -836,9 +980,37 @@ pub fn yuv420_to_rgb(y_plane: &[u8], u_plane: &[u8], v_plane: &[u8], w: u32, h: 
     let width = w as usize;
     let height = h as usize;
 
-    assert_eq!(y_plane.len(), width * height);
-    assert_eq!(u_plane.len(), (width / 2) * (height / 2));
-    assert_eq!(v_plane.len(), (width / 2) * (height / 2));
+    // 4:2:0 chroma is ceiling-divided (VP8/WebP odd-dimension convention),
+    // not floor-divided -- identical to floor division for even
+    // width/height. Before this fix, a floor-divided chroma stride here was
+    // the same panic class as the (now fixed) `yuv420p_to_rgb24`: a
+    // correctly ceil-sized `u_plane`/`v_plane` failed the (unlabeled)
+    // length assert outright, while a plane sized to the old floor
+    // contract passed that assert and then panicked out of bounds inside
+    // the `(row/2)*(width/2)+col/2` read once `row`/`col` reached the
+    // ceil-only edge (a 3x3 frame: the old assert required a 1-byte
+    // `u_plane`, and at `row=0, col=2` the index is `0*1 + 1 = 1`, already
+    // past the end).
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+
+    assert_eq!(
+        y_plane.len(),
+        width * height,
+        "y_plane length must equal width * height"
+    );
+    assert_eq!(
+        u_plane.len(),
+        chroma_width * chroma_height,
+        "u_plane length must equal the ceil-divided 4:2:0 chroma size \
+         div_ceil(width, 2) * div_ceil(height, 2)"
+    );
+    assert_eq!(
+        v_plane.len(),
+        chroma_width * chroma_height,
+        "v_plane length must equal the ceil-divided 4:2:0 chroma size \
+         div_ceil(width, 2) * div_ceil(height, 2)"
+    );
 
     // BT.601 fixed-point coefficients (scaled × 1024).
     // Y' contribution:  1.164 × (Y - 16)   → scale 1164/1000
@@ -858,8 +1030,8 @@ pub fn yuv420_to_rgb(y_plane: &[u8], u_plane: &[u8], v_plane: &[u8], w: u32, h: 
     for row in 0..height {
         for col in 0..width {
             let y_val = i32::from(y_plane[row * width + col]) - 16;
-            let u_val = i32::from(u_plane[(row / 2) * (width / 2) + col / 2]) - 128;
-            let v_val = i32::from(v_plane[(row / 2) * (width / 2) + col / 2]) - 128;
+            let u_val = i32::from(u_plane[(row / 2) * chroma_width + col / 2]) - 128;
+            let v_val = i32::from(v_plane[(row / 2) * chroma_width + col / 2]) - 128;
 
             let y_scaled = y_val * Y_SCALE;
             let r = (y_scaled + v_val * VR) >> 10;
@@ -942,6 +1114,74 @@ mod tests {
         assert_eq!(rgb.len(), width * height * 3);
     }
 
+    /// Odd-dimension (3x3) regression test: chroma is ceil-divided to 2x2,
+    /// and the row/column that only exists under ceil division must be read
+    /// at the correct chroma index (not aliased or panicking).
+    #[test]
+    fn test_yuv420p_to_rgb24_odd_dims_3x3() {
+        let width = 3;
+        let height = 3;
+        let y_plane: Vec<u8> = (0..9u32).map(|i| (20 + i * 20) as u8).collect();
+        let u_plane = vec![10u8, 60, 110, 160]; // 2x2 ceil-divided chroma
+        let v_plane = vec![30u8, 80, 130, 180];
+
+        let rgb = yuv420p_to_rgb24(
+            &y_plane,
+            &u_plane,
+            &v_plane,
+            width,
+            height,
+            ColorMatrix::Bt709,
+        );
+        assert_eq!(rgb.len(), width * height * 3);
+
+        let converter = PixelConverter::new(ColorMatrix::Bt709);
+
+        // (0,0) -> chroma index 0: baseline sanity check.
+        let expected00 = converter.yuv_to_rgb(y_plane[0], u_plane[0], v_plane[0]);
+        assert_eq!((rgb[0], rgb[1], rgb[2]), expected00);
+
+        // (0,2) -> chroma row 1, col 0 = index 2. A floor-divided
+        // chroma_width (1) would instead compute index `1*1+0 = 1`
+        // (in-bounds but wrong) -- the silent-shear case, not a panic.
+        let idx02 = (2 * width) * 3;
+        let expected02 = converter.yuv_to_rgb(y_plane[6], u_plane[2], v_plane[2]);
+        assert_eq!((rgb[idx02], rgb[idx02 + 1], rgb[idx02 + 2]), expected02);
+
+        // (2,2) -> chroma row 1, col 1 = index 3, the sample a floor
+        // row-stride would miscompute as index 2.
+        let idx22 = (2 * width + 2) * 3;
+        let expected22 = converter.yuv_to_rgb(y_plane[8], u_plane[3], v_plane[3]);
+        assert_eq!((rgb[idx22], rgb[idx22 + 1], rgb[idx22 + 2]), expected22);
+    }
+
+    /// Even-dimension regression pin: div_ceil(2) == floor division here, so
+    /// this proves the fix is a no-op for even width/height.
+    #[test]
+    fn test_yuv420p_to_rgb24_even_dims_6x4_unchanged() {
+        let width = 6;
+        let height = 4;
+        let y_plane = vec![128u8; width * height];
+        let u_plane = vec![64u8; (width / 2) * (height / 2)];
+        let v_plane = vec![192u8; (width / 2) * (height / 2)];
+
+        let rgb = yuv420p_to_rgb24(
+            &y_plane,
+            &u_plane,
+            &v_plane,
+            width,
+            height,
+            ColorMatrix::Bt709,
+        );
+        assert_eq!(rgb.len(), width * height * 3);
+
+        let converter = PixelConverter::new(ColorMatrix::Bt709);
+        let expected = converter.yuv_to_rgb(128, 64, 192);
+        for px in rgb.chunks_exact(3) {
+            assert_eq!((px[0], px[1], px[2]), expected);
+        }
+    }
+
     #[test]
     fn test_rgb24_to_yuv420p() {
         let width = 4;
@@ -952,6 +1192,58 @@ mod tests {
         assert_eq!(y_plane.len(), width * height);
         assert_eq!(u_plane.len(), (width / 2) * (height / 2));
         assert_eq!(v_plane.len(), (width / 2) * (height / 2));
+    }
+
+    /// Odd-dimension (3x3) regression test: before the fix, the chroma
+    /// index `(y / 2) * (width / 2) + x / 2` combined with a floor-sized
+    /// (1-byte) `u_plane`/`v_plane` panicked out of bounds once `x` or `y`
+    /// reached 2. This must now succeed and produce ceil-sized (2x2) planes.
+    /// Also checks the 2x2 averaging at the odd bottom-right edge: that
+    /// logic (average only the neighboring pixels that exist) was already
+    /// correct and is intentionally unchanged by this fix -- only the
+    /// chroma plane size/stride were floor- vs ceil-divided -- so this pins
+    /// it as a value check, not just a length check.
+    #[test]
+    fn test_rgb24_to_yuv420p_odd_dims_3x3_no_panic() {
+        let width = 3;
+        let height = 3;
+        let rgb: Vec<u8> = (0..(width * height * 3))
+            .map(|i| (i * 11 % 256) as u8)
+            .collect();
+
+        let (y_plane, u_plane, v_plane) = rgb24_to_yuv420p(&rgb, width, height, ColorMatrix::Bt709);
+        assert_eq!(y_plane.len(), 9);
+        assert_eq!(u_plane.len(), 4); // ceil(3/2) * ceil(3/2) = 2*2
+        assert_eq!(v_plane.len(), 4);
+
+        // Bottom-right chroma sample (row 1, col 1 of the 2x2 plane =
+        // index 3) is anchored at pixel (x=2, y=2), the frame's last row
+        // and column, so it has no right/bottom/diagonal neighbor to
+        // average with -- it must equal that single pixel's own U/V
+        // exactly, not an average diluted by phantom neighbors.
+        let converter = PixelConverter::new(ColorMatrix::Bt709);
+        let corner_offset = (2 * width + 2) * 3;
+        let (_, expected_u, expected_v) = converter.rgb_to_yuv(
+            rgb[corner_offset],
+            rgb[corner_offset + 1],
+            rgb[corner_offset + 2],
+        );
+        assert_eq!(u_plane[3], expected_u, "bottom-right chroma sample (U)");
+        assert_eq!(v_plane[3], expected_v, "bottom-right chroma sample (V)");
+    }
+
+    /// Even-dimension regression pin: div_ceil(2) == floor division here, so
+    /// this proves the fix is a no-op for even width/height.
+    #[test]
+    fn test_rgb24_to_yuv420p_even_dims_6x4_unchanged() {
+        let width = 6;
+        let height = 4;
+        let rgb = vec![100u8; width * height * 3];
+
+        let (y_plane, u_plane, v_plane) = rgb24_to_yuv420p(&rgb, width, height, ColorMatrix::Bt709);
+        assert_eq!(y_plane.len(), 24);
+        assert_eq!(u_plane.len(), 6); // 3x2, ceil == floor for even dims
+        assert_eq!(v_plane.len(), 6);
     }
 
     #[test]
@@ -968,6 +1260,51 @@ mod tests {
         assert_eq!(v_out.len(), width * height);
     }
 
+    /// Odd-dimension (3x3) regression test: chroma is ceil-divided to 2x2.
+    #[test]
+    fn test_yuv420p_to_yuv444p_odd_dims_3x3() {
+        let width = 3;
+        let height = 3;
+        let y_plane = vec![128u8; width * height];
+        let u_plane = vec![10u8, 60, 110, 160]; // 2x2 ceil-divided chroma
+        let v_plane = vec![30u8, 80, 130, 180];
+
+        let (y_out, u_out, v_out) = yuv420p_to_yuv444p(&y_plane, &u_plane, &v_plane, width, height);
+        assert_eq!(y_out.len(), 9);
+        assert_eq!(u_out.len(), 9);
+        assert_eq!(v_out.len(), 9);
+
+        // (0,2): output row 2, col 0 -> cx=0, cy=1, fx=0, fy=0, so the
+        // result must equal the raw chroma sample at row 1, col 0 = index
+        // 2. A floor-divided chroma_width (1) would instead read index 1.
+        assert_eq!(u_out[2 * width], u_plane[2]);
+        assert_eq!(v_out[2 * width], v_plane[2]);
+
+        // (2,2): bottom-right output pixel maps to chroma index (1,1) = 3,
+        // clamped at the plane edge (no further neighbor to interpolate
+        // towards), so it must equal the raw chroma sample exactly.
+        assert_eq!(u_out[2 * width + 2], u_plane[3]);
+        assert_eq!(v_out[2 * width + 2], v_plane[3]);
+    }
+
+    /// Even-dimension regression pin: div_ceil(2) == floor division here, so
+    /// this proves the fix is a no-op for even width/height.
+    #[test]
+    fn test_yuv420p_to_yuv444p_even_dims_6x4_unchanged() {
+        let width = 6;
+        let height = 4;
+        let y_plane = vec![128u8; width * height];
+        let u_plane = vec![100u8; 3 * 2]; // ceil(6/2)*ceil(4/2), 3x2
+        let v_plane = vec![150u8; 3 * 2];
+
+        let (y_out, u_out, v_out) = yuv420p_to_yuv444p(&y_plane, &u_plane, &v_plane, width, height);
+        assert_eq!(y_out.len(), 24);
+        assert_eq!(u_out.len(), 24);
+        assert_eq!(v_out.len(), 24);
+        assert!(u_out.iter().all(|&v| v == 100));
+        assert!(v_out.iter().all(|&v| v == 150));
+    }
+
     #[test]
     fn test_yuv444p_to_yuv420p() {
         let width = 4;
@@ -980,6 +1317,121 @@ mod tests {
         assert_eq!(y_out.len(), width * height);
         assert_eq!(u_out.len(), (width / 2) * (height / 2));
         assert_eq!(v_out.len(), (width / 2) * (height / 2));
+    }
+
+    /// Odd-dimension (3x3) regression test: before the fix, the output
+    /// chroma planes were floor-allocated to 1x1 (1 byte) instead of the
+    /// required 2x2 (4 bytes), and the unconditional `(y+dy)*width+(x+dx)`
+    /// block read overran the 9-byte source planes once the block touched
+    /// the last row/column (e.g. `y=2, dy=1` computes source row 3, one
+    /// past the end). This must now succeed, produce ceil-sized (2x2)
+    /// planes, and -- mirroring how the fixed `rgb24_to_yuv420p` handles
+    /// its own partial 2x2 blocks -- average only the source pixels that
+    /// exist at each of the plane's four blocks (full, right-edge,
+    /// bottom-edge, and single-corner), not a hardcoded 4-pixel divisor.
+    /// Every output byte is value-asserted against an independently
+    /// hand-selected set of source indices per block, not just lengths.
+    #[test]
+    fn test_yuv444p_to_yuv420p_odd_dims_3x3_no_panic() {
+        let width = 3;
+        let height = 3;
+        // Flat index = y * 3 + x:
+        //   0(0,0) 1(1,0) 2(2,0)
+        //   3(0,1) 4(1,1) 5(2,1)
+        //   6(0,2) 7(1,2) 8(2,2)
+        let y_plane: Vec<u8> = (0..9u32).map(|i| (10 + i * 15) as u8).collect();
+        let u_plane: Vec<u8> = vec![20, 40, 100, 60, 80, 140, 90, 110, 200];
+        let v_plane: Vec<u8> = vec![210, 190, 150, 170, 130, 90, 120, 100, 30];
+
+        let (y_out, u_out, v_out) = yuv444p_to_yuv420p(&y_plane, &u_plane, &v_plane, width, height);
+        assert_eq!(y_out, y_plane);
+        assert_eq!(u_out.len(), 4); // ceil(3/2) * ceil(3/2) = 2*2, not 1x1
+        assert_eq!(v_out.len(), 4);
+
+        // Average exactly the given source indices -- a small, obviously
+        // correct helper; the actual assertion is that these are the
+        // *right* indices (block membership/edge-clamping) and the *right*
+        // divisor (their count, not a hardcoded 4), not a re-derivation of
+        // the algorithm under test.
+        let avg = |plane: &[u8], px: &[usize]| -> u8 {
+            let sum: u32 = px.iter().map(|&i| u32::from(plane[i])).sum();
+            (sum / px.len() as u32) as u8
+        };
+
+        // Block (cx=0,cy=0) -> out index 0: full 2x2, source (0,0),(1,0),
+        // (0,1),(1,1) = flat indices 0,1,3,4.
+        assert_eq!(u_out[0], avg(&u_plane, &[0, 1, 3, 4]), "block(0,0) U");
+        assert_eq!(v_out[0], avg(&v_plane, &[0, 1, 3, 4]), "block(0,0) V");
+
+        // Block (cx=1,cy=0) -> out index 1: right edge, only 2 source
+        // pixels exist: (2,0),(2,1) = flat indices 2,5. A hardcoded `/4`
+        // divisor (the pre-fix behavior) would silently halve this instead
+        // of averaging just the two real samples.
+        assert_eq!(
+            u_out[1],
+            avg(&u_plane, &[2, 5]),
+            "block(1,0) U (right edge)"
+        );
+        assert_eq!(
+            v_out[1],
+            avg(&v_plane, &[2, 5]),
+            "block(1,0) V (right edge)"
+        );
+
+        // Block (cx=0,cy=1) -> out index 2: bottom edge, only 2 source
+        // pixels exist: (0,2),(1,2) = flat indices 6,7.
+        assert_eq!(
+            u_out[2],
+            avg(&u_plane, &[6, 7]),
+            "block(0,1) U (bottom edge)"
+        );
+        assert_eq!(
+            v_out[2],
+            avg(&v_plane, &[6, 7]),
+            "block(0,1) V (bottom edge)"
+        );
+
+        // Block (cx=1,cy=1) -> out index 3: bottom-right corner, only 1
+        // source pixel exists: (2,2) = flat index 8. Must equal that pixel
+        // exactly, not an average diluted by phantom neighbors.
+        assert_eq!(u_out[3], avg(&u_plane, &[8]), "block(1,1) U (corner)");
+        assert_eq!(v_out[3], avg(&v_plane, &[8]), "block(1,1) V (corner)");
+    }
+
+    /// Even-dimension regression pin: div_ceil(2) == floor division here,
+    /// and every 2x2 block is fully in-bounds, so this proves the fix is a
+    /// true no-op for even width/height -- not just same lengths, but the
+    /// exact same averaged byte per block. Uses non-uniform per-pixel data
+    /// (not a constant fill) so that a regression which summed the wrong
+    /// four source pixels, or reverted to the wrong divisor, would be
+    /// caught; a constant fill cannot distinguish those cases.
+    #[test]
+    fn test_yuv444p_to_yuv420p_even_dims_6x4_unchanged() {
+        let width = 6;
+        let height = 4;
+        let y_plane: Vec<u8> = (0..24u32).map(|i| (i * 5 % 256) as u8).collect();
+        let u_plane: Vec<u8> = (0..24u32).map(|i| (i * 7 % 256) as u8).collect();
+        let v_plane: Vec<u8> = (0..24u32).map(|i| (i * 13 % 256) as u8).collect();
+
+        let (y_out, u_out, v_out) = yuv444p_to_yuv420p(&y_plane, &u_plane, &v_plane, width, height);
+        assert_eq!(y_out, y_plane);
+        assert_eq!(u_out.len(), 6); // 3x2, ceil == floor for even dims
+        assert_eq!(v_out.len(), 6);
+
+        let avg = |plane: &[u8], px: &[usize]| -> u8 {
+            let sum: u32 = px.iter().map(|&i| u32::from(plane[i])).sum();
+            (sum / px.len() as u32) as u8
+        };
+
+        // Block (0,0) -> out index 0: source pixels (0,0),(1,0),(0,1),(1,1)
+        // = flat indices 0,1,6,7.
+        assert_eq!(u_out[0], avg(&u_plane, &[0, 1, 6, 7]), "block(0,0) U");
+        assert_eq!(v_out[0], avg(&v_plane, &[0, 1, 6, 7]), "block(0,0) V");
+
+        // Block (2,1) (bottom-right, out index = 1*3+2 = 5): source pixels
+        // (4,2),(5,2),(4,3),(5,3) = flat indices 16,17,22,23.
+        assert_eq!(u_out[5], avg(&u_plane, &[16, 17, 22, 23]), "block(2,1) U");
+        assert_eq!(v_out[5], avg(&v_plane, &[16, 17, 22, 23]), "block(2,1) V");
     }
 
     #[test]
@@ -1009,6 +1461,68 @@ mod tests {
         assert_eq!(v.len(), (width / 2) * (height / 2));
         assert_eq!(u[0], 128); // Neutral chroma
         assert_eq!(v[0], 128); // Neutral chroma
+    }
+
+    /// Odd-dimension (3x3) regression test: chroma allocation is now
+    /// ceil-divided (2x2 = 4 bytes) instead of floor-divided (1x1 = 1
+    /// byte). There is no indexed write into the chroma planes (constant
+    /// 128 fill), so the floor-sized allocation never panicked here -- but
+    /// it produced planes inconsistent with the div_ceil(2) convention
+    /// every other 4:2:0 function in this module follows. This is
+    /// demonstrated end-to-end: the now ceil-aware `yuv420p_to_rgb24` must
+    /// accept this function's output directly for an odd-sized image.
+    #[test]
+    fn test_gray8_to_yuv420p_odd_dims_3x3() {
+        let width = 3;
+        let height = 3;
+        let gray: Vec<u8> = (0..9u32).map(|i| (i * 25) as u8).collect();
+
+        let (y_plane, u_plane, v_plane) = gray8_to_yuv420p(&gray, width, height);
+        assert_eq!(y_plane, gray);
+        assert_eq!(u_plane.len(), 4); // ceil(3/2) * ceil(3/2) = 2*2, not 1x1
+        assert_eq!(v_plane.len(), 4);
+        assert!(
+            u_plane.iter().all(|&val| val == 128),
+            "U plane must stay neutral 128"
+        );
+        assert!(
+            v_plane.iter().all(|&val| val == 128),
+            "V plane must stay neutral 128"
+        );
+
+        // The now-ceil-aware yuv420p_to_rgb24 must accept this output
+        // directly instead of panicking on a length mismatch.
+        let rgb = yuv420p_to_rgb24(
+            &y_plane,
+            &u_plane,
+            &v_plane,
+            width,
+            height,
+            ColorMatrix::Bt709,
+        );
+        assert_eq!(rgb.len(), width * height * 3);
+    }
+
+    /// Even-dimension regression pin: div_ceil(2) == floor division here, so
+    /// this proves the fix is a no-op for even width/height.
+    #[test]
+    fn test_gray8_to_yuv420p_even_dims_6x4_unchanged() {
+        let width = 6;
+        let height = 4;
+        let gray: Vec<u8> = (0..24u32).map(|i| (i * 9 % 256) as u8).collect();
+
+        let (y_plane, u_plane, v_plane) = gray8_to_yuv420p(&gray, width, height);
+        assert_eq!(y_plane, gray);
+        assert_eq!(u_plane.len(), 6); // 3x2, ceil == floor for even dims
+        assert_eq!(v_plane.len(), 6);
+        assert!(
+            u_plane.iter().all(|&val| val == 128),
+            "U plane must stay neutral 128"
+        );
+        assert!(
+            v_plane.iter().all(|&val| val == 128),
+            "V plane must stay neutral 128"
+        );
     }
 
     #[test]
@@ -1142,6 +1656,73 @@ mod tests {
                 "G={g} B={b} differ by >{}",
                 (g - b).abs()
             );
+        }
+    }
+
+    /// Odd-dimension (3x3) regression test: chroma is ceil-divided to 2x2,
+    /// and the row/column that only exists under ceil division must be read
+    /// at the correct chroma index (not aliased or panicking) -- the same
+    /// shear/panic class as the fixed `yuv420p_to_rgb24`. The expected
+    /// pixel for a given (y, u, v) triple is obtained by calling
+    /// `yuv420_to_rgb` itself on a trivial 1x1 image, where the chroma
+    /// index is unambiguous (`chroma_width == chroma_height == 1`, the only
+    /// valid index is 0) -- this isolates the *indexing* bug under test
+    /// from the fixed-point arithmetic, which is identical in both calls.
+    #[test]
+    fn test_yuv420_to_rgb_odd_dims_3x3_no_panic() {
+        let w = 3_u32;
+        let h = 3_u32;
+        // Flat index = y * 3 + x, matching `yuv420p_to_rgb24`'s own
+        // odd-dim test fixture.
+        let y_plane: Vec<u8> = (0..9u32).map(|i| (20 + i * 20) as u8).collect();
+        let u_plane = vec![10u8, 60, 110, 160]; // 2x2 ceil-divided chroma
+        let v_plane = vec![30u8, 80, 130, 180];
+
+        let rgb = yuv420_to_rgb(&y_plane, &u_plane, &v_plane, w, h);
+        assert_eq!(rgb.len(), 3 * 3 * 3);
+
+        let reference = |y: u8, u: u8, v: u8| -> (u8, u8, u8) {
+            let out = yuv420_to_rgb(&[y], &[u], &[v], 1, 1);
+            (out[0], out[1], out[2])
+        };
+
+        // (0,0) -> chroma index 0: baseline sanity check.
+        let expected00 = reference(y_plane[0], u_plane[0], v_plane[0]);
+        assert_eq!((rgb[0], rgb[1], rgb[2]), expected00);
+
+        // (0,2) -> chroma row 1, col 0 = index 2. A floor-divided
+        // chroma_width (1) would instead compute index `1*1+0 = 1`
+        // (in-bounds but wrong) -- the silent-shear case, not a panic.
+        let idx02 = (2 * 3) * 3;
+        let expected02 = reference(y_plane[6], u_plane[2], v_plane[2]);
+        assert_eq!((rgb[idx02], rgb[idx02 + 1], rgb[idx02 + 2]), expected02);
+
+        // (2,2) -> chroma row 1, col 1 = index 3, the sample a floor
+        // row-stride would miscompute as index 2.
+        let idx22 = (2 * 3 + 2) * 3;
+        let expected22 = reference(y_plane[8], u_plane[3], v_plane[3]);
+        assert_eq!((rgb[idx22], rgb[idx22 + 1], rgb[idx22 + 2]), expected22);
+    }
+
+    /// Even-dimension regression pin: div_ceil(2) == floor division here, so
+    /// this proves the fix is a no-op for even width/height.
+    #[test]
+    fn test_yuv420_to_rgb_even_dims_6x4_unchanged() {
+        let w = 6_u32;
+        let h = 4_u32;
+        let y_plane = vec![128u8; 24];
+        let u_plane = vec![64u8; 6]; // 3x2, ceil == floor for even dims
+        let v_plane = vec![192u8; 6];
+
+        let rgb = yuv420_to_rgb(&y_plane, &u_plane, &v_plane, w, h);
+        assert_eq!(rgb.len(), 24 * 3);
+
+        let expected = {
+            let out = yuv420_to_rgb(&[128u8], &[64u8], &[192u8], 1, 1);
+            (out[0], out[1], out[2])
+        };
+        for px in rgb.chunks_exact(3) {
+            assert_eq!((px[0], px[1], px[2]), expected);
         }
     }
 }

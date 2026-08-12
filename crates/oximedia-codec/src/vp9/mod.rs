@@ -6,40 +6,38 @@
 //! # Modules
 //!
 //! - `bitstream` - Boolean decoder for entropy coding
-//! - `compressed` - Compressed header parsing
+//! - `dec` - Real frame decoding (bit-exact vs libvpx) and cross-frame state
 //! - `decoder` - Main VP9 decoder implementation
 //! - `frame` - Frame types and structures
-//! - `inter` - Inter prediction modes and context
 //! - `intra` - Intra prediction modes and functions
-//! - `kf` - Real keyframe/intra-only frame decoding (bit-exact vs libvpx)
 //! - `loopfilter` - Loop filter parameters
 //! - `mv` - Motion vector types
-//! - `mvref` - Motion vector reference building
 //! - `partition` - Partition types and block sizes
-//! - `prediction` - Prediction buffers and interpolation
 //! - `probability` - Probability tables for entropy coding
-//! - `reference` - Reference frame management
 //! - `segmentation` - Segmentation handling
 //! - `superframe` - Superframe container parsing
 //! - `transform` - Transform types and inverse transforms
 //! - `uncompressed` - Uncompressed header parsing
+//!
+//! `compressed` (header parsing), `inter` (inter-prediction context),
+//! `mvref` (MV reference candidates), `prediction` (interpolation) and
+//! `reference` (reference-frame pool) were deleted in VP9 PACKAGE P13: they
+//! were a superseded, never-invoked decode path (audit-verified AV1-shaped
+//! or hollow) that the real decoder in `dec` replaced. `InterMode` and
+//! `RefFrameType`, the two honest types `inter` held, moved to `symbols`,
+//! their one remaining real consumer.
 
 mod bitstream;
 mod coeff_decode;
-mod compressed;
+mod dec;
 mod decoder;
 mod encoder;
 mod frame;
-mod inter;
 mod intra;
-mod kf;
 mod loopfilter;
 mod mv;
-mod mvref;
 mod partition;
-mod prediction;
 mod probability;
-mod reference;
 mod segmentation;
 mod superframe;
 mod symbols;
@@ -55,11 +53,6 @@ pub use encoder::{
 pub use frame::{FrameType as Vp9FrameType, Vp9Frame};
 pub use superframe::{Superframe, SuperframeIndex};
 pub use uncompressed::{ColorSpace, UncompressedHeader, Vp9FrameType as HeaderFrameType};
-
-// Compressed header exports
-pub use compressed::{
-    CompressedHeader, CompressedHeaderParser, ProbabilityUpdates, QuantizationParams, ReferenceMode,
-};
 
 // Loop filter exports
 pub use loopfilter::{LoopFilterInfo, LoopFilterMask, LoopFilterParams, LoopFilterState};
@@ -78,33 +71,10 @@ pub use probability::{FrameContext, FrameCounts, MvProbs, Prob, ProbabilityConte
 // Segmentation exports
 pub use segmentation::{SegmentData, SegmentFeature, SegmentMap, Segmentation};
 
-// Inter prediction exports
-pub use inter::{
-    CompoundMode, InterMode, InterModeContext, InterPredContext, PredictionMode, RefFrameContext,
-    RefFrameType, ScalingFactors,
-};
-
 // Intra prediction exports
 pub use intra::{
     apply_intra_prediction, predict_dc, predict_horizontal, predict_tm, predict_vertical,
     IntraMode, IntraModeContext, IntraPredContext, SubBlockModes,
-};
-
-// Prediction exports
-pub use prediction::{
-    apply_inter_prediction, blend_predictions, blend_weighted, subpel_interp_2d, InterPrediction,
-    InterpFilter, PredBuffer,
-};
-
-// Reference frame exports
-pub use reference::{
-    RefFrameBuffer, RefUpdateFlags, ReferenceFrame, ReferenceFramePool, SignBiasInfo,
-};
-
-// MV reference exports
-pub use mvref::{
-    clamp_mv, find_best_ref_mvs, find_mv_refs, round_mv, BlockModeInfo, ModeInfoGrid,
-    MvPredContext, MvRefCandidate, MvRefContext, MvRefStack,
 };
 
 // Transform exports
@@ -113,5 +83,6 @@ pub use transform::{apply_inverse_transform, dequantize, CoeffBuffer, DequantCon
 // Coefficient decoding exports
 pub use coeff_decode::{CoeffContext, CoeffDecoder, CoeffToken, QuantTables, ScanOrder};
 
-// Symbol decoding exports
-pub use symbols::SymbolDecoder;
+// Symbol decoding exports (also re-exports InterMode/RefFrameType, relocated
+// here from the deleted `inter` module — see the module doc comment above)
+pub use symbols::{InterMode, RefFrameType, SymbolDecoder};
