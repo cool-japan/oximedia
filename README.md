@@ -4,8 +4,8 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.87+-orange.svg)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-v0.2.1-green.svg)](https://github.com/cool-japan/oximedia)
-[![Released](https://img.shields.io/badge/last%20release-0.2.0%20(2026--07--15)-brightgreen.svg)](https://github.com/cool-japan/oximedia)
+[![Version](https://img.shields.io/badge/version-v0.2.2-green.svg)](https://github.com/cool-japan/oximedia)
+[![Released](https://img.shields.io/badge/last%20release-0.2.1%20(2026--08--12)-brightgreen.svg)](https://github.com/cool-japan/oximedia)
 [![Crates](https://img.shields.io/badge/crates-115-blue.svg)](https://github.com/cool-japan/oximedia)
 [![SLOC](https://img.shields.io/badge/SLOC-~3.05M-blueviolet.svg)](https://github.com/cool-japan/oximedia)
 
@@ -67,7 +67,7 @@ Computer vision (object detection, motion tracking, video enhancement, quality a
 
 ## Project Scale
 
-OxiMedia is a **production-grade** framework at **v0.2.1** (active cycle):
+OxiMedia is a **production-grade** framework at **v0.2.2** (active cycle):
 
 | Metric | Value |
 |--------|-------|
@@ -102,7 +102,7 @@ pulls in **zero** ONNX symbols and stays C/Fortran-free.
 
 ```toml
 [dependencies]
-oximedia = { version = "0.2.1", features = ["ml", "ml-scene-classifier", "ml-onnx"] }
+oximedia = { version = "0.2.2", features = ["ml", "ml-scene-classifier", "ml-onnx"] }
 ```
 
 ```rust,ignore
@@ -556,7 +556,7 @@ or pin the version and pick features in `Cargo.toml`:
 
 ```toml
 [dependencies]
-oximedia = { version = "0.2.1", features = ["full"] }
+oximedia = { version = "0.2.2", features = ["full"] }
 ```
 
 ### Python (PyPI)
