@@ -603,7 +603,7 @@ scirs2-core = { version = "0.6.5", features = ["random", "linalg", "simd"] }
 # each consumer re-enable `threading` for native targets through a
 # `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` section.
 oxifft = { version = "0.4.2", default-features = false, features = ["std"] }
-oxionnx = "0.1.6"
+oxionnx = "0.1.7"
 
 # Network and HTTP
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form"] }
