@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Professional video scopes (waveform, vectorscope, histogram, parade) for OxiMedia"
 keywords = ["color", "lut", "grading", "video", "multimedia"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 readme = "README.md"
 
 [lints]

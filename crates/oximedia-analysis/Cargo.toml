@@ -10,7 +10,7 @@ authors.workspace = true
 description = "Comprehensive media analysis and quality assessment tools for OxiMedia"
 readme = "README.md"
 keywords = ["media", "analysis", "quality", "scene-detection", "audio-analysis"]
-categories = ["multimedia", "multimedia::video", "multimedia::audio"]
+categories = ["multimedia::video", "multimedia::audio"]
 
 [lints]
 workspace = true

@@ -10,7 +10,7 @@ repository.workspace = true
 description = "Cloudflare Images-compatible URL image transformation — on-the-fly resize, format negotiation, and optimization for OxiMedia"
 readme = "README.md"
 keywords = ["image-transform", "cdn", "cloudflare-images", "resize", "multimedia"]
-categories = ["multimedia", "web-programming", "multimedia::images"]
+categories = ["web-programming", "multimedia::images"]
 
 [lints]
 workspace = true

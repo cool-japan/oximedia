@@ -10,7 +10,7 @@ repository.workspace = true
 description = "Advanced caption and subtitle generation — speech alignment, line breaking, WCAG compliance, and speaker diarization for OxiMedia"
 readme = "README.md"
 keywords = ["captions", "subtitles", "accessibility", "speech-to-text", "multimedia"]
-categories = ["multimedia", "multimedia::video", "text-processing"]
+categories = ["multimedia::video", "text-processing"]
 
 [lints]
 workspace = true

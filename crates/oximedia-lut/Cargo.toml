@@ -2,7 +2,7 @@
 name = "oximedia-lut"
 description = "Look-Up Table (LUT) processing for color grading and correction"
 keywords = ["color", "lut", "grading", "video", "multimedia"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

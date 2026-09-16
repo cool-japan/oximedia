@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Audio codec implementations for OxiMedia"
 keywords = ["audio", "codec", "sound", "dsp", "multimedia"]
-categories = ["multimedia::audio", "multimedia"]
+categories = ["multimedia::audio"]
 readme = "README.md"
 
 [package.metadata.docs.rs]

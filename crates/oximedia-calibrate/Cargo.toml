@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Professional color calibration and matching tools for OxiMedia"
 keywords = ["color", "calibration", "grading", "video", "multimedia"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 readme = "README.md"
 
 [lints]

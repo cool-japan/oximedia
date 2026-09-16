@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Dolby Vision RPU metadata parser/writer for OxiMedia (metadata-only, respects Dolby IP)"
 keywords = ["dolby-vision", "hdr", "color", "video", "multimedia"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 readme = "README.md"
 
 [lints]

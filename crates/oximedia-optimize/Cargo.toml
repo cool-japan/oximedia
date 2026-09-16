@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Codec optimization and tuning suite for OxiMedia"
 keywords = ["optimization", "codec", "encoding", "video", "multimedia"]
-categories = ["multimedia::encoding", "multimedia"]
+categories = ["multimedia::encoding"]
 readme = "README.md"
 
 [features]

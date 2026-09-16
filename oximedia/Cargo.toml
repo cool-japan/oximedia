@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Patent-free multimedia framework for Rust"
 readme = "README.md"
-categories = ["multimedia", "multimedia::video", "multimedia::audio", "multimedia::encoding", "multimedia::images"]
+categories = ["multimedia::video", "multimedia::audio", "multimedia::encoding", "multimedia::images"]
 keywords = ["multimedia", "video", "audio", "codec", "media"]
 
 [package.metadata.docs.rs]

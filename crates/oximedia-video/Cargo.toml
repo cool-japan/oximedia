@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Professional video processing operations for OxiMedia — motion compensation, frame interpolation, and deinterlacing"
 keywords = ["video", "multimedia", "processing", "frame", "filter"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 readme = "README.md"
 
 [lints]

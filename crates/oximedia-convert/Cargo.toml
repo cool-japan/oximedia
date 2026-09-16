@@ -8,7 +8,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Universal media format converter for OxiMedia"
 keywords = ["transcoding", "encoding", "video", "audio", "multimedia"]
-categories = ["multimedia::encoding", "multimedia"]
+categories = ["multimedia::encoding"]
 readme = "README.md"
 authors.workspace = true
 

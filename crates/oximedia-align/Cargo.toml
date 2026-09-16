@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Video alignment and registration tools for multi-camera synchronization in OxiMedia"
 keywords = ["alignment", "synchronization", "multi-camera", "video", "multimedia"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 readme = "README.md"
 
 [lints]

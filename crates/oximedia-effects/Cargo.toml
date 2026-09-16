@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Professional audio effects suite for OxiMedia"
 keywords = ["audio", "effects", "reverb", "dsp", "multimedia"]
-categories = ["multimedia::audio", "multimedia"]
+categories = ["multimedia::audio"]
 readme = "README.md"
 
 [lints]

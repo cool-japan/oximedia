@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Computer vision for OxiMedia"
 keywords = ["computer-vision", "video", "tracking", "multimedia", "image"]
-categories = ["multimedia::images", "multimedia", "science"]
+categories = ["multimedia::images", "science"]
 readme = "README.md"
 
 [package.metadata.docs.rs]

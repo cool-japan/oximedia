@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Video quality assessment and objective metrics for OxiMedia"
 keywords = ["quality", "video", "metrics", "multimedia", "broadcast"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 readme = "README.md"
 
 [lints]

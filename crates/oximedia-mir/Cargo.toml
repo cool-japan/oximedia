@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Music Information Retrieval (MIR) system for OxiMedia"
 keywords = ["music", "mir", "beat", "audio", "multimedia"]
-categories = ["multimedia::audio", "multimedia", "science"]
+categories = ["multimedia::audio", "science"]
 readme = "README.md"
 
 [lints]

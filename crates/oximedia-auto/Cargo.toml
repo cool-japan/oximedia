@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Automated video editing for OxiMedia"
 keywords = ["auto-edit", "video", "editing", "automation", "multimedia"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 readme = "README.md"
 
 [lints]

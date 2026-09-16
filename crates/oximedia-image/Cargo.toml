@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Professional image sequence I/O for OxiMedia (DPX, OpenEXR, TIFF)"
 keywords = ["image", "multimedia", "processing", "pixels", "graphics"]
-categories = ["multimedia::images", "multimedia"]
+categories = ["multimedia::images"]
 readme = "README.md"
 
 [lints]

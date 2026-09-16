@@ -10,7 +10,7 @@ repository.workspace = true
 description = "Plugin system for OxiMedia - dynamic codec loading"
 readme = "README.md"
 keywords = ["media", "plugin", "codec", "dynamic"]
-categories = ["multimedia", "multimedia::encoding"]
+categories = ["multimedia::encoding"]
 
 [lints]
 workspace = true

@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Professional audio mixer with automation for OxiMedia"
 keywords = ["audio", "mixer", "dsp", "sound", "multimedia"]
-categories = ["multimedia::audio", "multimedia"]
+categories = ["multimedia::audio"]
 readme = "README.md"
 
 [lints]

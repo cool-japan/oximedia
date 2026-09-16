@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Multi-track timeline editor for OxiMedia"
 keywords = ["video", "timeline", "editing", "multimedia", "editor"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 readme = "README.md"
 
 [lints]

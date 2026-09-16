@@ -2,7 +2,7 @@
 name = "oximedia-restoration"
 description = "Image restoration algorithms for OxiMedia: blind deconvolution and content-aware inpainting"
 keywords = ["restoration", "deconvolution", "inpainting", "image", "patchmatch"]
-categories = ["multimedia::images", "multimedia"]
+categories = ["multimedia::images"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

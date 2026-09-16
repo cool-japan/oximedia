@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Professional video scaling operations for OxiMedia"
 keywords = ["scaling", "resize", "video", "multimedia", "image"]
-categories = ["multimedia::video", "multimedia"]
+categories = ["multimedia::video"]
 readme = "README.md"
 
 [lints]

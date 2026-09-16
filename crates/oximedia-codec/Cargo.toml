@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Video codec implementations for OxiMedia"
 keywords = ["codec", "encoding", "decoding", "video", "audio"]
-categories = ["multimedia::encoding", "multimedia"]
+categories = ["multimedia::encoding"]
 readme = "README.md"
 
 [package.metadata.docs.rs]

@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "FFmpeg CLI argument compatibility layer for OxiMedia"
 keywords = ["ffmpeg", "compatibility", "transcoding", "multimedia", "codec"]
-categories = ["multimedia::encoding", "multimedia"]
+categories = ["multimedia::encoding"]
 readme = "README.md"
 
 [lints]
