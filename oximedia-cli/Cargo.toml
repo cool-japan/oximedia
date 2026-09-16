@@ -8,6 +8,8 @@ rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Command-line interface for OxiMedia"
+categories = ["multimedia", "command-line-utilities"]
+keywords = ["oximedia", "video", "audio", "cli", "transcode"]
 readme = "README.md"
 
 [lints]
