@@ -114,4 +114,4 @@ println!("Issues fixed: {}/{}", result.issues_fixed, result.issues_detected);
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

@@ -143,4 +143,4 @@ TXT records: `codec`, `width`, `height`, `fps`, `audio_codec`, `sample_rate`, `c
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

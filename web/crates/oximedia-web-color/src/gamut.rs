@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! Primaries-aware gamut conversion (BT.709 / BT.2020 / Display-P3) with
 //! hue-preserving out-of-gamut handling.

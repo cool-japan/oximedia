@@ -80,4 +80,4 @@ println!("Spectral flatness: {:.3}", result.spectral.flatness);
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

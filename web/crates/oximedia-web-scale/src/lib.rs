@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! `oximedia-web-scale` — professional separable image/video resampling
 //! (Lanczos3, Catmull-Rom, Mitchell-Netravali, bilinear) compiled to

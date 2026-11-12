@@ -113,4 +113,4 @@ println!("L: {:.1} dBFS, R: {:.1} dBFS", peaks[0], peaks[1]);
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! Allocation-free YUV <-> RGBA8 conversion kernels.
 //!

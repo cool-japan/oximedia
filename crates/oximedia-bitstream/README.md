@@ -104,7 +104,7 @@ Alpha — API may change between minor versions.
 
 ## License
 
-Apache-2.0 — Copyright 2017 Brian Langenberger; 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2017 Brian Langenberger; 2024-2026 COOLJAPAN OU (Team KitaSan)
 
 This crate derives from [`bitstream-io`](https://crates.io/crates/bitstream-io) 4.9.0,
 originally dual-licensed "MIT OR Apache-2.0" by its author. COOLJAPAN OU redistributes

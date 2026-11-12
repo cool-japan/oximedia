@@ -1,5 +1,5 @@
 // Copyright 2017 Brian Langenberger
-// Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+// Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)
 //
 // Licensed under the Apache License, Version 2.0
 // <http://www.apache.org/licenses/LICENSE-2.0>. See `lib.rs` for upstream

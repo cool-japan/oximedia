@@ -251,4 +251,4 @@ assert!(matches!(phase2, PassPhase::Second { .. }));
 
 Apache-2.0
 
-Copyright COOLJAPAN OU (Team Kitasan)
+Copyright COOLJAPAN OU (Team KitaSan)

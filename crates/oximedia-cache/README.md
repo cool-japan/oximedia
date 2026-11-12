@@ -134,5 +134,5 @@ the patent-free, memory-safe multimedia processing framework written in pure Rus
 
 ## License
 
-Copyright COOLJAPAN OU (Team Kitasan). Licensed under the terms specified in the
+Copyright COOLJAPAN OU (Team KitaSan). Licensed under the terms specified in the
 workspace root.

@@ -113,7 +113,7 @@ impl WasmPluginRegistry {
         let info = CodecPluginInfo {
             name: "oximedia-builtin".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            author: "COOLJAPAN OU (Team Kitasan)".to_string(),
+            author: "COOLJAPAN OU (Team KitaSan)".to_string(),
             description: "Built-in patent-free codecs for OxiMedia".to_string(),
             api_version: PLUGIN_API_VERSION,
             license: "MIT OR Apache-2.0".to_string(),

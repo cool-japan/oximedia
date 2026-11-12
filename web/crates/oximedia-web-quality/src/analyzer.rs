@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! [`QualityAnalyzer`]: the preallocated, zero-per-frame-allocation PSNR +
 //! SSIM comparator that both the native `#[cfg(test)]` suite and the

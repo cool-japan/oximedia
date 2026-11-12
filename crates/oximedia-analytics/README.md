@@ -126,4 +126,4 @@ Sessions are modeled as ordered event streams. All analytics functions are state
 
 Licensed under the terms specified in the workspace root.
 
-Copyright (c) COOLJAPAN OU (Team Kitasan)
+Copyright (c) COOLJAPAN OU (Team KitaSan)

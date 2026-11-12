@@ -789,7 +789,7 @@ Topic-focused guides live in [`docs/`](docs/):
 
 ## Sponsorship
 
-OxiMedia is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+OxiMedia is developed and maintained by **COOLJAPAN OU (Team KitaSan)**.
 
 If you find OxiMedia useful, please consider sponsoring the project to support continued development of the Pure Rust multimedia and computer vision ecosystem.
 
@@ -807,7 +807,7 @@ Your sponsorship helps us:
 
 Apache 2.0 — See [LICENSE](LICENSE) for details.
 
-Copyright 2026 COOLJAPAN OU (Team Kitasan). All rights reserved.
+Copyright 2026 COOLJAPAN OU (Team KitaSan). All rights reserved.
 
 ---
 

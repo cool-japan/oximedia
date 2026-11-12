@@ -36,7 +36,7 @@ Report vulnerabilities privately via **GitHub Security Advisories**:
 This project does not currently operate a dedicated security-contact email
 alias; GitHub Security Advisories is the authoritative and only channel for
 private disclosure, and it is monitored by the maintainers (COOLJAPAN OU /
-Team Kitasan).
+Team KitaSan).
 
 When filing a report, please include:
 

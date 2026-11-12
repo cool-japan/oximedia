@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
-    { name = "COOLJAPAN OU (Team Kitasan)" },
+    { name = "COOLJAPAN OU (Team KitaSan)" },
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

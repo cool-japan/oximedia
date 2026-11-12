@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! `oximedia-web-color` — the colour-science pipeline for the browser:
 //! exposure / contrast / saturation, tone mapping (Reinhard / Filmic-Hable /

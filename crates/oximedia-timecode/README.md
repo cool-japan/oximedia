@@ -74,4 +74,4 @@ println!("{}", df_tc); // "01:02:03;04" (semicolon separator)
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

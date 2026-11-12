@@ -61,7 +61,7 @@ an appointed representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement via the
-**OxiMedia maintainers (COOLJAPAN OU / Team Kitasan)**, either by opening a
+**OxiMedia maintainers (COOLJAPAN OU / Team KitaSan)**, either by opening a
 confidential report through
 [GitHub Security Advisories](https://github.com/cool-japan/oximedia/security/advisories/new)
 (if the matter is sensitive), or by contacting the maintainers through the

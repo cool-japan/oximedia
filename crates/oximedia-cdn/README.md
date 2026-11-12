@@ -126,4 +126,4 @@ access. All modules share a common `CdnError` type. No unsafe code is used anywh
 
 Licensed under the terms specified in the workspace root.
 
-Copyright (c) COOLJAPAN OU (Team Kitasan)
+Copyright (c) COOLJAPAN OU (Team KitaSan)

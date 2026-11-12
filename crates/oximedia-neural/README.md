@@ -113,4 +113,4 @@ All layers are stateless inference-only -- they hold weight tensors but perform 
 
 Licensed under the terms specified in the workspace root.
 
-Copyright (c) COOLJAPAN OU (Team Kitasan)
+Copyright (c) COOLJAPAN OU (Team KitaSan)

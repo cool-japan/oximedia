@@ -100,4 +100,4 @@ All angles are in radians. UV coordinates are normalized to 0..1. Image buffers 
 
 Licensed under the terms specified in the workspace root.
 
-Copyright (c) COOLJAPAN OU (Team Kitasan)
+Copyright (c) COOLJAPAN OU (Team KitaSan)

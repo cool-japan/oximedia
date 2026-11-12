@@ -912,7 +912,7 @@ Supported containers:      Matroska, WebM, Ogg, FLAC, WAV
 
 Homepage: https://github.com/cool-japan/oximedia
 License:  Apache-2.0
-Author:   COOLJAPAN OU (Team Kitasan)
+Author:   COOLJAPAN OU (Team KitaSan)
 
 Keyboard shortcuts:
   q / Ctrl+C     Quit

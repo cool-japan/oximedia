@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) COOLJAPAN OU (Team Kitasan)
+// Copyright (c) COOLJAPAN OU (Team KitaSan)
 
 //! Content-addressable response cache for transformed images.
 //!

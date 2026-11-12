@@ -235,4 +235,4 @@ When a patent-encumbered codec is detected in a container, a `PatentViolation` e
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

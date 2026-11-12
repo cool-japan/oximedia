@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! `oximedia-web-quality` — PSNR and (real, windowed) SSIM video quality
 //! metrics compiled to WebAssembly.

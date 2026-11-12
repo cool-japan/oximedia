@@ -176,4 +176,4 @@ Cross-reference against the [Cloudflare Images transformation reference](https:/
 
 Apache-2.0
 
-Copyright (c) COOLJAPAN OU (Team Kitasan)
+Copyright (c) COOLJAPAN OU (Team KitaSan)

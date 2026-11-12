@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) COOLJAPAN OU (Team Kitasan)
+// Copyright (c) COOLJAPAN OU (Team KitaSan)
 
 //! Accept header parsing and format negotiation for Cloudflare Images-compatible
 //! content negotiation.

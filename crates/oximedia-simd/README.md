@@ -77,4 +77,4 @@ forward_dct(&input, &mut output, DctSize::Dct8x8).unwrap();
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

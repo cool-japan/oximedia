@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! `oximedia-web-scopes` — broadcast-grade video scopes (waveform,
 //! vectorscope, histogram and false-colour exposure) for tightly packed RGBA8

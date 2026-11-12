@@ -126,6 +126,6 @@ All fallible operations return `oximedia_hdr::Result<T>`, backed by the `HdrErro
 
 ## License
 
-Copyright (c) COOLJAPAN OU (Team Kitasan). All rights reserved.
+Copyright (c) COOLJAPAN OU (Team KitaSan). All rights reserved.
 
 Part of the [OxiMedia](https://github.com/cool-japan/oximedia) project.

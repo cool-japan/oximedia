@@ -156,4 +156,4 @@ All algorithms are selected to avoid patent-encumbered methods. ORB features are
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) COOLJAPAN OU (Team Kitasan)
+// Copyright (c) COOLJAPAN OU (Team KitaSan)
 
 //! Geometry, rotation, compression, and output-option types used by
 //! [`TransformParams`](super::transform::TransformParams).

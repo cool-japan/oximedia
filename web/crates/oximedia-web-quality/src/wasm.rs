@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! `wasm-bindgen` glue exposing [`QualityAnalyzer`] to JavaScript as
 //! [`Quality`]. No JSON on the per-frame path: [`QualityResult`] exposes its

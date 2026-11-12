@@ -9,7 +9,7 @@ pub(crate) fn show_version(json: bool) {
             "version": env!("CARGO_PKG_VERSION"),
             "rust_version": rustc_version_str(),
             "license": env!("CARGO_PKG_LICENSE"),
-            "copyright": "COOLJAPAN OU (Team Kitasan)",
+            "copyright": "COOLJAPAN OU (Team KitaSan)",
             "homepage": env!("CARGO_PKG_HOMEPAGE"),
             "repository": env!("CARGO_PKG_REPOSITORY"),
             "features": ["audio","video","graph","subtitle","lut","filter","scene","qc","workflow",
@@ -41,7 +41,7 @@ pub(crate) fn show_version(json: bool) {
         "IS-04 v1.3, IS-05 v1.1, IS-07 v1.0, IS-08 v1.0, IS-09 v1.0, IS-11 v1.0".cyan()
     );
     println!("License:     {}", env!("CARGO_PKG_LICENSE").yellow());
-    println!("Copyright:   {}", "COOLJAPAN OU (Team Kitasan)".yellow());
+    println!("Copyright:   {}", "COOLJAPAN OU (Team KitaSan)".yellow());
     println!("Homepage:    {}", env!("CARGO_PKG_HOMEPAGE").dimmed());
     println!("Repository:  {}", env!("CARGO_PKG_REPOSITORY").dimmed());
 }

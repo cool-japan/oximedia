@@ -1,5 +1,5 @@
 // Copyright 2017 Brian Langenberger
-// Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+// Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)
 //
 // Originally dual-licensed "MIT OR Apache-2.0" as part of `bitstream-io`
 // 4.9.0 by Brian Langenberger. Redistributed here, per the terms of that

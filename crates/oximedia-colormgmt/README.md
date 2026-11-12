@@ -87,4 +87,4 @@ let result = pipeline.transform_pixel([0.5, 0.3, 0.2]);
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

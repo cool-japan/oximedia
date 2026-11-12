@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) COOLJAPAN OU (Team Kitasan)
+// Copyright (c) COOLJAPAN OU (Team KitaSan)
 
 //! Integration tests exercising the full `parser -> negotiation -> processor`
 //! pipeline against actual (synthetically generated) in-memory image data.

@@ -119,7 +119,7 @@ Cost values are used by the optimiser to estimate computational weight.
 
 ## License
 
-Copyright COOLJAPAN OU (Team Kitasan). Part of the
+Copyright COOLJAPAN OU (Team KitaSan). Part of the
 [OxiMedia](https://github.com/cool-japan/oximedia) framework.
 
 Licensed under the terms specified in the workspace root.

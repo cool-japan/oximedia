@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 /**
  * Wraps a raw RGBA8 buffer into a `FrameSource` the `scopes`/`color`/`scale`

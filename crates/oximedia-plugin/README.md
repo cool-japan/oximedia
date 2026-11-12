@@ -69,4 +69,4 @@ Use the `declare_plugin!` macro to generate these exports automatically.
 
 Apache-2.0
 
-Copyright COOLJAPAN OU (Team Kitasan)
+Copyright COOLJAPAN OU (Team KitaSan)

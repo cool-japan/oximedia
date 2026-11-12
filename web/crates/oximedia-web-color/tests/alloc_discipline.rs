@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! Verifies the "no per-call allocation" discipline: after construction and
 //! a warm-up call, `apply_rgba8` / `apply_rgba_f32` must not touch the heap.

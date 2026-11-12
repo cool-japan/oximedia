@@ -149,4 +149,4 @@ All analyzers operate in a single pass for efficiency. Video frames are processe
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

@@ -286,4 +286,4 @@ Attempting to use patent-encumbered codecs (H.264, H.265, AAC, etc.) will result
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

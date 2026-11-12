@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.9"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["COOLJAPAN OU (Team Kitasan)"]
+authors = ["COOLJAPAN OU (Team KitaSan)"]
 repository = "https://github.com/cool-japan/oximedia"
 
 [workspace.dependencies]

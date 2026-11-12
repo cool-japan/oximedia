@@ -88,4 +88,4 @@ profiler.record_metric("frames_encoded".to_string(), ProfileMetric::Count(1000))
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

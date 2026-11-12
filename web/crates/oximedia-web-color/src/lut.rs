@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! 3D LUT (`f32`, flattened RGB lattice) with trilinear **and** tetrahedral
 //! interpolation.

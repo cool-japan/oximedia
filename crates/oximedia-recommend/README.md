@@ -107,4 +107,4 @@ engine.record_rating(user_id, content_id, 4.5)?;
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

@@ -1,4 +1,4 @@
-// Copyright 2025 COOLJAPAN OU (Team Kitasan)
+// Copyright 2025 COOLJAPAN OU (Team KitaSan)
 // Licensed under the Apache License, Version 2.0
 
 //! RGB24 AVI roundtrip test.

@@ -138,4 +138,4 @@ curl -X DELETE http://localhost:3000/api/v1/jobs/<job-id>
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

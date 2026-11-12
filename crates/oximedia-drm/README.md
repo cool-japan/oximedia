@@ -108,4 +108,4 @@ oximedia-drm = { version = "0.2.0", features = ["all-drm"] }
 
 ## License
 
-Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — Copyright 2024-2026 COOLJAPAN OU (Team KitaSan)

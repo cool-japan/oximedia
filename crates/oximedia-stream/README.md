@@ -125,6 +125,6 @@ All modules share a common `StreamError` type. No unsafe code is used anywhere i
 
 Licensed under the terms specified in the workspace root.
 
-Copyright (c) COOLJAPAN OU (Team Kitasan)
+Copyright (c) COOLJAPAN OU (Team KitaSan)
 
 Version: 0.2.1 — 2026-08-12 — extensively tested

@@ -86,7 +86,7 @@ All fallible operations return `Result<T, SpatialError>`. Variants:
 
 ## License
 
-Copyright (c) COOLJAPAN OU (Team Kitasan). All rights reserved.
+Copyright (c) COOLJAPAN OU (Team KitaSan). All rights reserved.
 
 Part of the [OxiMedia](https://github.com/cool-japan/oximedia) Sovereign Media Framework.
 

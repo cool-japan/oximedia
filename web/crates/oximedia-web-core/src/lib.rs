@@ -1,4 +1,4 @@
-// Copyright COOLJAPAN OU (Team Kitasan). Licensed under Apache-2.0.
+// Copyright COOLJAPAN OU (Team KitaSan). Licensed under Apache-2.0.
 
 //! `oximedia-web-core` — dependency-free numeric kernels shared by the
 //! OxiMedia web wasm modules (`oximedia-web-scopes`, `-color`, `-scale`,

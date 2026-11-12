@@ -159,4 +159,4 @@ The caption generation pipeline flows from raw transcript segments through align
 
 Licensed under the terms specified in the workspace root.
 
-Copyright (c) COOLJAPAN OU (Team Kitasan)
+Copyright (c) COOLJAPAN OU (Team KitaSan)
